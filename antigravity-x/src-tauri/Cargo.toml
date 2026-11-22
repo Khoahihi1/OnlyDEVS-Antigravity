@@ -1,6 +1,6 @@
 [package]
 name = "onlydevs-antigravity"
-version = "1.1.0"
+version = "1.1.1"
 description = "OnlyDEVS — Antigravity IDE/CLI Control Suite"
 authors = ["KhoaHihi"]
 edition = "2024"
