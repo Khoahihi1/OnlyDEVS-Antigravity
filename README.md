@@ -36,7 +36,7 @@
 | **👤 Accounts** | Google OAuth 2.0 login, local account sync, Refresh Token / Batch / JSON & folder import-export. Live quota buckets (`Gemini · 5h`, `Gemini · Weekly`, `Claude · 5h`, `Claude · Weekly`, `Gemini 4 Argon`, `Gemini 4 Carbon`). 1-click **`+ API / API ✓`** pool toggle on every card, **Launch / Switch Account Popup** (auto-detects installed Antigravity targets, graceful restart & full credential sync), Groups, Custom Sort, Tags, Privacy Mode, Notes, 2FA TOTP Vault, and Switch History. |
 | **📊 Session Token Usage** | Read-only local scanner separating **Input / Thinking / Output / Cache** tokens with interactive SVG trend charts, model/workspace/type cross-filtering, conversation table, and per-turn breakdown. |
 | **⚡ API Service Router** | **Pure Antigravity Cloud Code proxy** (`cloudcode-pa.googleapis.com` / `daily-cloudcode-pa.googleapis.com`) powered solely by your pooled Antigravity OAuth accounts. Exposes standard local/LAN compatibility endpoints (`/v1/chat/completions`, `/v1/models`, `/v1/messages`) so external editors & SDKs can consume your Antigravity quota directly. |
-| **🧩 Plugins** | Hardcoded built-in `antigravity-filter-bypass v1.3.1` one-click toggle, self-test runner, live `hooks.json` & `config.json` editors, plus Folder / `.ZIP` / Git URL / Custom Manifest installer. |
+| **🧩 Plugins** | Hardcoded built-in `onlydevs-filter-bypass v1.3.1` one-click toggle, self-test runner, live `hooks.json` & `config.json` editors, plus Folder / `.ZIP` / Git URL / Custom Manifest installer. |
 | **📝 Prompts** | Curated instruction prompt library synced with `Prompt/` — toggling a prompt writes directly to `~/.gemini/config/AGENTS.md`. |
 | **💬 Sessions** | Scan, search, group by workspace, inspect transcripts, sync, export to Markdown, and batch delete. |
 | **🛠️ MCP & Skills** | Manage `~/.gemini/config/mcp_config.json` servers and Agent Skills (`SKILL.md`). |
@@ -104,7 +104,7 @@ OnlyDEVS-Antigravity/
 ├── build.bat            # One-click Windows release builder (typecheck + .exe + NSIS installer)
 ├── dev.bat              # Launch Tauri dev server from root
 ├── antigravity-x/       # Tauri 2 + React 19 + Rust desktop application source
-├── plugin/              # antigravity-filter-bypass plugin source (also embedded in binary)
+├── plugin/              # onlydevs-filter-bypass plugin source (also embedded in binary)
 ├── Prompt/              # Instruction prompt templates synced into ~/.gemini/config/AGENTS.md
 └── README.md            # Documentation
 ```

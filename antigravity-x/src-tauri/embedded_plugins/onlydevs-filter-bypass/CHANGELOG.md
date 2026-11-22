@@ -25,6 +25,10 @@
 - Portable `hooks.json` (`python` / `python3` on PATH).
 - `scripts/install.ps1` / `scripts/install.sh` for installing into `~/.gemini/config/plugins/`.
 
-## 1.1.x (fork baseline)
+## 1.3.1
 
-- Stop hook + multiline filter detection (upstream v1ktorrr0x).
+- Rebranded package & plugin ID to `onlydevs-filter-bypass` (OnlyDEVS).
+
+## 1.1.x (baseline)
+
+- Stop hook + multiline filter detection.

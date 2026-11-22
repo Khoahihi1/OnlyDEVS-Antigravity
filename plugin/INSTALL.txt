@@ -1,9 +1,10 @@
-antigravity-filter-bypass v1.3.1 — source package
+onlydevs-filter-bypass v1.3.1 — source package
 
 Windows (recommended):
-  1. Unzip anywhere (e.g. C:\Tools\antigravity-filter-bypass)
-  2. PowerShell: .\scripts\install.ps1
-  3. Antigravity: agy plugin enable antigravity-filter-bypass
+  1. Open OnlyDEVS-Antigravity.exe -> Plugins tab -> enable onlydevs-filter-bypass
+  -- OR manual install --
+  2. PowerShell inside plugin\: .\scripts\install.ps1
+  3. Enable plugin: agy plugin enable onlydevs-filter-bypass
   4. Reload Window
 
 Linux/macOS:
@@ -13,4 +14,4 @@ Test:
   python test_filter_bypass.py
 
 Install target:
-  %USERPROFILE%\.gemini\config\plugins\antigravity-filter-bypass
+  %USERPROFILE%\.gemini\config\plugins\onlydevs-filter-bypass

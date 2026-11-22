@@ -8,7 +8,7 @@ use walkdir::WalkDir;
 use crate::config;
 use crate::paths;
 
-pub const DEFAULT_PLUGIN_ID: &str = "antigravity-filter-bypass";
+pub const DEFAULT_PLUGIN_ID: &str = "onlydevs-filter-bypass";
 
 const COPY_FILES: &[&str] = &[
     "filter_bypass.py",
@@ -22,27 +22,27 @@ const COPY_FILES: &[&str] = &[
 const EMBEDDED_FILTER_BYPASS_FILES: &[(&str, &str)] = &[
     (
         "filter_bypass.py",
-        include_str!("../embedded_plugins/antigravity-filter-bypass/filter_bypass.py"),
+        include_str!("../embedded_plugins/onlydevs-filter-bypass/filter_bypass.py"),
     ),
     (
         "hooks.json",
-        include_str!("../embedded_plugins/antigravity-filter-bypass/hooks.json"),
+        include_str!("../embedded_plugins/onlydevs-filter-bypass/hooks.json"),
     ),
     (
         "plugin.json",
-        include_str!("../embedded_plugins/antigravity-filter-bypass/plugin.json"),
+        include_str!("../embedded_plugins/onlydevs-filter-bypass/plugin.json"),
     ),
     (
         "test_filter_bypass.py",
-        include_str!("../embedded_plugins/antigravity-filter-bypass/test_filter_bypass.py"),
+        include_str!("../embedded_plugins/onlydevs-filter-bypass/test_filter_bypass.py"),
     ),
     (
         "README.md",
-        include_str!("../embedded_plugins/antigravity-filter-bypass/README.md"),
+        include_str!("../embedded_plugins/onlydevs-filter-bypass/README.md"),
     ),
     (
         "CHANGELOG.md",
-        include_str!("../embedded_plugins/antigravity-filter-bypass/CHANGELOG.md"),
+        include_str!("../embedded_plugins/onlydevs-filter-bypass/CHANGELOG.md"),
     ),
 ];
 
@@ -254,7 +254,7 @@ pub fn install_plugin_from_folder(
         ));
     }
 
-    // If user pointed to antigravity-filter-bypass source folder, use the specialized installer
+    // If user pointed to onlydevs-filter-bypass source folder, use the specialized installer
     if src.join("filter_bypass.py").is_file()
         && plugin_id
             .as_deref()

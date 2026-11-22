@@ -155,7 +155,7 @@ pub fn list_plugins() -> Result<Vec<PluginEntry>, String> {
                 (
                     true,
                     Some(user_path),
-                    if id == "antigravity-filter-bypass" {
+                    if id == "onlydevs-filter-bypass" {
                         "bundled"
                     } else {
                         "user"
@@ -218,7 +218,7 @@ pub fn list_plugins() -> Result<Vec<PluginEntry>, String> {
                 description: meta.description,
                 enabled: false,
                 installed: true,
-                source: if id == "antigravity-filter-bypass" {
+                source: if id == "onlydevs-filter-bypass" {
                     "bundled".into()
                 } else {
                     "user".into()
@@ -263,14 +263,14 @@ pub fn list_plugins() -> Result<Vec<PluginEntry>, String> {
         }
     }
 
-    // Ensure antigravity-filter-bypass always appears at the top of the list even if not installed yet
-    if !entries.contains_key("antigravity-filter-bypass") {
+    // Ensure onlydevs-filter-bypass always appears at the top of the list even if not installed yet
+    if !entries.contains_key("onlydevs-filter-bypass") {
         let bundled_src = paths::default_bundled_plugin_source();
         let meta = if bundled_src.is_dir() {
-            inspect_plugin_dir(&bundled_src, "antigravity-filter-bypass")
+            inspect_plugin_dir(&bundled_src, "onlydevs-filter-bypass")
         } else {
             PluginManifestMeta {
-                name: Some("antigravity-filter-bypass".into()),
+                name: Some("onlydevs-filter-bypass".into()),
                 description: Some("Execution continuity lifecycle hook for Antigravity".into()),
                 version: Some("1.3.1".into()),
                 hooks: vec![
@@ -283,12 +283,12 @@ pub fn list_plugins() -> Result<Vec<PluginEntry>, String> {
             }
         };
         entries.insert(
-            "antigravity-filter-bypass".into(),
+            "onlydevs-filter-bypass".into(),
             PluginEntry {
-                id: "antigravity-filter-bypass".into(),
+                id: "onlydevs-filter-bypass".into(),
                 name: meta
                     .name
-                    .unwrap_or_else(|| "antigravity-filter-bypass".into()),
+                    .unwrap_or_else(|| "onlydevs-filter-bypass".into()),
                 description: meta.description,
                 enabled: false,
                 installed: false,
@@ -303,8 +303,8 @@ pub fn list_plugins() -> Result<Vec<PluginEntry>, String> {
 
     let mut list: Vec<PluginEntry> = entries.into_values().collect();
     list.sort_by(|a, b| {
-        let a_is_fb = a.id == "antigravity-filter-bypass";
-        let b_is_fb = b.id == "antigravity-filter-bypass";
+        let a_is_fb = a.id == "onlydevs-filter-bypass";
+        let b_is_fb = b.id == "onlydevs-filter-bypass";
         b_is_fb.cmp(&a_is_fb).then_with(|| a.id.cmp(&b.id))
     });
     Ok(list)

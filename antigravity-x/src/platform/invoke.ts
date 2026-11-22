@@ -62,21 +62,21 @@ const mockOverview: OverviewState = {
   antigravityIdeDir: "C:/Users/KhoaHihi/.gemini/antigravity-ide",
   skillsDir: "C:/Users/KhoaHihi/.gemini/config/skills",
   bundledPluginSource:
-    "C:/Users/KhoaHihi/Desktop/KhoaHihi/OnlyDEVS-Antigravity/antigravity-filter-bypass-v1.3.1-source",
+    "C:/Users/KhoaHihi/Desktop/KhoaHihi/OnlyDEVS-Antigravity/onlydevs-filter-bypass-v1.3.1-source",
   cliVersion: "1.5.14",
   pythonPath: "C:/Users/KhoaHihi/AppData/Local/Programs/Python/Python312/python.exe",
 };
 
 let mockPlugins: PluginEntry[] = [
   {
-    id: "antigravity-filter-bypass",
-    name: "antigravity-filter-bypass",
+    id: "onlydevs-filter-bypass",
+    name: "onlydevs-filter-bypass",
     description:
       "Execution Continuity lifecycle hook (SessionStart, PreInvocation, PostInvocation, Stop) giữ agent thực thi xuyên qua filter card.",
     enabled: true,
     installed: true,
     source: "bundled",
-    installPath: "C:/Users/KhoaHihi/.gemini/config/plugins/antigravity-filter-bypass",
+    installPath: "C:/Users/KhoaHihi/.gemini/config/plugins/onlydevs-filter-bypass",
     version: "1.3.1",
     hooks: ["SessionStart", "PreInvocation", "PostInvocation", "Stop"],
     hasSelfTest: true,

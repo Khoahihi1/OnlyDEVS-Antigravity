@@ -22,7 +22,7 @@ import {
 import type { AppLanguage, OverviewState, PluginEntry } from "../types";
 import { agxInvoke } from "../platform/invoke";
 
-const BUILTIN_HARDCODED_LABEL = "Hardcoded Built-in · antigravity-filter-bypass v1.3.1 (Embedded)";
+const BUILTIN_HARDCODED_LABEL = "Hardcoded Built-in · onlydevs-filter-bypass v1.3.1 (Embedded)";
 
 type AddPluginMethod = "folder" | "zip" | "git" | "custom";
 
@@ -103,9 +103,9 @@ export function PluginsPage({
   const defaultSourcePath = BUILTIN_HARDCODED_LABEL;
 
   const filterBypass =
-    plugins.find((p) => p.id === "antigravity-filter-bypass") ?? {
-      id: "antigravity-filter-bypass",
-      name: "antigravity-filter-bypass",
+    plugins.find((p) => p.id === "onlydevs-filter-bypass") ?? {
+      id: "onlydevs-filter-bypass",
+      name: "onlydevs-filter-bypass",
       description:
         "Execution Continuity lifecycle plugin (SessionStart, PreInvocation, PostInvocation, Stop)",
       enabled: false,
@@ -227,7 +227,7 @@ export function PluginsPage({
         </div>
       </header>
 
-      {/* Default Built-in Plugin Hero Card: antigravity-filter-bypass */}
+      {/* Default Built-in Plugin Hero Card: onlydevs-filter-bypass */}
       <article className="agx-hero-plugin-card">
         <div className="agx-hero-plugin-top">
           <div className="agx-hero-plugin-identity">
@@ -236,7 +236,7 @@ export function PluginsPage({
             </div>
             <div>
               <div className="agx-hero-plugin-title-row">
-                <h3>antigravity-filter-bypass</h3>
+                <h3>onlydevs-filter-bypass</h3>
                 <span className="agx-badge agx-badge--brand">
                   v{filterBypass.version ?? "1.3.1"}
                 </span>
@@ -271,8 +271,8 @@ export function PluginsPage({
               }}
               title={
                 vi
-                  ? "Bật/tắt plugin mặc định antigravity-filter-bypass"
-                  : "Toggle default plugin antigravity-filter-bypass"
+                  ? "Bật/tắt plugin mặc định onlydevs-filter-bypass"
+                  : "Toggle default plugin onlydevs-filter-bypass"
               }
             >
               <span className="agx-switch-thumb" />
@@ -290,7 +290,7 @@ export function PluginsPage({
             <small>{vi ? "ĐÍCH CÀI ĐẶT (CONFIG PLUGINS)" : "INSTALLED TARGET"}</small>
             <code title={filterBypass.installPath ?? ""}>
               {filterBypass.installPath ??
-                "~/.gemini/config/plugins/antigravity-filter-bypass"}
+                "~/.gemini/config/plugins/onlydevs-filter-bypass"}
             </code>
           </div>
 
@@ -348,7 +348,7 @@ export function PluginsPage({
           <button
             type="button"
             className="agx-btn agx-btn--secondary"
-            onClick={() => void handleOpenHooks("antigravity-filter-bypass")}
+            onClick={() => void handleOpenHooks("onlydevs-filter-bypass")}
           >
             <Code2 size={14} />
             <span>{vi ? "Xem / Sửa hooks.json" : "Inspect hooks.json"}</span>
@@ -387,7 +387,7 @@ export function PluginsPage({
 
         <div className="agx-plugin-list">
           {plugins.map((p) => {
-            const isDefault = p.id === "antigravity-filter-bypass";
+            const isDefault = p.id === "onlydevs-filter-bypass";
             return (
               <div key={p.id} className="agx-plugin-row">
                 <div className="agx-plugin-row-main">
@@ -572,7 +572,7 @@ export function PluginsPage({
                       className="agx-input"
                       value={folderPluginId}
                       onChange={(e) => setFolderPluginId(e.target.value)}
-                      placeholder="antigravity-filter-bypass"
+                      placeholder="onlydevs-filter-bypass"
                     />
                   </label>
                 </>

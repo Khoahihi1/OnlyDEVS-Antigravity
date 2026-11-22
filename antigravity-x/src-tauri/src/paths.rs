@@ -94,8 +94,8 @@ pub(crate) fn default_bundled_plugin_source() -> PathBuf {
     let mut candidates = vec![
         PathBuf::from("../plugin"),
         PathBuf::from("plugin"),
-        PathBuf::from("../antigravity-filter-bypass-v1.3.1-source"),
-        PathBuf::from("antigravity-filter-bypass-v1.3.1-source"),
+        PathBuf::from("../onlydevs-filter-bypass-v1.3.1-source"),
+        PathBuf::from("onlydevs-filter-bypass-v1.3.1-source"),
     ];
     if let Ok(exe) = std::env::current_exe() {
         for ancestor in exe.ancestors().skip(1).take(5) {
