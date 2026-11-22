@@ -33,7 +33,7 @@ import type {
   VersionJumpInfo,
 } from "./types";
 
-const APP_VERSION = "1.1.3";
+const APP_VERSION = "1.1.4";
 
 const VALID_LANGS: AppLanguage[] = ["vi", "en", "zh-CN", "zh-TW", "ja", "ko", "ru", "de"];
 const VALID_THEME_COLORS: AppThemeColor[] = [
@@ -350,12 +350,23 @@ export default function App() {
               await refreshAll();
             }}
             onPrepareOAuth={() => agxInvoke<OAuthPrepareResult>("prepare_oauth_session")}
-            onSubmitOAuthCallback={async (callbackUrl) => {
-              const acc = await agxInvoke<AntigravityAccount>("submit_oauth_callback_url", {
-                callbackUrl,
-              });
+            onStartOAuthLogin={async () => {
+              const acc = await agxInvoke<AntigravityAccount>("start_oauth_login");
               showToast(`OAuth thành công: ${acc.email}`);
               await refreshAll();
+            }}
+            onCompleteOAuthLogin={async () => {
+              const acc = await agxInvoke<AntigravityAccount>("complete_oauth_login");
+              showToast(`OAuth thành công: ${acc.email}`);
+              await refreshAll();
+            }}
+            onSubmitOAuthCallback={async (callbackUrl) => {
+              await agxInvoke<void>("submit_oauth_callback_url", {
+                callbackUrl,
+              });
+            }}
+            onCancelOAuthLogin={async () => {
+              await agxInvoke<void>("cancel_oauth_login");
             }}
             onGenerateTotp={(secret) =>
               agxInvoke<TotpCodeResult>("generate_totp_code", { secret })

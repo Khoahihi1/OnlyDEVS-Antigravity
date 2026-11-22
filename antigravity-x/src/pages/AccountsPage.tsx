@@ -53,7 +53,7 @@ import type {
   TokenUsageSummary,
   TotpCodeResult,
 } from "../types";
-import { agxInvoke, openExternalUrl } from "../platform/invoke";
+import { agxInvoke, isTauri } from "../platform/invoke";
 import { tr } from "../i18n";
 import {
   AntigravityQuotaSection,
@@ -108,7 +108,10 @@ type AccountsPageProps = {
   }) => Promise<void>;
   onDeleteAccounts: (accountIds: string[]) => Promise<void>;
   onPrepareOAuth: () => Promise<OAuthPrepareResult>;
+  onStartOAuthLogin: () => Promise<void>;
+  onCompleteOAuthLogin: () => Promise<void>;
   onSubmitOAuthCallback: (callbackUrl: string) => Promise<void>;
+  onCancelOAuthLogin: () => Promise<void>;
   onGenerateTotp: (secret: string) => Promise<TotpCodeResult>;
   onClearSwitchHistory: () => Promise<void>;
 };
@@ -183,7 +186,10 @@ export function AccountsPage({
   onUpdateMetadata,
   onDeleteAccounts,
   onPrepareOAuth,
+  onStartOAuthLogin,
+  onCompleteOAuthLogin,
   onSubmitOAuthCallback,
+  onCancelOAuthLogin,
   onGenerateTotp,
   onClearSwitchHistory,
 }: AccountsPageProps) {
@@ -228,7 +234,26 @@ export function AccountsPage({
     "oauth" | "local" | "token" | "batch" | "json"
   >("oauth");
   const [oauthPrep, setOauthPrep] = useState<OAuthPrepareResult | null>(null);
+  const [oauthPrepLoading, setOauthPrepLoading] = useState(false);
+  const [oauthWorking, setOauthWorking] = useState(false);
+  const [oauthStatusText, setOauthStatusText] = useState<string | null>(null);
+  const [oauthError, setOauthError] = useState<string | null>(null);
   const [oauthCallbackUrl, setOauthCallbackUrl] = useState("");
+  const addModalOpenRef = useRef(addModalOpen);
+  const addTabRef = useRef(addTab);
+  const oauthWorkingRef = useRef(oauthWorking);
+  const oauthPrepRef = useRef(oauthPrep);
+  const oauthPrepInFlightRef = useRef(false);
+  const onPrepareOAuthRef = useRef(onPrepareOAuth);
+  const onCompleteOAuthLoginRef = useRef(onCompleteOAuthLogin);
+  const onCancelOAuthLoginRef = useRef(onCancelOAuthLogin);
+  addModalOpenRef.current = addModalOpen;
+  addTabRef.current = addTab;
+  oauthWorkingRef.current = oauthWorking;
+  oauthPrepRef.current = oauthPrep;
+  onPrepareOAuthRef.current = onPrepareOAuth;
+  onCompleteOAuthLoginRef.current = onCompleteOAuthLogin;
+  onCancelOAuthLoginRef.current = onCancelOAuthLogin;
   const [tokenInput, setTokenInput] = useState("");
   const [tokenEmailHint, setTokenEmailHint] = useState("");
   const [batchInput, setBatchInput] = useState("");
@@ -707,35 +732,195 @@ export function AccountsPage({
     }
   };
 
+  // OAuth lifecycle: auto-prepare on open, cancel on close/tab switch,
+  // and listen to Tauri `oauth-callback-received` so both browser redirect & manual paste finish automatically once.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let active = true;
+    let unlistenUrl: (() => void) | undefined;
+    let unlistenCallback: (() => void) | undefined;
+
+    void import("@tauri-apps/api/event").then(async ({ listen }) => {
+      if (!active) return;
+      unlistenUrl = await listen<string>("oauth-url-generated", (event) => {
+        const url = String(event.payload || "");
+        if (!url) return;
+        setOauthPrep((prev) =>
+          prev ? { ...prev, authUrl: url } : { authUrl: url, redirectUri: "", state: "" },
+        );
+      });
+      if (!active) {
+        unlistenUrl?.();
+        return;
+      }
+      unlistenCallback = await listen("oauth-callback-received", async () => {
+        if (!addModalOpenRef.current || addTabRef.current !== "oauth") return;
+        if (oauthWorkingRef.current) {
+          setOauthStatusText(
+            vi
+              ? "Đã nhận callback từ Google, đang đổi token & tải quota..."
+              : "Callback received, exchanging token & fetching quota...",
+          );
+          return;
+        }
+        if (!oauthPrepRef.current) return;
+        oauthWorkingRef.current = true;
+        setOauthWorking(true);
+        setOauthError(null);
+        setOauthStatusText(
+          vi
+            ? "Đã nhận callback từ Google, đang hoàn tất đăng nhập..."
+            : "Callback received, completing sign-in...",
+        );
+        try {
+          await onCompleteOAuthLoginRef.current();
+          setOauthCallbackUrl("");
+          setOauthPrep(null);
+          setOauthStatusText(null);
+          setAddModalOpen(false);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          setOauthError(msg);
+          setOauthPrep(null);
+        } finally {
+          oauthWorkingRef.current = false;
+          setOauthWorking(false);
+        }
+      });
+    });
+
+    return () => {
+      active = false;
+      unlistenUrl?.();
+      unlistenCallback?.();
+    };
+  }, [vi]);
+
+  useEffect(() => {
+    if (!addModalOpen || addTab !== "oauth" || oauthPrep || oauthPrepInFlightRef.current) return;
+    let cancelled = false;
+    oauthPrepInFlightRef.current = true;
+    setOauthPrepLoading(true);
+    onPrepareOAuthRef
+      .current()
+      .then((prep) => {
+        if (!cancelled) {
+          setOauthPrep(prep);
+          setOauthError(null);
+        }
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          setOauthError(e instanceof Error ? e.message : String(e));
+        }
+      })
+      .finally(() => {
+        oauthPrepInFlightRef.current = false;
+        setOauthPrepLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [addModalOpen, addTab, oauthPrep]);
+
+  useEffect(() => {
+    if (addModalOpen && addTab === "oauth") return;
+    if (!oauthPrep && !oauthWorking) return;
+    void onCancelOAuthLoginRef.current().catch(() => {});
+    setOauthPrep(null);
+    setOauthCallbackUrl("");
+    setOauthError(null);
+    setOauthStatusText(null);
+    setOauthWorking(false);
+    oauthWorkingRef.current = false;
+  }, [addModalOpen, addTab, oauthPrep, oauthWorking]);
+
+  useEffect(() => {
+    return () => {
+      if (addModalOpenRef.current && addTabRef.current === "oauth") {
+        void onCancelOAuthLoginRef.current().catch(() => {});
+      }
+    };
+  }, []);
+
   const handleStartOAuth = async () => {
-    setBusyKey("oauth-prep");
+    if (oauthWorkingRef.current) return;
+    oauthWorkingRef.current = true;
+    setOauthWorking(true);
+    setOauthError(null);
+    setOauthStatusText(
+      vi
+        ? "Đã mở trình duyệt — hoàn tất đăng nhập Google, app sẽ tự nhận tài khoản..."
+        : "Browser opened — finish Google sign-in and the app will auto-complete...",
+    );
     try {
-      const prep = await onPrepareOAuth();
-      setOauthPrep(prep);
-      await openExternalUrl(prep.authUrl);
-      flashMsg(
-        "ok",
-        vi
-          ? "Đã mở trình duyệt đăng nhập Google. Hoàn tất rồi dán URL callback nếu trình duyệt không tự quay về."
-          : "Opened Google sign-in. Complete login or paste callback URL below.",
-      );
+      await onStartOAuthLogin();
+      setOauthCallbackUrl("");
+      setOauthPrep(null);
+      setOauthStatusText(null);
+      setAddModalOpen(false);
     } catch (e) {
-      flashMsg("err", e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      setOauthError(msg);
+      setOauthStatusText(null);
+      setOauthPrep(null);
+      flashMsg("err", msg);
     } finally {
-      setBusyKey(null);
+      oauthWorkingRef.current = false;
+      setOauthWorking(false);
     }
   };
 
-  const handleSubmitCallback = async () => {
-    if (!oauthCallbackUrl.trim()) return;
-    setBusyKey("oauth-submit");
+  const handleCompleteOAuth = async () => {
+    if (oauthWorkingRef.current) return;
+    oauthWorkingRef.current = true;
+    setOauthWorking(true);
+    setOauthError(null);
+    setOauthStatusText(
+      vi
+        ? "Đang chờ callback từ trình duyệt..."
+        : "Waiting for browser OAuth callback...",
+    );
     try {
-      await onSubmitOAuthCallback(oauthCallbackUrl.trim());
+      await onCompleteOAuthLogin();
       setOauthCallbackUrl("");
       setOauthPrep(null);
+      setOauthStatusText(null);
       setAddModalOpen(false);
     } catch (e) {
-      flashMsg("err", e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      setOauthError(msg);
+      setOauthStatusText(null);
+      setOauthPrep(null);
+      flashMsg("err", msg);
+    } finally {
+      oauthWorkingRef.current = false;
+      setOauthWorking(false);
+    }
+  };
+
+  const handleResetOAuth = async () => {
+    setOauthError(null);
+    setOauthStatusText(null);
+    setOauthCallbackUrl("");
+    setOauthWorking(false);
+    oauthWorkingRef.current = false;
+    await onCancelOAuthLogin().catch(() => {});
+    setOauthPrep(null);
+  };
+
+  const handleSubmitCallback = async () => {
+    const trimmed = oauthCallbackUrl.trim();
+    if (!trimmed) return;
+    setBusyKey("oauth-submit");
+    setOauthError(null);
+    try {
+      await onSubmitOAuthCallback(trimmed);
+      setOauthCallbackUrl("");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setOauthError(msg);
+      flashMsg("err", msg);
     } finally {
       setBusyKey(null);
     }
@@ -1831,55 +2016,124 @@ export function AccountsPage({
             <div className="agx-modal-body">
               {addTab === "oauth" ? (
                 <div className="od-add-pane">
-                  <button
-                    type="button"
-                    className="agx-btn agx-btn--primary od-add-hero-btn"
-                    disabled={busyKey === "oauth-prep"}
-                    onClick={() => void handleStartOAuth()}
-                  >
-                    {busyKey === "oauth-prep" ? (
-                      <Loader2 size={16} className="spin" />
-                    ) : (
-                      <ExternalLink size={16} />
-                    )}
-                    <span>
-                      {vi ? "Đăng nhập Google OAuth" : "Sign in with Google"}
-                    </span>
-                  </button>
+                  <div className="od-oauth-actions-row">
+                    <button
+                      type="button"
+                      className="agx-btn agx-btn--primary od-add-hero-btn"
+                      disabled={oauthWorking || oauthPrepLoading}
+                      onClick={() => void handleStartOAuth()}
+                    >
+                      {oauthWorking ? (
+                        <Loader2 size={16} className="spin" />
+                      ) : (
+                        <ExternalLink size={16} />
+                      )}
+                      <span>
+                        {oauthWorking
+                          ? vi
+                            ? "Đang chờ Google xác nhận..."
+                            : "Waiting for Google..."
+                          : vi
+                            ? "Đăng nhập Google (Tự động)"
+                            : "Sign in with Google"}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="agx-btn agx-btn--secondary"
+                      disabled={!oauthPrep || oauthWorking}
+                      onClick={() => void handleCompleteOAuth()}
+                      title={
+                        vi
+                          ? "Dùng nếu bạn tự mở link ở tab ẩn danh / trình duyệt khác"
+                          : "Use if you opened the link in another browser or incognito"
+                      }
+                    >
+                      <Check size={15} />
+                      <span>{vi ? "Tôi đã đăng nhập" : "I've authorized"}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="agx-btn agx-btn--secondary"
+                      disabled={oauthPrepLoading}
+                      onClick={() => void handleResetOAuth()}
+                      title={vi ? "Hủy phiên cũ & tạo link OAuth mới" : "Reset & generate fresh OAuth link"}
+                    >
+                      <RefreshCw size={14} className={oauthPrepLoading ? "spin" : ""} />
+                    </button>
+                  </div>
 
-                  {oauthPrep ? (
-                    <div className="od-oauth-box">
-                      <div className="ag-oauth-url-row">
-                        <code>{oauthPrep.authUrl}</code>
-                        <button
-                          type="button"
-                          className="agx-btn agx-btn--secondary agx-btn--sm"
-                          onClick={() => void copyText(oauthPrep.authUrl, "oauth-url")}
-                        >
-                          {copiedId === "oauth-url" ? <Check size={13} /> : <Copy size={13} />}
-                        </button>
-                      </div>
-                      <div className="od-inline-submit">
-                        <input
-                          type="text"
-                          className="agx-input"
-                          value={oauthCallbackUrl}
-                          onChange={(e) => setOauthCallbackUrl(e.target.value)}
-                          placeholder="http://localhost:.../oauth-callback?code=..."
-                        />
-                        <button
-                          type="button"
-                          className="agx-btn agx-btn--primary"
-                          disabled={
-                            !oauthCallbackUrl.trim() || busyKey === "oauth-submit"
-                          }
-                          onClick={() => void handleSubmitCallback()}
-                        >
-                          {vi ? "Xác nhận" : "Confirm"}
-                        </button>
-                      </div>
+                  {oauthStatusText ? (
+                    <div className="od-oauth-status is-info">
+                      <Loader2 size={14} className="spin" />
+                      <span>{oauthStatusText}</span>
                     </div>
                   ) : null}
+
+                  {oauthError ? (
+                    <div className="od-oauth-status is-err">
+                      <AlertTriangle size={14} />
+                      <span>{oauthError}</span>
+                    </div>
+                  ) : null}
+
+                  <div className="od-oauth-box">
+                    <div className="od-oauth-field-label">
+                      {vi
+                        ? "Link ủy quyền OAuth (copy nếu muốn mở bằng trình duyệt khác / ẩn danh)"
+                        : "OAuth authorization URL (copy to open in another browser / incognito)"}
+                    </div>
+                    <div className="ag-oauth-url-row">
+                      <code>
+                        {oauthPrep?.authUrl ||
+                          (vi ? "Đang tạo link OAuth..." : "Generating OAuth link...")}
+                      </code>
+                      <button
+                        type="button"
+                        className="agx-btn agx-btn--secondary agx-btn--sm"
+                        disabled={!oauthPrep?.authUrl}
+                        onClick={() =>
+                          oauthPrep?.authUrl &&
+                          void copyText(oauthPrep.authUrl, "oauth-url")
+                        }
+                      >
+                        {copiedId === "oauth-url" ? <Check size={13} /> : <Copy size={13} />}
+                      </button>
+                    </div>
+
+                    <div className="od-oauth-field-label">
+                      {vi
+                        ? "Dán URL callback thủ công (chỉ cần khi trình duyệt không tự quay về localhost)"
+                        : "Manual callback URL (only needed if browser cannot reach localhost)"}
+                    </div>
+                    <div className="od-inline-submit">
+                      <input
+                        type="text"
+                        className="agx-input"
+                        value={oauthCallbackUrl}
+                        onChange={(e) => setOauthCallbackUrl(e.target.value)}
+                        placeholder="http://localhost:.../oauth-callback?code=...&state=..."
+                        disabled={!oauthPrep || busyKey === "oauth-submit"}
+                      />
+                      <button
+                        type="button"
+                        className="agx-btn agx-btn--secondary"
+                        disabled={
+                          !oauthPrep ||
+                          !oauthCallbackUrl.trim() ||
+                          busyKey === "oauth-submit"
+                        }
+                        onClick={() => void handleSubmitCallback()}
+                      >
+                        {busyKey === "oauth-submit" ? (
+                          <Loader2 size={14} className="spin" />
+                        ) : (
+                          <Check size={14} />
+                        )}
+                        <span>{vi ? "Xác nhận" : "Confirm"}</span>
+                      </button>
+                    </div>
+                  </div>
                 </div>
               ) : null}
 

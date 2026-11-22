@@ -373,15 +373,36 @@ fn delete_accounts(account_ids: Vec<String>) -> Result<usize, String> {
 }
 
 #[tauri::command]
-async fn prepare_oauth_session() -> Result<accounts::OAuthPrepareResult, String> {
-    accounts::prepare_oauth_session().await
+async fn prepare_oauth_session(
+    app: tauri::AppHandle,
+) -> Result<accounts::OAuthPrepareResult, String> {
+    accounts::prepare_oauth_session(app).await
+}
+
+#[tauri::command]
+async fn start_oauth_login(app: tauri::AppHandle) -> Result<accounts::AntigravityAccount, String> {
+    accounts::start_oauth_login(app).await
+}
+
+#[tauri::command]
+async fn complete_oauth_login(
+    app: tauri::AppHandle,
+) -> Result<accounts::AntigravityAccount, String> {
+    accounts::complete_oauth_login(app).await
 }
 
 #[tauri::command]
 async fn submit_oauth_callback_url(
+    app: tauri::AppHandle,
     callback_url: String,
-) -> Result<accounts::AntigravityAccount, String> {
-    accounts::submit_oauth_callback_url(callback_url).await
+) -> Result<(), String> {
+    accounts::submit_oauth_callback_url(app, callback_url).await
+}
+
+#[tauri::command]
+fn cancel_oauth_login() -> Result<(), String> {
+    accounts::cancel_oauth_login();
+    Ok(())
 }
 
 #[tauri::command]
@@ -710,7 +731,10 @@ pub fn run() {
             update_account_metadata,
             delete_accounts,
             prepare_oauth_session,
+            start_oauth_login,
+            complete_oauth_login,
             submit_oauth_callback_url,
+            cancel_oauth_login,
             generate_totp_code,
             get_switch_history,
             clear_switch_history,

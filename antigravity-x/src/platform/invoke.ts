@@ -492,6 +492,12 @@ export async function agxInvoke<T>(command: string, args?: Record<string, unknow
         redirectUri: "http://localhost:54321/oauth-callback",
         state: "mock-state",
       } as OAuthPrepareResult as T;
+    case "start_oauth_login":
+    case "complete_oauth_login":
+      return mockAccounts[0] as T;
+    case "submit_oauth_callback_url":
+    case "cancel_oauth_login":
+      return undefined as T;
     case "generate_totp_code":
       return { code: "482910", remainingSeconds: 22 } as TotpCodeResult as T;
     case "get_switch_history":

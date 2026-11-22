@@ -7,10 +7,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use tauri::{AppHandle, Emitter};
+use tauri_plugin_opener::OpenerExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::time::{timeout, Duration};
 use url::Url;
 use uuid::Uuid;
@@ -865,34 +867,57 @@ fn http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("Tạo HTTP client: {e}"))
 }
 
+fn encode_form_pairs(pairs: &[(&str, &str)]) -> String {
+    let mut ser = url::form_urlencoded::Serializer::new(String::new());
+    for (k, v) in pairs {
+        ser.append_pair(k, v);
+    }
+    ser.finish()
+}
+
 async fn refresh_google_access_token(refresh_token: &str) -> Result<GoogleTokenResponse, String> {
     let client = http_client()?;
-    let body = format!(
-        "client_id={}&client_secret={}&refresh_token={}&grant_type=refresh_token",
-        url::form_urlencoded::byte_serialize(CLIENT_ID.as_bytes()).collect::<String>(),
-        url::form_urlencoded::byte_serialize(CLIENT_SECRET.as_bytes()).collect::<String>(),
-        url::form_urlencoded::byte_serialize(refresh_token.trim().as_bytes()).collect::<String>(),
-    );
-    let res = client
-        .post(TOKEN_URL)
-        .header(reqwest::header::USER_AGENT, NATIVE_OAUTH_USER_AGENT)
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
-        )
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| format!("OAuth refresh request lỗi: {e}"))?;
+    let body = encode_form_pairs(&[
+        ("client_id", CLIENT_ID),
+        ("client_secret", CLIENT_SECRET),
+        ("refresh_token", refresh_token.trim()),
+        ("grant_type", "refresh_token"),
+    ]);
 
-    if !res.status().is_success() {
+    for attempt in 0..2 {
+        let res = client
+            .post(TOKEN_URL)
+            .header(reqwest::header::USER_AGENT, NATIVE_OAUTH_USER_AGENT)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(body.clone())
+            .send()
+            .await
+            .map_err(|e| format!("OAuth refresh request lỗi: {e}"))?;
+
+        if res.status().is_success() {
+            return res
+                .json::<GoogleTokenResponse>()
+                .await
+                .map_err(|e| format!("Parse token response: {e}"));
+        }
+
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
+        let is_invalid_grant = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
+            .as_deref()
+            == Some("invalid_grant");
+        if attempt == 0 && is_invalid_grant {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
         return Err(format!("OAuth refresh thất bại ({status}): {text}"));
     }
-    res.json::<GoogleTokenResponse>()
-        .await
-        .map_err(|e| format!("Parse token response: {e}"))
+    unreachable!("OAuth refresh attempts are bounded")
 }
 
 pub(crate) async fn ensure_fresh_access_token(
@@ -937,13 +962,13 @@ async fn exchange_google_code(
     redirect_uri: &str,
 ) -> Result<GoogleTokenResponse, String> {
     let client = http_client()?;
-    let body = format!(
-        "client_id={}&client_secret={}&code={}&redirect_uri={}&grant_type=authorization_code",
-        url::form_urlencoded::byte_serialize(CLIENT_ID.as_bytes()).collect::<String>(),
-        url::form_urlencoded::byte_serialize(CLIENT_SECRET.as_bytes()).collect::<String>(),
-        url::form_urlencoded::byte_serialize(code.trim().as_bytes()).collect::<String>(),
-        url::form_urlencoded::byte_serialize(redirect_uri.trim().as_bytes()).collect::<String>(),
-    );
+    let body = encode_form_pairs(&[
+        ("client_id", CLIENT_ID),
+        ("client_secret", CLIENT_SECRET),
+        ("code", code.trim()),
+        ("redirect_uri", redirect_uri.trim()),
+        ("grant_type", "authorization_code"),
+    ]);
     let res = client
         .post(TOKEN_URL)
         .header(reqwest::header::USER_AGENT, NATIVE_OAUTH_USER_AGENT)
@@ -1345,21 +1370,34 @@ async fn fetch_cloud_code_quota(
 // Core Account Lifecycle Operations
 // ============================================================================
 
-async fn build_or_update_account_from_refresh_token(
-    refresh_token: String,
+async fn build_or_update_account_from_token_response(
+    token_res: GoogleTokenResponse,
+    fallback_refresh_token: Option<String>,
     mark_current: bool,
 ) -> Result<AntigravityAccount, String> {
-    let token_res = refresh_google_access_token(&refresh_token).await?;
-    let user_info = fetch_google_user_info(&token_res.access_token).await?;
-    let email = user_info.email.trim().to_lowercase();
     let effective_refresh = token_res
         .refresh_token
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or(refresh_token);
+        .or_else(|| fallback_refresh_token.filter(|s| !s.trim().is_empty()))
+        .ok_or_else(|| {
+            "Google không trả về refresh_token (tài khoản này có thể đã cấp quyền trước đó).\n\
+             Cách xử lý:\n\
+             1. Mở https://myaccount.google.com/permissions\n\
+             2. Thu hồi quyền của ứng dụng Antigravity\n\
+             3. Thực hiện ủy quyền OAuth lại từ đầu."
+                .to_string()
+        })?;
 
+    let user_info = fetch_google_user_info(&token_res.access_token).await?;
+    let email = user_info.email.trim().to_lowercase();
     let now = Utc::now().timestamp();
-    let (quota, quota_error) =
-        fetch_cloud_code_quota(&token_res.access_token, &email, None).await?;
+
+    // Non-fatal quota fetch right after OAuth login so a transient quota glitch never drops valid tokens
+    let (quota_opt, quota_error) =
+        match fetch_cloud_code_quota(&token_res.access_token, &email, None).await {
+            Ok((q, err)) => (Some(q), err),
+            Err(_) => (None, None),
+        };
 
     let conn = open_db()?;
     ensure_accounts_schema(&conn)?;
@@ -1369,6 +1407,8 @@ async fn build_or_update_account_from_refresh_token(
         .as_ref()
         .map(|a| a.id.clone())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    let effective_quota = quota_opt.or_else(|| existing.as_ref().and_then(|a| a.quota.clone()));
 
     let account = AntigravityAccount {
         id: id.clone(),
@@ -1408,11 +1448,20 @@ async fn build_or_update_account_from_refresh_token(
             expiry_timestamp: now + token_res.expires_in,
             token_type: "Bearer".into(),
             email: Some(email),
-            project_id: quota.project_id.clone(),
-            is_gcp_tos: quota.is_gcp_tos,
-            id_token: token_res.id_token,
+            project_id: effective_quota
+                .as_ref()
+                .and_then(|q| q.project_id.clone())
+                .or_else(|| existing.as_ref().and_then(|a| a.token.project_id.clone())),
+            is_gcp_tos: effective_quota
+                .as_ref()
+                .and_then(|q| q.is_gcp_tos)
+                .or_else(|| existing.as_ref().and_then(|a| a.token.is_gcp_tos)),
+            id_token: token_res
+                .id_token
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| existing.as_ref().and_then(|a| a.token.id_token.clone())),
         },
-        quota: Some(quota),
+        quota: effective_quota,
         quota_error,
         created_at: existing.as_ref().map(|a| a.created_at).unwrap_or(now),
         last_used: now,
@@ -1425,6 +1474,14 @@ async fn build_or_update_account_from_refresh_token(
         let _ = set_current_account_id(&conn, &id);
     }
     load_account_by_id(&conn, &id)
+}
+
+async fn build_or_update_account_from_refresh_token(
+    refresh_token: String,
+    mark_current: bool,
+) -> Result<AntigravityAccount, String> {
+    let token_res = refresh_google_access_token(&refresh_token).await?;
+    build_or_update_account_from_token_response(token_res, Some(refresh_token), mark_current).await
 }
 
 pub async fn import_local_account() -> Result<AntigravityAccount, String> {
@@ -2228,19 +2285,79 @@ pub fn export_accounts_json(
 }
 
 // ============================================================================
-// Google OAuth 2.0 Loopback Server & Manual Callback Flow
+// Google OAuth 2.0 Loopback Server & Manual Callback Flow (Dual-Stack, Single-Use)
 // ============================================================================
 
-struct ActiveOAuthSession {
+const OAUTH_CALLBACK_PATH: &str = "/oauth-callback";
+const MAX_OAUTH_HTTP_REQUEST_BYTES: usize = 32 * 1024;
+const OAUTH_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const OAUTH_FLOW_WAIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+struct OAuthFlowState {
+    auth_url: String,
     redirect_uri: String,
-    state: String,
-    code_tx: Option<oneshot::Sender<String>>,
+    expected_state: String,
+    cancel_tx: watch::Sender<bool>,
+    code_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<Result<String, String>>>>>,
+    code_rx: Option<oneshot::Receiver<Result<String, String>>>,
 }
 
-static OAUTH_SESSION: OnceLock<Mutex<Option<ActiveOAuthSession>>> = OnceLock::new();
+static OAUTH_FLOW_STATE: OnceLock<Mutex<Option<OAuthFlowState>>> = OnceLock::new();
 
-fn oauth_session_lock() -> &'static Mutex<Option<ActiveOAuthSession>> {
-    OAUTH_SESSION.get_or_init(|| Mutex::new(None))
+fn oauth_flow_state_lock() -> &'static Mutex<Option<OAuthFlowState>> {
+    OAUTH_FLOW_STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn clear_oauth_flow_state() {
+    if let Ok(mut lock) = oauth_flow_state_lock().lock() {
+        if let Some(prev) = lock.take() {
+            let _ = prev.cancel_tx.send(true);
+        }
+    }
+}
+
+pub fn cancel_oauth_login() {
+    clear_oauth_flow_state();
+}
+
+fn oauth_success_html() -> &'static str {
+    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n\
+    <html>\
+    <body style='font-family:system-ui,-apple-system,sans-serif;text-align:center;padding:52px;background:#0d1117;color:#f3f4f6;'>\
+        <h1 style='color:#4ade80;margin-bottom:10px;'>✅ OnlyDEVS — Ủy quyền OAuth thành công!</h1>\
+        <p style='color:#9ca3af;'>Bạn có thể đóng tab này và quay lại ứng dụng OnlyDEVS.</p>\
+        <script>setTimeout(function(){window.close();},1800);</script>\
+    </body>\
+    </html>"
+}
+
+fn oauth_fail_html(message: &str) -> String {
+    let escaped = message
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n\
+        <html>\
+        <body style='font-family:system-ui,-apple-system,sans-serif;text-align:center;padding:52px;background:#0d1117;color:#f3f4f6;'>\
+            <h1 style='color:#f87171;margin-bottom:10px;'>❌ Ủy quyền OAuth thất bại</h1>\
+            <p style='color:#d1d5db;'>{escaped}</p>\
+        </body>\
+        </html>"
+    )
+}
+
+fn oauth_not_found_response() -> &'static str {
+    "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nNot Found"
+}
+
+fn oauth_options_response() -> &'static str {
+    "HTTP/1.1 200 OK\r\n\
+    Access-Control-Allow-Origin: *\r\n\
+    Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+    Access-Control-Allow-Headers: Content-Type\r\n\
+    Content-Length: 0\r\n\
+    Connection: close\r\n\r\n"
 }
 
 fn build_google_auth_url(redirect_uri: &str, state: &str) -> String {
@@ -2270,151 +2387,414 @@ fn build_google_auth_url(redirect_uri: &str, state: &str) -> String {
         .to_string()
 }
 
-pub async fn prepare_oauth_session() -> Result<OAuthPrepareResult, String> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| format!("Bind OAuth loopback port: {e}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| format!("Local addr: {e}"))?
-        .port();
-    let redirect_uri = format!("http://localhost:{port}/oauth-callback");
-    let state = Uuid::new_v4().to_string();
-    let auth_url = build_google_auth_url(&redirect_uri, &state);
+fn extract_code_from_callback_url(
+    callback_url: &Url,
+    expected_state: &str,
+) -> Result<String, String> {
+    let mut code = None;
+    let mut state = None;
+    let mut error = None;
+    let mut error_desc = None;
 
-    let (code_tx, code_rx) = oneshot::channel::<String>();
-    {
-        let mut lock = oauth_session_lock()
-            .lock()
-            .map_err(|_| "OAuth lock error".to_string())?;
-        *lock = Some(ActiveOAuthSession {
-            redirect_uri: redirect_uri.clone(),
-            state: state.clone(),
-            code_tx: Some(code_tx),
-        });
+    for (key, value) in callback_url.query_pairs() {
+        match key.as_ref() {
+            "code" if code.is_none() => code = Some(value.into_owned()),
+            "state" if state.is_none() => state = Some(value.into_owned()),
+            "error" if error.is_none() => error = Some(value.into_owned()),
+            "error_description" if error_desc.is_none() => error_desc = Some(value.into_owned()),
+            _ => {}
+        }
     }
 
-    let expected_state = state.clone();
-    let expected_redirect = redirect_uri.clone();
-
-    // Background listener for browser callback
-    tokio::spawn(async move {
-        let accept_fut = async {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = [0u8; 4096];
-                if let Ok(n) = stream.read(&mut buf).await {
-                    let req = String::from_utf8_lossy(&buf[..n]);
-                    if let Some(first_line) = req.lines().next() {
-                        if let Some(target) = first_line.split_whitespace().nth(1) {
-                            if let Ok(parsed) =
-                                Url::parse(&format!("http://localhost:{port}{target}"))
-                            {
-                                let mut code_opt = None;
-                                let mut state_opt = None;
-                                for (k, v) in parsed.query_pairs() {
-                                    if k == "code" {
-                                        code_opt = Some(v.into_owned());
-                                    } else if k == "state" {
-                                        state_opt = Some(v.into_owned());
-                                    }
-                                }
-                                if let (Some(c), Some(st)) = (code_opt, state_opt) {
-                                    if st == expected_state {
-                                        let html = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><body style='font-family:sans-serif;text-align:center;padding:50px;background:#0d1117;color:#fff;'><h2 style='color:#4ade80;'>✅ OnlyDEVS — OAuth Ủy quyền thành công!</h2><p>Bạn có thể đóng tab này và quay lại ứng dụng OnlyDEVS.</p><script>setTimeout(()=>window.close(),1800)</script></body></html>";
-                                        let _ = stream.write_all(html.as_bytes()).await;
-                                        let _ = stream.flush().await;
-                                        if let Ok(mut lock) = oauth_session_lock().lock() {
-                                            if let Some(sess) = lock.as_mut() {
-                                                if let Some(tx) = sess.code_tx.take() {
-                                                    let _ = tx.send(c);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    if let Some(err) = error.filter(|v| !v.trim().is_empty()) {
+        return match error_desc.filter(|v| !v.trim().is_empty()) {
+            Some(desc) => Err(format!("Google OAuth từ chối ({err}): {desc}")),
+            None => Err(format!("Google OAuth từ chối ({err})")),
         };
-        let _ = timeout(Duration::from_secs(600), accept_fut).await;
-        let _ = expected_redirect;
-    });
+    }
 
-    // Store receiver in a waiter task is handled by await_oauth_session or submit_oauth_callback_url
+    let Some(code) = code.filter(|v| !v.trim().is_empty()) else {
+        return Err("Không tìm thấy tham số 'code' trong Callback URL".to_string());
+    };
+
+    let Some(state) = state.filter(|v| !v.trim().is_empty()) else {
+        return Err("Không tìm thấy tham số 'state' trong Callback URL".to_string());
+    };
+
+    if state != expected_state {
+        return Err(
+            "OAuth state không khớp với phiên hiện tại (link cũ hoặc đã tạo phiên mới — hãy mở lại link hiện tại)".to_string(),
+        );
+    }
+
+    Ok(code)
+}
+
+fn parse_manual_callback_url(raw_callback_url: &str, redirect_uri: &str) -> Result<Url, String> {
+    let trimmed = raw_callback_url.trim();
+    if trimmed.is_empty() {
+        return Err("Callback URL không được để trống".to_string());
+    }
+
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Url::parse(trimmed).map_err(|e| format!("Callback URL không hợp lệ: {e}"));
+    }
+
+    let redirect =
+        Url::parse(redirect_uri).map_err(|e| format!("redirect_uri không hợp lệ: {e}"))?;
+    let host = redirect
+        .host_str()
+        .ok_or_else(|| "redirect_uri thiếu host".to_string())?;
+    let origin = match redirect.port() {
+        Some(port) => format!("{}://{}:{}", redirect.scheme(), host, port),
+        None => format!("{}://{}", redirect.scheme(), host),
+    };
+
+    if trimmed.starts_with('/') {
+        return Url::parse(&format!("{origin}{trimmed}"))
+            .map_err(|e| format!("Callback URL không hợp lệ: {e}"));
+    }
+
+    Url::parse(&format!(
+        "{origin}{OAUTH_CALLBACK_PATH}?{}",
+        trimmed.trim_start_matches('?')
+    ))
+    .map_err(|e| format!("Callback query không hợp lệ: {e}"))
+}
+
+async fn read_oauth_http_request(stream: &mut tokio::net::TcpStream) -> Result<String, String> {
+    let mut buffer = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 2048];
+
+    loop {
+        let bytes_read = timeout(OAUTH_REQUEST_READ_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .map_err(|_| "Đọc OAuth callback request quá hạn".to_string())?
+            .map_err(|e| format!("Đọc OAuth callback request lỗi: {e}"))?;
+
+        if bytes_read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..bytes_read]);
+        if buffer.windows(4).any(|w| w == b"\r\n\r\n")
+            || buffer.len() >= MAX_OAUTH_HTTP_REQUEST_BYTES
+        {
+            break;
+        }
+    }
+
+    if buffer.is_empty() {
+        return Err("OAuth callback request rỗng".to_string());
+    }
+
+    Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+fn parse_oauth_request_target(request: &str) -> Result<(String, String), String> {
+    let request_line = request
+        .lines()
+        .next()
+        .ok_or_else(|| "OAuth callback request rỗng".to_string())?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| "OAuth callback thiếu HTTP method".to_string())?;
+    let target = parts
+        .next()
+        .ok_or_else(|| "OAuth callback thiếu request target".to_string())?;
+    Ok((method.to_string(), target.to_string()))
+}
+
+async fn process_oauth_callback_request(
+    stream: &mut tokio::net::TcpStream,
+    port: u16,
+    expected_state: &str,
+) -> Option<Result<String, String>> {
+    let request = match read_oauth_http_request(stream).await {
+        Ok(req) => req,
+        Err(err) => {
+            let response = oauth_fail_html("Không đọc được callback từ trình duyệt, hãy thử lại.");
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+            return Some(Err(err));
+        }
+    };
+
+    let (method, target) = match parse_oauth_request_target(&request) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let response = oauth_fail_html("Định dạng callback không hợp lệ, hãy thử lại.");
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+            return Some(Err(err));
+        }
+    };
+
+    if method.eq_ignore_ascii_case("OPTIONS") {
+        let _ = stream.write_all(oauth_options_response().as_bytes()).await;
+        let _ = stream.flush().await;
+        return None;
+    }
+
+    let callback_url = match if target.starts_with("http://") || target.starts_with("https://") {
+        Url::parse(&target)
+    } else {
+        Url::parse(&format!("http://localhost:{port}{target}"))
+    } {
+        Ok(url) => url,
+        Err(_) => {
+            let response = oauth_fail_html("Không phân tích được URL callback, hãy thử lại.");
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+            return Some(Err("OAuth callback URL không hợp lệ".to_string()));
+        }
+    };
+
+    if callback_url.path() != OAUTH_CALLBACK_PATH {
+        let _ = stream.write_all(oauth_not_found_response().as_bytes()).await;
+        let _ = stream.flush().await;
+        return None;
+    }
+
+    let code = match extract_code_from_callback_url(&callback_url, expected_state) {
+        Ok(code) => code,
+        Err(err) => {
+            let response = oauth_fail_html(&err);
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+            return Some(Err(err));
+        }
+    };
+
+    let _ = stream.write_all(oauth_success_html().as_bytes()).await;
+    let _ = stream.flush().await;
+    Some(Ok(code))
+}
+
+struct OAuthCallbackListeners {
+    ipv4: Option<TcpListener>,
+    ipv6: Option<TcpListener>,
+    port: u16,
+}
+
+fn callback_redirect_uri(port: u16, has_ipv4: bool, has_ipv6: bool) -> String {
+    let host = match (has_ipv4, has_ipv6) {
+        (true, true) => "localhost",
+        (true, false) => "127.0.0.1",
+        (false, true) => "[::1]",
+        (false, false) => unreachable!("OAuth requires a bound loopback listener"),
+    };
+    format!("http://{host}:{port}{OAUTH_CALLBACK_PATH}")
+}
+
+async fn bind_callback_listeners() -> Result<OAuthCallbackListeners, String> {
+    let (first, is_ipv6) = match TcpListener::bind("[::1]:0").await {
+        Ok(listener) => (listener, true),
+        Err(_) => (
+            TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|e| format!("Không thể mở cổng OAuth loopback: {e}"))?,
+            false,
+        ),
+    };
+    let port = first
+        .local_addr()
+        .map_err(|e| format!("Không lấy được cổng local: {e}"))?
+        .port();
+    let other_addr = if is_ipv6 {
+        format!("127.0.0.1:{port}")
+    } else {
+        format!("[::1]:{port}")
+    };
+    let other = TcpListener::bind(&other_addr).await.ok();
+    let (ipv4, ipv6) = if is_ipv6 {
+        (other, Some(first))
+    } else {
+        (Some(first), other)
+    };
+    Ok(OAuthCallbackListeners { ipv4, ipv6, port })
+}
+
+async fn accept_oauth_callback(
+    listener: &Option<TcpListener>,
+) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+    match listener {
+        Some(l) => l.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn ensure_oauth_flow_prepared(app_handle: &AppHandle) -> Result<OAuthPrepareResult, String> {
+    if let Ok(lock) = oauth_flow_state_lock().lock() {
+        if let Some(s) = lock.as_ref() {
+            return Ok(OAuthPrepareResult {
+                auth_url: s.auth_url.clone(),
+                redirect_uri: s.redirect_uri.clone(),
+                state: s.expected_state.clone(),
+            });
+        }
+    }
+
+    let listeners = bind_callback_listeners().await?;
+    let port = listeners.port;
+    let redirect_uri =
+        callback_redirect_uri(port, listeners.ipv4.is_some(), listeners.ipv6.is_some());
+    let state_token = Uuid::new_v4().to_string();
+    let auth_url = build_google_auth_url(&redirect_uri, &state_token);
+
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    let (code_tx, code_rx) = oneshot::channel::<Result<String, String>>();
+    let code_tx = Arc::new(tokio::sync::Mutex::new(Some(code_tx)));
+
+    let tx_clone = code_tx.clone();
+    let app_clone = app_handle.clone();
+    let expected_state = state_token.clone();
+
     tokio::spawn(async move {
-        if let Ok(code) = code_rx.await {
-            let redirect = {
-                oauth_session_lock()
-                    .lock()
-                    .ok()
-                    .and_then(|l| l.as_ref().map(|s| s.redirect_uri.clone()))
+        loop {
+            let accept_result = tokio::select! {
+                res = accept_oauth_callback(&listeners.ipv4) => Some(res),
+                res = accept_oauth_callback(&listeners.ipv6) => Some(res),
+                _ = cancel_rx.changed() => None,
             };
-            if let Some(redir) = redirect {
-                if let Ok(tok_res) = exchange_google_code(&code, &redir).await {
-                    if let Some(rt) = tok_res.refresh_token {
-                        let _ = build_or_update_account_from_refresh_token(rt, false).await;
-                    }
+
+            let Some(accept_result) = accept_result else {
+                break;
+            };
+
+            let Ok((mut stream, _)) = accept_result else {
+                continue;
+            };
+
+            if let Some(result) =
+                process_oauth_callback_request(&mut stream, port, &expected_state).await
+            {
+                if let Some(sender) = tx_clone.lock().await.take() {
+                    let _ = app_clone.emit("oauth-callback-received", ());
+                    let _ = sender.send(result);
                 }
+                break;
             }
         }
     });
+
+    {
+        let mut lock = oauth_flow_state_lock()
+            .lock()
+            .map_err(|_| "OAuth state lock bị lỗi".to_string())?;
+        *lock = Some(OAuthFlowState {
+            auth_url: auth_url.clone(),
+            redirect_uri: redirect_uri.clone(),
+            expected_state: state_token.clone(),
+            cancel_tx,
+            code_tx,
+            code_rx: Some(code_rx),
+        });
+    }
+
+    let _ = app_handle.emit("oauth-url-generated", &auth_url);
 
     Ok(OAuthPrepareResult {
         auth_url,
         redirect_uri,
-        state,
+        state: state_token,
     })
 }
 
-pub async fn submit_oauth_callback_url(callback_url: String) -> Result<AntigravityAccount, String> {
-    let trimmed = callback_url.trim();
-    if trimmed.is_empty() {
-        return Err("Callback URL không được để trống".into());
-    }
-    let (redirect_uri, expected_state) = {
-        let lock = oauth_session_lock()
+async fn await_oauth_code_and_exchange() -> Result<GoogleTokenResponse, String> {
+    let (code_rx, redirect_uri) = {
+        let mut lock = oauth_flow_state_lock()
             .lock()
-            .map_err(|_| "OAuth lock error".to_string())?;
-        let sess = lock
+            .map_err(|_| "OAuth state lock bị lỗi".to_string())?;
+        let Some(state) = lock.as_mut() else {
+            return Err("Chưa có phiên OAuth nào đang chờ".to_string());
+        };
+        let rx = state
+            .code_rx
+            .take()
+            .ok_or_else(|| "Phiên OAuth đang được xử lý, vui lòng chờ...".to_string())?;
+        (rx, state.redirect_uri.clone())
+    };
+
+    let code = match timeout(OAUTH_FLOW_WAIT_TIMEOUT, code_rx).await {
+        Ok(Ok(Ok(code))) => code,
+        Ok(Ok(Err(e))) => {
+            clear_oauth_flow_state();
+            return Err(e);
+        }
+        Ok(Err(_)) => {
+            clear_oauth_flow_state();
+            return Err("Phiên OAuth đã bị hủy".to_string());
+        }
+        Err(_) => {
+            clear_oauth_flow_state();
+            return Err("Hết thời gian chờ Google OAuth callback (10 phút), hãy thử lại".to_string());
+        }
+    };
+
+    clear_oauth_flow_state();
+    exchange_google_code(&code, &redirect_uri).await
+}
+
+pub async fn prepare_oauth_session(app_handle: AppHandle) -> Result<OAuthPrepareResult, String> {
+    ensure_oauth_flow_prepared(&app_handle).await
+}
+
+pub async fn start_oauth_login(app_handle: AppHandle) -> Result<AntigravityAccount, String> {
+    let prep = ensure_oauth_flow_prepared(&app_handle).await?;
+    app_handle
+        .opener()
+        .open_url(&prep.auth_url, None::<String>)
+        .map_err(|e| {
+            clear_oauth_flow_state();
+            format!("Không thể mở trình duyệt cho OAuth: {e}")
+        })?;
+    let tok_res = await_oauth_code_and_exchange().await?;
+    build_or_update_account_from_token_response(tok_res, None, false).await
+}
+
+pub async fn complete_oauth_login(app_handle: AppHandle) -> Result<AntigravityAccount, String> {
+    let _ = ensure_oauth_flow_prepared(&app_handle).await?;
+    let tok_res = await_oauth_code_and_exchange().await?;
+    build_or_update_account_from_token_response(tok_res, None, false).await
+}
+
+pub async fn submit_oauth_callback_url(
+    app_handle: AppHandle,
+    callback_url: String,
+) -> Result<(), String> {
+    let (redirect_uri, expected_state, code_tx) = {
+        let lock = oauth_flow_state_lock()
+            .lock()
+            .map_err(|_| "OAuth state lock bị lỗi".to_string())?;
+        let state = lock
             .as_ref()
-            .ok_or_else(|| "Chưa khởi tạo phiên OAuth (hãy bấm Tạo link OAuth trước)".to_string())?;
-        (sess.redirect_uri.clone(), sess.state.clone())
+            .ok_or_else(|| "Chưa khởi tạo phiên OAuth (hãy tạo link OAuth trước)".to_string())?;
+        (
+            state.redirect_uri.clone(),
+            state.expected_state.clone(),
+            state.code_tx.clone(),
+        )
     };
 
-    let parsed = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        Url::parse(trimmed).map_err(|e| format!("Callback URL không hợp lệ: {e}"))?
-    } else {
-        Url::parse(&format!(
-            "{}?{}",
-            redirect_uri,
-            trimmed.trim_start_matches('?')
-        ))
-        .map_err(|e| format!("Callback query không hợp lệ: {e}"))?
-    };
-
-    let mut code = None;
-    let mut state = None;
-    for (k, v) in parsed.query_pairs() {
-        if k == "code" {
-            code = Some(v.into_owned());
-        } else if k == "state" {
-            state = Some(v.into_owned());
-        }
-    }
-    let code = code.ok_or_else(|| "Không tìm thấy tham số 'code' trong Callback URL".to_string())?;
-    if let Some(st) = state {
-        if st != expected_state {
-            return Err("OAuth state không khớp với phiên hiện tại".into());
-        }
+    let parsed = parse_manual_callback_url(&callback_url, &redirect_uri)?;
+    if parsed.path() != OAUTH_CALLBACK_PATH {
+        return Err(format!(
+            "Đường dẫn callback không hợp lệ (phải là {OAUTH_CALLBACK_PATH})"
+        ));
     }
 
-    let tok_res = exchange_google_code(&code, &redirect_uri).await?;
-    let rt = tok_res
-        .refresh_token
-        .ok_or_else(|| "Google không trả về refresh_token (hãy thu hồi quyền rồi thử lại)".to_string())?;
-    build_or_update_account_from_refresh_token(rt, false).await
+    let code = extract_code_from_callback_url(&parsed, &expected_state)?;
+
+    let mut tx = code_tx.lock().await;
+    let sender = tx
+        .take()
+        .ok_or_else(|| "Callback OAuth đã được xử lý rồi, không cần gửi lại.".to_string())?;
+    sender
+        .send(Ok(code))
+        .map_err(|_| "Phiên OAuth đã đóng, hãy tạo link mới và thử lại.".to_string())?;
+    let _ = app_handle.emit("oauth-callback-received", ());
+    Ok(())
 }
 
 // ============================================================================
@@ -2924,5 +3304,141 @@ pub fn pick_folder_dialog(default_path: Option<String>) -> Result<Option<String>
     {
         let _ = default_path;
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod oauth_tests {
+    use super::*;
+
+    #[test]
+    fn callback_redirect_uri_matches_bound_families() {
+        assert_eq!(
+            callback_redirect_uri(54321, true, true),
+            "http://localhost:54321/oauth-callback"
+        );
+        assert_eq!(
+            callback_redirect_uri(54321, true, false),
+            "http://127.0.0.1:54321/oauth-callback"
+        );
+        assert_eq!(
+            callback_redirect_uri(54321, false, true),
+            "http://[::1]:54321/oauth-callback"
+        );
+    }
+
+    #[test]
+    fn manual_callback_parser_handles_full_path_and_query_and_validates_state() {
+        let redirect = "http://localhost:41234/oauth-callback";
+        let state = "test-state-123";
+
+        let full = parse_manual_callback_url(
+            "http://localhost:41234/oauth-callback?code=4%2F0AbC&state=test-state-123",
+            redirect,
+        )
+        .unwrap();
+        assert_eq!(full.path(), OAUTH_CALLBACK_PATH);
+        assert_eq!(
+            extract_code_from_callback_url(&full, state).unwrap(),
+            "4/0AbC"
+        );
+
+        let path_only =
+            parse_manual_callback_url("/oauth-callback?code=my_code&state=test-state-123", redirect)
+                .unwrap();
+        assert_eq!(
+            extract_code_from_callback_url(&path_only, state).unwrap(),
+            "my_code"
+        );
+
+        let query_only =
+            parse_manual_callback_url("code=raw_code&state=test-state-123", redirect).unwrap();
+        assert_eq!(
+            extract_code_from_callback_url(&query_only, state).unwrap(),
+            "raw_code"
+        );
+
+        let wrong_state = parse_manual_callback_url(
+            "http://localhost:41234/oauth-callback?code=4%2F0AbC&state=stale-state",
+            redirect,
+        )
+        .unwrap();
+        assert!(extract_code_from_callback_url(&wrong_state, state).is_err());
+
+        let denied = parse_manual_callback_url(
+            "http://localhost:41234/oauth-callback?error=access_denied&state=test-state-123",
+            redirect,
+        )
+        .unwrap();
+        let err = extract_code_from_callback_url(&denied, state).unwrap_err();
+        assert!(err.contains("access_denied"));
+    }
+
+    #[test]
+    fn encode_form_pairs_encodes_oauth_code_and_redirect_uri() {
+        let encoded = encode_form_pairs(&[
+            ("code", "4/0AbC+def=ghi"),
+            ("redirect_uri", "http://localhost:54321/oauth-callback"),
+            ("grant_type", "authorization_code"),
+        ]);
+        assert!(encoded.contains("code=4%2F0AbC%2Bdef%3Dghi"));
+        assert!(encoded.contains("redirect_uri=http%3A%2F%2Flocalhost%3A54321%2Foauth-callback"));
+        assert!(encoded.contains("grant_type=authorization_code"));
+    }
+
+    #[tokio::test]
+    async fn loopback_ignores_favicon_and_options_then_accepts_callback_once() {
+        let listeners = bind_callback_listeners().await.unwrap();
+        let port = listeners.port;
+        let expected_state = "state-loopback-check".to_string();
+        let (code_tx, code_rx) = oneshot::channel::<Result<String, String>>();
+        let code_tx = Arc::new(tokio::sync::Mutex::new(Some(code_tx)));
+        let tx_clone = code_tx.clone();
+        let st_clone = expected_state.clone();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let accept_result = tokio::select! {
+                    res = accept_oauth_callback(&listeners.ipv4) => res,
+                    res = accept_oauth_callback(&listeners.ipv6) => res,
+                };
+                let Ok((mut stream, _)) = accept_result else {
+                    continue;
+                };
+                if let Some(res) = process_oauth_callback_request(&mut stream, port, &st_clone).await {
+                    if let Some(sender) = tx_clone.lock().await.take() {
+                        let _ = sender.send(res);
+                    }
+                    break;
+                }
+            }
+        });
+
+        let addr = format!("127.0.0.1:{port}");
+        // 1. Browser /favicon.ico probe must NOT break the listener
+        let mut s1 = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        s1.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut r1 = [0u8; 256];
+        let n1 = s1.read(&mut r1).await.unwrap();
+        assert!(String::from_utf8_lossy(&r1[..n1]).starts_with("HTTP/1.1 404"));
+
+        // 2. Real Google callback succeeds
+        let mut s2 = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        s2.write_all(
+            b"GET /oauth-callback?code=4%2F0GoodCode&state=state-loopback-check HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut r2 = [0u8; 512];
+        let n2 = s2.read(&mut r2).await.unwrap();
+        assert!(String::from_utf8_lossy(&r2[..n2]).starts_with("HTTP/1.1 200"));
+
+        let received = code_rx.await.unwrap().unwrap();
+        assert_eq!(received, "4/0GoodCode");
+        // Second consumer cannot double-consume the authorization code
+        assert!(code_tx.lock().await.take().is_none());
+        let _ = server.await;
     }
 }
