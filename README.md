@@ -9,10 +9,6 @@
   </p>
 
   <p>
-    <strong>🇬🇧 English</strong> &nbsp;·&nbsp; <a href="README.vi.md">🇻🇳 Tiếng Việt</a>
-  </p>
-
-  <p>
     <a href="https://github.com/Khoahihi1/OnlyDEVS-Antigravity/releases/latest">
       <img src="https://img.shields.io/github/v/release/Khoahihi1/OnlyDEVS-Antigravity?style=for-the-badge&color=EF2328&labelColor=090A0F&label=Release" alt="Latest Release" />
     </a>
@@ -110,8 +106,7 @@ OnlyDEVS-Antigravity/
 ├── antigravity-x/       # Tauri 2 + React 19 + Rust desktop application source
 ├── plugin/              # antigravity-filter-bypass plugin source (also embedded in binary)
 ├── Prompt/              # Instruction prompt templates synced into ~/.gemini/config/AGENTS.md
-├── README.md            # English documentation
-└── README.vi.md         # Vietnamese documentation
+└── README.md            # Documentation
 ```
 
 ---
