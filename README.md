@@ -6,6 +6,14 @@ Control Suite (Tauri 2 + React 19 + Rust) for **Antigravity** — built by **Onl
 - **Discord Server:** https://discord.gg/kEdMcjnftp
 - **Releases:** https://github.com/Khoahihi1/OnlyDEVS-Antigravity/releases
 
+## Repository Layout
+
+- `build.bat` — One-click Windows build script (auto checks Node/pnpm/Rust, runs typecheck, builds `.exe` + NSIS `-setup.exe`).
+- `dev.bat` — Launch Tauri dev mode from repository root.
+- `antigravity-x/` — Tauri 2 + React 19 + Rust application source.
+- `plugin/` — Source of `antigravity-filter-bypass` plugin (also embedded directly inside the compiled binary).
+- `Prompt/` — Curated prompt templates synced into `~/.gemini/config/AGENTS.md`.
+
 ## Features
 
 - **Account & Session Token Usage:**
@@ -21,9 +29,14 @@ Control Suite (Tauri 2 + React 19 + Rust) for **Antigravity** — built by **Onl
 - **MCP / Skill:** Manage `~/.gemini/config/mcp_config.json` servers and Agent Skills (`SKILL.md`).
 - **Auto-Update & Themes:** GitHub Releases auto-updater with live download progress + NSIS installer handoff, 8 languages (`VI`, `EN`, `简体中文`, `繁體中文`, `JA`, `KO`, `RU`, `DE`), and 7 color themes (`OnlyDEVS`, `Nord`, `Tokyo Night`, `Catppuccin`, `Gruvbox`, `Everforest`, `OLED Pure`) in Dark & Light modes.
 
-## Build From Source
+## Build From Source (Windows)
+
+Double-click `build.bat` at the repository root, or run:
 
 ```bat
-cd antigravity-x
-scripts\build.bat
+build.bat
 ```
+
+Output binaries:
+- `antigravity-x\src-tauri\target\release\OnlyDEVS-Antigravity.exe`
+- `antigravity-x\src-tauri\target\release\bundle\nsis\OnlyDEVS-Antigravity_<version>_x64-setup.exe`

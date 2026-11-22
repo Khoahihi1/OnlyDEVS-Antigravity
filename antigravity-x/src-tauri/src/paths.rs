@@ -91,28 +91,36 @@ pub(crate) fn default_bundled_plugin_source() -> PathBuf {
             return PathBuf::from(trimmed);
         }
     }
-    let candidates = [
+    let mut candidates = vec![
+        PathBuf::from("../plugin"),
+        PathBuf::from("plugin"),
         PathBuf::from("../antigravity-filter-bypass-v1.3.1-source"),
         PathBuf::from("antigravity-filter-bypass-v1.3.1-source"),
-        PathBuf::from(
-            r"C:\Users\KhoaHihi\Desktop\KhoaHihi\OnlyDEVS-Antigravity\antigravity-filter-bypass-v1.3.1-source",
-        ),
     ];
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors().skip(1).take(5) {
+            candidates.push(ancestor.join("plugin"));
+        }
+    }
     for c in &candidates {
         if c.is_dir() {
             return std::fs::canonicalize(c).unwrap_or_else(|_| c.clone());
         }
     }
-    candidates[2].clone()
+    PathBuf::from("plugin")
 }
 
 pub(crate) fn workspace_examples_dirs() -> Vec<PathBuf> {
-    let candidates = [
-        PathBuf::from(r"C:\Users\KhoaHihi\Desktop\KhoaHihi\OnlyDEVS-Antigravity\Prompt"),
+    let mut candidates = vec![
         PathBuf::from("../Prompt"),
+        PathBuf::from("Prompt"),
         PathBuf::from("examples"),
-        PathBuf::from(r"C:\Users\KhoaHihi\Desktop\KhoaHihi\OnlyDEVS-Antigravity\antigravity-x\examples"),
     ];
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors().skip(1).take(5) {
+            candidates.push(ancestor.join("Prompt"));
+        }
+    }
     let mut out = Vec::new();
     for c in candidates {
         if c.is_dir() {
