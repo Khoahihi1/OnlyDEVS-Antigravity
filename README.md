@@ -35,7 +35,7 @@
 | :--- | :--- |
 | **👤 Accounts** | Google OAuth 2.0 login, local account sync, Refresh Token / Batch / JSON & folder import-export. Live quota buckets (`Gemini · 5h`, `Gemini · Weekly`, `Claude · 5h`, `Claude · Weekly`, `Gemini 4 Argon`, `Gemini 4 Carbon`). 1-click **`+ API / API ✓`** pool toggle on every card, **Launch / Switch Account Popup** (auto-detects installed Antigravity targets, graceful restart & full credential sync), Groups, Custom Sort, Tags, Privacy Mode, Notes, 2FA TOTP Vault, and Switch History. |
 | **📊 Session Token Usage** | Read-only local scanner separating **Input / Thinking / Output / Cache** tokens with interactive SVG trend charts, model/workspace/type cross-filtering, conversation table, and per-turn breakdown. |
-| **⚡ API Service Router** | **Pure Antigravity Cloud Code proxy** (`cloudcode-pa.googleapis.com` / `daily-cloudcode-pa.googleapis.com`) powered solely by your pooled Antigravity OAuth accounts. Exposes standard local/LAN compatibility endpoints (`/v1/chat/completions`, `/v1/models`, `/v1/messages`) so external editors & SDKs can consume your Antigravity quota directly. |
+| **⚡ API Service Router** | **Pure Antigravity Cloud Code proxy** (`daily-cloudcode-pa.googleapis.com`) powered solely by your pooled Antigravity OAuth accounts. Exposes standard local/LAN compatibility endpoints (`/v1/chat/completions`, `/v1/responses`, `/v1/models`, `/v1/messages`) with automatic tool/schema compatibility so external editors & SDKs can consume your Antigravity quota directly. |
 | **🧩 Plugins** | Hardcoded built-in `onlydevs-filter-bypass v1.3.1` one-click toggle, self-test runner, live `hooks.json` & `config.json` editors, plus Folder / `.ZIP` / Git URL / Custom Manifest installer. |
 | **📝 Prompts** | Curated instruction prompt library synced with `Prompt/` — toggling a prompt writes directly to `~/.gemini/config/AGENTS.md`. |
 | **💬 Sessions** | Scan, search, group by workspace, inspect transcripts, sync, export to Markdown, and batch delete. |
@@ -47,13 +47,13 @@
 ## ⚡ How the Built-in Antigravity API Router Works
 
 > **100% Antigravity Upstream — Zero Third-Party API Keys Required**  
-> The router **never** connects to OpenAI or Anthropic servers. Every request is translated and forwarded exclusively to **Antigravity Cloud Code** (`cloudcode-pa.googleapis.com` / `daily-cloudcode-pa.googleapis.com`) using the OAuth tokens of the Antigravity accounts in your pool.
+> The router **never** connects to OpenAI or Anthropic servers. Every request is translated and forwarded exclusively to **Antigravity Cloud Code** (`daily-cloudcode-pa.googleapis.com`) using the OAuth tokens of the Antigravity accounts in your pool.
 
 ```mermaid
 flowchart LR
-    A["External Clients & SDKs\n(Cursor, Cline, Roo Code, Claude Code, curl)"] -->|"/v1/chat/completions\n/v1/messages · /v1/models"| B["OnlyDEVS Local API Router\n127.0.0.1:57120"]
-    B -->|"Pool Strategy · Auto Refresh\n429 Cooldown Failover"| C["Antigravity Account Pool\n(+ API toggle per card)"]
-    C -->|"v1internal:streamGenerateContent"| D["Antigravity Cloud Code\n(Gemini 3/4 · Claude 4.5/4.6)"]
+    A["External Clients & SDKs\n(OpenCode, Cline, Roo Code, Claude Code, curl)"] -->|"/v1/chat/completions · /v1/responses\n/v1/messages · /v1/models"| B["OnlyDEVS Local API Router\n127.0.0.1:57120"]
+    B -->|"Smart Pool · Tool/Schema Compat\nAuto Refresh · Scoped Cooldown"| C["Antigravity Account Pool\n(+ API toggle per card)"]
+    C -->|"v1internal:streamGenerateContent"| D["Antigravity Cloud Code\n(Gemini 3.8/4 · Claude 4.6/5.5)"]
 ```
 
 - **Why standard `/v1/*` routes?** Providing OpenAI-style (`/v1/chat/completions`, `/v1/models`) and Anthropic-style (`/v1/messages`) inbound compatibility lets any third-party tool point its Base URL to `http://127.0.0.1:57120/v1` and use your Antigravity quota with streaming, thinking, tool calls, and automatic account failover.
