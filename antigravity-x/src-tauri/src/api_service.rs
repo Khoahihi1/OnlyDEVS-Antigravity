@@ -25,15 +25,40 @@ use crate::prompts::open_db;
 // Antigravity Cloud Code Constants & Protocol Signatures
 // ============================================================================
 
-const ANTIGRAVITY_BASE_URLS: &[&str] = &[
-    "https://daily-cloudcode-pa.googleapis.com",
-    "https://cloudcode-pa.googleapis.com",
-];
+// Official Antigravity chat endpoint — NEVER fall back to prod cloudcode-pa.googleapis.com
+// for chat traffic (prod returns fake 429 RESOURCE_EXHAUSTED for consumer accounts).
+const ANTIGRAVITY_BASE_URLS: &[&str] = &["https://daily-cloudcode-pa.googleapis.com"];
 
-// Official Antigravity 2.25.0 aidev_client fingerprint (required for Gemini 4 / Claude 5.5 models)
+// Official Antigravity 2.25.0 aidev_client fingerprint (verified HTTP 200 on Gemini 4 & Claude 4.6/5.5)
 const ANTIGRAVITY_IDE_USER_AGENT: &str =
     "antigravity/2.25.0 (aidev_client; os_type=windows; arch=amd64; cl=1003475615)";
 const MAX_ANTIGRAVITY_OUTPUT_TOKENS: u64 = 64_000;
+
+const AG_TOOL_SUFFIX: &str = "_ide";
+
+const AG_NATIVE_TOOL_NAMES: &[&str] = &[
+    "browser_subagent",
+    "command_status",
+    "find_by_name",
+    "generate_image",
+    "grep_search",
+    "list_dir",
+    "list_resources",
+    "mcp_sequential-thinking_sequentialthinking",
+    "multi_replace_file_content",
+    "notify_user",
+    "read_resource",
+    "read_terminal",
+    "read_url_content",
+    "replace_file_content",
+    "run_command",
+    "search_web",
+    "send_command_input",
+    "task_boundary",
+    "view_content_chunk",
+    "view_file",
+    "write_to_file",
+];
 
 // Default thinking signature for Gemini 3+ functionCall backfill
 const DEFAULT_THINKING_AG_SIGNATURE: &str = "EuwGCukGAXLI2nxwZIq54WWSoL/YN0P3TsDZ7zRnLi8g0S4aVr2HUGxvaHKySuY6HAVzcE0GPGjXrytLIldxthSvfxgUlJh6Qa9Z+Oj5QZBlYdg6HaJ6yuY5R7waE6rdwBsRf7Ft2j3DJ9rMi9qhWFqApewYtPhls3VHtuvND3l8Rm09+lbAXQs6KKWEWrxNLKTBkfpMgXhRERc/TQRMZu1twAablm6/Zk1tsYRvfWKLsNbeKF+CCojJdXJKvnR/8Ouuoa+Y2Ti20hcW7aZIIjZDFYPU//k6Ybmhg69J/imbFai2ckhfLaisqdDkdoIiBJScTOUvYqP6AE9d4MsydSC+UlhIMk4hoP76R8vUSCZRMkjOaDXstf/QoVZKbt94wyRZgAJ1G0BqI8L5ow86kLpA4wJEtxsRGymOE4bKUvApveBakYDNM9APkf+LbtbzWSseGjoZcSlycF9iN8Q2XNYKRrHbv3Lr5Y8JjdH/5y/6SHkNehTEZugaeGnSPSyCTWto1kQgHpxdWmhkLfJGNUGLmue7Mesj4TSms4J33mRpYVhNB/J333FCqIP0hr/E7BkkjEn7yZ4X7SQlh+xKPurapsnHRwiKmtsilmEFrnTE9iQr+pMr6M29qqFNv1tr5yumbaJw8JW9sB15tNsRv+dW6BjNanbsKz7HCgKUBc8tGy+7YuhXzAfViyRefcjK7eZW0Fbyt7AbybJTKz78W8NH7ye6LAwzOebXpeZ4D43fNIt8bKh26qgduSQv/7o+pAflkuqHZ99YWgHQ8h8OkZFi3eOiSYjsjhdZ/czWOdoPI/OnqIldzMPF5YlrKBLFX8VhRKVmqgsmWf5PHGulHhMkVlS+XG2UIseGy69ARa93D78Gsa+1n1kJr7EEB7Rh+27vUMxVYLdz1yMSvE5nalTAlg/ZeG8+XQ0cHuAI3KbQpHW2Q++RdXfm5JzD5WdJZUU+Zn8t8UUn85BH4RxZLeE0qJikgSsKoYVBc6YhiMjhPgkR95ReimY4Z0xCJdRo1gjexOFeODZMpQF6Yxnoic7IrdgsFA3iePTbFnPp3IAM1fAThWhXJUn3QInUOTd5o1qmTmn6REbL15g/JQNl+dqUoPkhleeb2V3kjqp1okmO3wMZbPknR3S1LZNmlS72/iBQUm+n2b/RCn4PjmM2";
@@ -873,8 +898,38 @@ fn is_fully_cooled_down(account_id: &str) -> bool {
 }
 
 fn parse_retry_seconds_from_body(body: &str, default_secs: u64) -> u64 {
-    // Matches Antigravity quota reset format: "Your quota will reset after 2h7m23s"
-    if let Ok(re) = Regex::new(r"(?i)(?:(\d+)h)?(?:(\d+)m)?(\d+)s") {
+    // 1. Structured Google ErrorInfo/RetryInfo: details[].metadata.quotaResetTimeStamp or details[].retryDelay
+    if let Ok(val) = serde_json::from_str::<Value>(body) {
+        if let Some(details) = val.pointer("/error/details").and_then(Value::as_array) {
+            for d in details {
+                if let Some(ts_str) = d
+                    .pointer("/metadata/quotaResetTimeStamp")
+                    .and_then(Value::as_str)
+                {
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts_str) {
+                        let diff = dt.timestamp() - Utc::now().timestamp();
+                        if diff > 0 {
+                            return (diff as u64).min(3600);
+                        }
+                    }
+                }
+                if let Some(delay_str) = d.get("retryDelay").and_then(Value::as_str) {
+                    let trimmed = delay_str.trim().trim_end_matches('s');
+                    if let Ok(secs) = trimmed.parse::<f64>() {
+                        if secs > 0.0 {
+                            return (secs.ceil() as u64).clamp(5, 3600);
+                        }
+                    }
+                }
+            }
+            // Detail-free 429 (often transient/burst) -> shorter cooldown so accounts recover quickly
+            if details.is_empty() {
+                return default_secs.min(20).max(10);
+            }
+        }
+    }
+    // 2. Text quota reset format: "Your quota will reset after 2h7m23s"
+    if let Ok(re) = Regex::new(r"(?i)reset after (?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?") {
         if let Some(caps) = re.captures(body) {
             let h: u64 = caps.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
             let m: u64 = caps.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
@@ -1318,6 +1373,64 @@ fn sanitize_function_name(name: &str) -> String {
     s.chars().take(64).collect()
 }
 
+fn is_native_ag_tool(name: &str) -> bool {
+    AG_NATIVE_TOOL_NAMES.contains(&name)
+}
+
+fn cloak_tool_name(sanitized: &str) -> String {
+    if is_native_ag_tool(sanitized) || sanitized.ends_with(AG_TOOL_SUFFIX) {
+        sanitized.to_string()
+    } else {
+        let mut s = format!("{sanitized}{AG_TOOL_SUFFIX}");
+        if s.len() > 64 {
+            let keep = 64 - AG_TOOL_SUFFIX.len();
+            s = format!("{}{}", &sanitized[..keep], AG_TOOL_SUFFIX);
+        }
+        s
+    }
+}
+
+fn uncloak_tool_name(name: &str, tool_name_map: &HashMap<String, String>) -> String {
+    if let Some(orig) = tool_name_map.get(name) {
+        return orig.clone();
+    }
+    name.strip_suffix(AG_TOOL_SUFFIX)
+        .unwrap_or(name)
+        .to_string()
+}
+
+/// Rewrite competing-client branding in system prompts so Antigravity Cloud Code
+/// does not flag the request with a fake detail-free 429 RESOURCE_EXHAUSTED.
+fn sanitize_antigravity_system_prompt(raw: &str) -> String {
+    let mut s = raw.replace(
+        "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+        "",
+    );
+    if let Ok(re_billing) = Regex::new(r"(?im)^x-anthropic-billing-header:[^\n]*(?:\r?\n)*") {
+        s = re_billing.replace_all(&s, "").into_owned();
+    }
+    if let Ok(re_hermes) = Regex::new(
+        r"(?i)You are Hermes(?: Agent)?(?:,\s*(?:an intelligent AI assistant|an AI assistant|an AI agent))?(?:,?\s*(?:built|created)\s+by\s+Nous Research)?\.",
+    ) {
+        s = re_hermes.replace_all(&s, "You are an AI assistant.").into_owned();
+    }
+    if let Ok(re_cc) = Regex::new(r"(?i)You are Claude Code, Anthropic's official CLI for Claude\.") {
+        s = re_cc.replace_all(&s, "You are Antigravity, an AI coding assistant.").into_owned();
+    }
+    if let Ok(re_oc) = Regex::new(r"(?i)opencode") {
+        s = re_oc
+            .replace_all(&s, |caps: &regex::Captures| {
+                match caps.get(0).map(|m| m.as_str()).unwrap_or("") {
+                    "OpenCode" => "Antigravity",
+                    "OPENCODE" => "ANTIGRAVITY",
+                    _ => "antigravity",
+                }
+            })
+            .into_owned();
+    }
+    s
+}
+
 fn clean_json_schema_for_antigravity(val: Value) -> Value {
     match val {
         Value::Object(map) => {
@@ -1328,16 +1441,71 @@ fn clean_json_schema_for_antigravity(val: Value) -> Value {
                     "$schema"
                         | "$id"
                         | "$defs"
+                        | "$ref"
+                        | "$comment"
                         | "definitions"
                         | "additionalProperties"
+                        | "additionalItems"
+                        | "unevaluatedProperties"
+                        | "unevaluatedItems"
+                        | "contentSchema"
+                        | "prefixItems"
+                        | "uniqueItems"
+                        | "contains"
                         | "default"
                         | "examples"
                         | "title"
+                        | "optional"
+                        | "~optional"
+                        | "deprecated"
+                        | "readOnly"
+                        | "writeOnly"
+                        | "minLength"
+                        | "maxLength"
+                        | "minItems"
+                        | "maxItems"
+                        | "minProperties"
+                        | "maxProperties"
+                        | "multipleOf"
+                        | "format"
                         | "exclusiveMinimum"
                         | "exclusiveMaximum"
                         | "const"
                         | "propertyNames"
                         | "patternProperties"
+                        | "enumDescriptions"
+                        | "anyOf"
+                        | "oneOf"
+                        | "allOf"
+                        | "not"
+                        | "dependencies"
+                        | "dependentSchemas"
+                        | "dependentRequired"
+                        | "if"
+                        | "then"
+                        | "else"
+                        | "contentMediaType"
+                        | "contentEncoding"
+                        | "errorMessage"
+                        | "errorMessages"
+                        | "x-errorMessage"
+                        | "x-errorMessages"
+                        | "markdownDescription"
+                        | "x-intellij-html-description"
+                        | "x-taplo-info"
+                        | "x-taplo"
+                        | "doNotSuggest"
+                        | "suggestSortText"
+                        | "cornerRadius"
+                        | "fillColor"
+                        | "fontFamily"
+                        | "fontSize"
+                        | "fontWeight"
+                        | "gap"
+                        | "padding"
+                        | "strokeColor"
+                        | "strokeThickness"
+                        | "textColor"
                 ) {
                     continue;
                 }
@@ -1457,11 +1625,17 @@ fn openai_body_to_antigravity_envelope(
     resolved_model: &str,
     project_id: &str,
     session_seed: &str,
-) -> (Value, String) {
+) -> (Value, String, HashMap<String, String>) {
     let mut system_texts: Vec<String> = Vec::new();
     let mut contents: Vec<Value> = Vec::new();
     let mut tool_id_to_name: HashMap<String, String> = HashMap::new();
+    let mut tool_name_map: HashMap<String, String> = HashMap::new();
     let mut first_user_preview = String::new();
+
+    let has_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty());
 
     if let Some(msgs) = body.get("messages").and_then(Value::as_array) {
         for m in msgs {
@@ -1484,7 +1658,7 @@ fn openai_body_to_antigravity_envelope(
             let content = m.get("content").unwrap_or(&Value::Null);
             match role {
                 "system" | "developer" => {
-                    let t = extract_text_from_value(content);
+                    let t = sanitize_antigravity_system_prompt(&extract_text_from_value(content));
                     if !t.trim().is_empty() {
                         system_texts.push(t);
                     }
@@ -1505,7 +1679,7 @@ fn openai_body_to_antigravity_envelope(
                         parts.push(json!({ "text": text }));
                     }
                     if let Some(tcs) = m.get("tool_calls").and_then(Value::as_array) {
-                        for tc in tcs {
+                        for (idx, tc) in tcs.iter().enumerate() {
                             let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
                             let name = tc
                                 .pointer("/function/name")
@@ -1517,14 +1691,31 @@ fn openai_body_to_antigravity_envelope(
                                 .unwrap_or("{}");
                             let args: Value =
                                 serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
-                            parts.push(json!({
-                                "thoughtSignature": DEFAULT_THINKING_AG_SIGNATURE,
+                            let sanitized = sanitize_function_name(name);
+                            let wire_name = if has_tools {
+                                let cloaked = cloak_tool_name(&sanitized);
+                                tool_name_map.entry(cloaked.clone()).or_insert_with(|| name.to_string());
+                                cloaked
+                            } else {
+                                sanitized
+                            };
+                            let mut part = json!({
                                 "functionCall": {
                                     "id": id,
-                                    "name": sanitize_function_name(name),
+                                    "name": wire_name,
                                     "args": args
                                 }
-                            }));
+                            });
+                            // In parallel calls, only the first call gets fallback thoughtSignature
+                            if idx == 0 {
+                                if let Some(obj) = part.as_object_mut() {
+                                    obj.insert(
+                                        "thoughtSignature".into(),
+                                        Value::String(DEFAULT_THINKING_AG_SIGNATURE.into()),
+                                    );
+                                }
+                            }
+                            parts.push(part);
                         }
                     }
                     if !parts.is_empty() {
@@ -1538,20 +1729,24 @@ fn openai_body_to_antigravity_envelope(
                         .cloned()
                         .or_else(|| m.get("name").and_then(Value::as_str).map(str::to_string))
                         .unwrap_or_else(|| "tool".into());
+                    let sanitized = sanitize_function_name(&name);
+                    let wire_name = if has_tools {
+                        let cloaked = cloak_tool_name(&sanitized);
+                        tool_name_map.entry(cloaked.clone()).or_insert_with(|| name.clone());
+                        cloaked
+                    } else {
+                        sanitized
+                    };
                     let raw_text = extract_text_from_value(content);
                     let parsed = serde_json::from_str::<Value>(&raw_text)
                         .unwrap_or_else(|_| json!({ "result": raw_text }));
-                    let resp_obj = if parsed.is_object() {
-                        json!({ "result": parsed })
-                    } else {
-                        json!({ "result": parsed })
-                    };
+                    let resp_obj = json!({ "result": parsed });
                     contents.push(json!({
                         "role": "user",
                         "parts": [{
                             "functionResponse": {
                                 "id": tc_id,
-                                "name": sanitize_function_name(&name),
+                                "name": wire_name,
                                 "response": resp_obj
                             }
                         }]
@@ -1591,7 +1786,7 @@ fn openai_body_to_antigravity_envelope(
         );
     }
 
-    // Tools conversion (OpenAI & Anthropic shapes)
+    // Tools conversion + Anti-ban Cloaking (_ide suffix + native AG decoy tools)
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         let mut decls = Vec::new();
         let mut seen_names = HashSet::new();
@@ -1612,20 +1807,40 @@ fn openai_body_to_antigravity_envelope(
             if name.is_empty() {
                 continue;
             }
-            let clean_name = sanitize_function_name(name);
-            if !seen_names.insert(clean_name.clone()) {
+            let sanitized = sanitize_function_name(name);
+            let wire_name = cloak_tool_name(&sanitized);
+            if !seen_names.insert(wire_name.clone()) {
                 continue;
             }
+            tool_name_map.insert(wire_name.clone(), name.to_string());
             let parameters = params_val
                 .map(clean_json_schema_for_antigravity)
-                .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+                .unwrap_or_else(|| {
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "reason": { "type": "string", "description": "Brief explanation" }
+                        },
+                        "required": ["reason"]
+                    })
+                });
             decls.push(json!({
-                "name": clean_name,
+                "name": wire_name,
                 "description": desc,
                 "parameters": parameters
             }));
         }
         if !decls.is_empty() {
+            // Append native AG decoy tools after client tools so payload matches official Antigravity IDE shape
+            for decoy_name in AG_NATIVE_TOOL_NAMES {
+                if seen_names.insert((*decoy_name).to_string()) {
+                    decls.push(json!({
+                        "name": decoy_name,
+                        "description": "This tool is currently unavailable.",
+                        "parameters": { "type": "OBJECT", "properties": {}, "required": [] }
+                    }));
+                }
+            }
             req_obj.insert("tools".into(), json!([{ "functionDeclarations": decls }]));
             req_obj.insert(
                 "toolConfig".into(),
@@ -1637,7 +1852,7 @@ fn openai_body_to_antigravity_envelope(
     for k in BLACKLISTED_FIELDS {
         req_obj.remove(*k);
     }
-    let session_id = format!("{}-{}", Uuid::new_v4(), Utc::now().timestamp_millis());
+    let session_id = Utc::now().timestamp_millis().to_string();
     req_obj.insert("sessionId".into(), Value::String(session_id));
 
     let conv_id = Uuid::new_v4();
@@ -1652,17 +1867,21 @@ fn openai_body_to_antigravity_envelope(
     );
     let _ = session_seed;
 
-    let envelope = json!({
-        "project": project_id,
-        "model": resolved_model,
-        "userAgent": "antigravity",
-        "requestType": "agent",
-        "requestId": request_id,
-        "request": Value::Object(req_obj)
-    });
+    // Official Antigravity client omits `requestType` on the chat/agent path.
+    // Sending `requestType: "agent"` triggers Google's detail-free 429 RESOURCE_EXHAUSTED
+    // even when full quota is available. Only image generation models keep `requestType: "image_gen"`.
+    let mut envelope_map = Map::new();
+    envelope_map.insert("project".into(), json!(project_id));
+    envelope_map.insert("model".into(), json!(resolved_model));
+    envelope_map.insert("userAgent".into(), json!("antigravity"));
+    if resolved_model.to_ascii_lowercase().contains("image") {
+        envelope_map.insert("requestType".into(), json!("image_gen"));
+    }
+    envelope_map.insert("requestId".into(), json!(request_id));
+    envelope_map.insert("request".into(), Value::Object(req_obj));
 
     let preview: String = first_user_preview.chars().take(240).collect();
-    (envelope, preview)
+    (Value::Object(envelope_map), preview, tool_name_map)
 }
 
 fn responses_body_to_openai_body(body: &Value) -> Value {
@@ -1988,9 +2207,17 @@ async fn send_upstream_with_failover(
     resolved_model: &str,
     openai_body: &Value,
     stream: bool,
-) -> Result<(reqwest::Response, AntigravityAccount, String), (u16, String, String, String)> {
+) -> Result<
+    (
+        reqwest::Response,
+        AntigravityAccount,
+        String,
+        HashMap<String, String>,
+    ),
+    (u16, String, String, String, String),
+> {
     let client = build_upstream_client(cfg)
-        .map_err(|e| (500u16, e, String::new(), String::new()))?;
+        .map_err(|e| (500u16, e, String::new(), String::new(), String::new()))?;
     let all_members = select_pool_members(
         accounts::list_accounts_sync().unwrap_or_default(),
         cfg,
@@ -2001,6 +2228,7 @@ async fn send_upstream_with_failover(
         return Err((
             503u16,
             "Không có tài khoản Antigravity khả dụng trong Pool.".to_string(),
+            String::new(),
             String::new(),
             String::new(),
         ));
@@ -2021,13 +2249,12 @@ async fn send_upstream_with_failover(
             ),
             String::new(),
             String::new(),
+            String::new(),
         ));
     }
 
     let scope = model_quota_scope(resolved_model);
     let mut tried = HashSet::new();
-    // Allow trying up to max_retries+1 real upstream failures, while 404 model-mismatch
-    // failovers do NOT consume a retry slot (bounded by total compatible accounts).
     let max_real_attempts = (cfg.max_retries as usize) + 1;
     let mut real_attempts = 0usize;
     let mut total_hops = 0usize;
@@ -2036,6 +2263,7 @@ async fn send_upstream_with_failover(
     let mut last_err = (
         503u16,
         format!("Không có tài khoản Antigravity khả dụng cho model '{resolved_model}'."),
+        String::new(),
         String::new(),
         String::new(),
     );
@@ -2058,7 +2286,13 @@ async fn send_upstream_with_failover(
                     cfg.cooldown_seconds,
                     e.clone(),
                 );
-                last_err = (401, e, candidate.id.clone(), candidate.email.clone());
+                last_err = (
+                    401,
+                    e,
+                    candidate.id.clone(),
+                    candidate.email.clone(),
+                    String::new(),
+                );
                 real_attempts += 1;
                 continue;
             }
@@ -2072,10 +2306,11 @@ async fn send_upstream_with_failover(
             .filter(|p| !p.trim().is_empty() && p != "aicode-consumers")
             .unwrap_or_else(generate_fallback_project_id);
 
-        let (envelope, preview) =
+        let (envelope, preview, tool_name_map) =
             openai_body_to_antigravity_envelope(openai_body, resolved_model, &project_id, &key.id);
 
-        let action = if stream {
+        let force_non_stream = resolved_model.to_ascii_lowercase().contains("image");
+        let action = if stream && !force_non_stream {
             "streamGenerateContent?alt=sse"
         } else {
             "generateContent"
@@ -2104,7 +2339,7 @@ async fn send_upstream_with_failover(
                                 map.insert(format!("{}:{resolved_model}", key.id), acc.id.clone());
                             }
                         }
-                        succeeded = Some((resp, acc.clone(), preview.clone()));
+                        succeeded = Some((resp, acc.clone(), preview.clone(), tool_name_map.clone()));
                         break;
                     }
                     let err_body = resp.text().await.unwrap_or_default();
@@ -2122,7 +2357,12 @@ async fn send_upstream_with_failover(
                                 .await
                             {
                                 if retry_resp.status().is_success() {
-                                    succeeded = Some((retry_resp, re_acc, preview.clone()));
+                                    succeeded = Some((
+                                        retry_resp,
+                                        re_acc,
+                                        preview.clone(),
+                                        tool_name_map.clone(),
+                                    ));
                                     break;
                                 }
                             }
@@ -2138,28 +2378,55 @@ async fn send_upstream_with_failover(
                             cool,
                             format!("HTTP {status}"),
                         );
-                        last_err = (status, err_body, acc.id.clone(), acc.email.clone());
+                        last_err = (
+                            status,
+                            err_body,
+                            acc.id.clone(),
+                            acc.email.clone(),
+                            preview.clone(),
+                        );
                         continue;
                     }
                     if status == 404 {
                         saw_model_not_found = true;
-                        // Preserve more specific primary error if secondary fallback returns 404
                         if !(matches!(last_err.0, 429 | 403 | 500 | 502 | 503) && saw_non_404_error)
                         {
-                            last_err = (status, err_body, acc.id.clone(), acc.email.clone());
+                            last_err = (
+                                status,
+                                err_body,
+                                acc.id.clone(),
+                                acc.email.clone(),
+                                preview.clone(),
+                            );
                         }
                         continue;
                     }
                     saw_non_404_error = true;
-                    last_err = (status, err_body, acc.id.clone(), acc.email.clone());
+                    last_err = (
+                        status,
+                        err_body,
+                        acc.id.clone(),
+                        acc.email.clone(),
+                        preview.clone(),
+                    );
                     if status == 403 {
                         mark_account_cooldown(&acc.id, &acc.email, "all", 300, "HTTP 403".into());
                         break;
                     }
+                    if status == 400 {
+                        // Bad request payload won't succeed on another account either; return exact 400 immediately
+                        return Err(last_err);
+                    }
                 }
                 Err(e) => {
                     saw_non_404_error = true;
-                    last_err = (502, e.to_string(), acc.id.clone(), acc.email.clone());
+                    last_err = (
+                        502,
+                        e.to_string(),
+                        acc.id.clone(),
+                        acc.email.clone(),
+                        preview.clone(),
+                    );
                 }
             }
         }
@@ -2169,8 +2436,6 @@ async fn send_upstream_with_failover(
         }
 
         if saw_model_not_found && !saw_non_404_error {
-            // Runtime-learn that this account doesn't support `resolved_model` (30 min TTL)
-            // and failover immediately without burning a retry slot or cooling down the account!
             mark_runtime_unsupported(&acc.id, resolved_model, 1800);
         } else {
             real_attempts += 1;
@@ -2660,7 +2925,7 @@ async fn handle_connection(mut stream: TcpStream) {
         send_upstream_with_failover(&cfg, &api_key, &resolved_model, &openai_body, is_stream).await;
 
     match upstream_res {
-        Err((status, err_msg, acc_id, acc_email)) => {
+        Err((status, err_msg, acc_id, acc_email, err_preview)) => {
             ACTIVE_REQUESTS.fetch_sub(1, Ordering::Relaxed);
             record_api_log(&ApiRequestLogItem {
                 id: log_id,
@@ -2681,7 +2946,7 @@ async fn handle_connection(mut stream: TcpStream) {
                 cache_read_tokens: 0,
                 total_tokens: 0,
                 error_message: Some(err_msg.clone()),
-                request_preview: String::new(),
+                request_preview: err_preview,
                 response_preview: String::new(),
             });
             write_json_response(
@@ -2696,7 +2961,7 @@ async fn handle_connection(mut stream: TcpStream) {
             )
             .await;
         }
-        Ok((mut resp, acc, req_preview)) => {
+        Ok((mut resp, acc, req_preview, tool_name_map)) => {
             let mut total_in = 0u64;
             let mut total_out = 0u64;
             let mut total_think = 0u64;
@@ -2732,7 +2997,12 @@ async fn handle_connection(mut stream: TcpStream) {
                             let Ok(val) = serde_json::from_str::<Value>(data_trim) else {
                                 continue;
                             };
-                            let parsed = parse_antigravity_response_payload(&val);
+                            let mut parsed = parse_antigravity_response_payload(&val);
+                            if !tool_name_map.is_empty() && !parsed.tool_calls.is_empty() {
+                                for (_, name, _) in &mut parsed.tool_calls {
+                                    *name = uncloak_tool_name(name, &tool_name_map);
+                                }
+                            }
                             if parsed.input_tokens > 0 {
                                 total_in = parsed.input_tokens;
                             }
@@ -3040,9 +3310,14 @@ async fn handle_connection(mut stream: TcpStream) {
             } else {
                 // Non-streaming JSON response
                 let raw_text = resp.text().await.unwrap_or_default();
-                let parsed = serde_json::from_str::<Value>(&raw_text)
+                let mut parsed = serde_json::from_str::<Value>(&raw_text)
                     .map(|v| parse_antigravity_response_payload(&v))
                     .unwrap_or_default();
+                if !tool_name_map.is_empty() && !parsed.tool_calls.is_empty() {
+                    for (_, name, _) in &mut parsed.tool_calls {
+                        *name = uncloak_tool_name(name, &tool_name_map);
+                    }
+                }
                 total_in = parsed.input_tokens;
                 total_out = parsed.output_tokens;
                 total_think = parsed.thinking_tokens;
@@ -3653,7 +3928,7 @@ pub async fn test_chat_completion(
 
     let started = Instant::now();
     match send_upstream_with_failover(&cfg, &key, &resolved_model, &body, false).await {
-        Ok((resp, acc, req_preview)) => {
+        Ok((resp, acc, req_preview, _tool_name_map)) => {
             let raw_text = resp.text().await.unwrap_or_default();
             let parsed = serde_json::from_str::<Value>(&raw_text)
                 .map(|v| parse_antigravity_response_payload(&v))
@@ -3699,7 +3974,7 @@ pub async fn test_chat_completion(
                 error: None,
             })
         }
-        Err((status, err, acc_id, acc_email)) => {
+        Err((status, err, acc_id, acc_email, _err_preview)) => {
             let latency_ms = started.elapsed().as_millis() as u64;
             record_api_log(&ApiRequestLogItem {
                 id: Uuid::new_v4().to_string(),
@@ -3908,5 +4183,64 @@ mod tests {
         );
         assert_eq!(g38_after_cd[0].id, "c_high");
         let _ = clear_account_cooldowns(None);
+    }
+
+    #[test]
+    fn anti_429_envelope_omits_request_type_sanitizes_branding_and_cloaks_tools() {
+        let body = json!({
+            "model": "gemini-4-neon-medium",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "x-anthropic-billing-header: cc_version=2.1\nYou are OpenCode, an AI coding agent. You are a Claude agent, built on Anthropic's Claude Agent SDK."
+                },
+                { "role": "user", "content": "Run ls" }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "description": "Run shell command",
+                        "parameters": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "cmd": { "type": "string", "minLength": 1, "format": "plain" }
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+
+        let (env, preview, tool_map) =
+            openai_body_to_antigravity_envelope(&body, "gemini-4-neon-medium", "p1", "k1");
+
+        // 1. Chat envelope MUST omit requestType (prevents Google fake 429)
+        assert!(env.get("requestType").is_none());
+        assert_eq!(preview, "Run ls");
+
+        // 2. System instruction strips billing header, SDK branding, and rewrites OpenCode -> Antigravity
+        let sys = env
+            .pointer("/request/systemInstruction/parts/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(!sys.to_lowercase().contains("opencode"));
+        assert!(!sys.contains("x-anthropic-billing-header"));
+        assert!(!sys.contains("Claude Agent SDK"));
+        assert!(sys.contains("Antigravity"));
+
+        // 3. Tool cloaking: bash -> bash_ide + native decoys appended, uncloak restores "bash"
+        let decls = env
+            .pointer("/request/tools/0/functionDeclarations")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(decls[0].get("name").and_then(Value::as_str), Some("bash_ide"));
+        assert!(decls.iter().any(|d| d.get("name").and_then(Value::as_str) == Some("view_file")));
+        assert_eq!(uncloak_tool_name("bash_ide", &tool_map), "bash");
+        // Unsupported schema keywords stripped
+        assert!(decls[0].pointer("/parameters/additionalProperties").is_none());
+        assert!(decls[0].pointer("/parameters/properties/cmd/minLength").is_none());
     }
 }
