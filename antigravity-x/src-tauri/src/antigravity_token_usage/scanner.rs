@@ -2564,7 +2564,7 @@ impl AntigravityScanner {
                 let _ = std::fs::rename(&tmp, &dest);
             }
             let _ = std::fs::remove_file(&tmp);
-            // Clean up obsolete 25MB v2 cache inside Cockpit Tools' cache folder.
+            // Clean up obsolete 25MB v2 cache inside the app cache folder.
             let legacy = self.legacy_v2_cache_file_path();
             if legacy.exists() {
                 let _ = std::fs::remove_file(legacy);
@@ -3527,7 +3527,7 @@ mod tests {
     fn scans_sqlite_and_rpc_without_touching_antigravity_dir() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let data_dir = tmp.path().join("agy-data");
-        let cache_dir = tmp.path().join("cockpit-cache");
+        let cache_dir = tmp.path().join("onlydevs-cache");
         let conv_dir = data_dir.join("conversations");
         std::fs::create_dir_all(&conv_dir).expect("conv_dir");
 

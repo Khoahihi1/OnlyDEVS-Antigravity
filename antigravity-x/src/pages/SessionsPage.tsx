@@ -7,7 +7,6 @@ import {
   FolderTree,
   History,
   Loader2,
-  RefreshCw,
   Search,
   Trash2,
   X,
@@ -51,8 +50,6 @@ function shortId(id: string): string {
 export function SessionsPage({
   lang,
   scan,
-  loading,
-  onRefresh,
   onSyncSessions,
   onDeleteSessions,
   onExportSessions,
@@ -60,7 +57,6 @@ export function SessionsPage({
 }: SessionsPageProps) {
   const vi = lang === "vi";
   const [query, setQuery] = useState("");
-  const [sourceFilter, setSourceFilter] = useState<"ALL" | "IDE" | "CLI">("ALL");
   const [folderView, setFolderView] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [busyAction, setBusyAction] = useState<string | null>(null);
@@ -74,8 +70,6 @@ export function SessionsPage({
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return sessions.filter((s) => {
-      if (sourceFilter === "IDE" && !s.source.includes("IDE")) return false;
-      if (sourceFilter === "CLI" && !s.source.includes("CLI")) return false;
       if (!q) return true;
       return (
         s.title.toLowerCase().includes(q) ||
@@ -85,7 +79,7 @@ export function SessionsPage({
         s.firstUserMessage.toLowerCase().includes(q)
       );
     });
-  }, [sessions, query, sourceFilter]);
+  }, [sessions, query]);
 
   const groupedByWorkspace = useMemo(() => {
     const map = new Map<string, SessionItem[]>();
@@ -132,37 +126,13 @@ export function SessionsPage({
       {/* Header matching Codex-X Screenshot 3 */}
       <header className="agx-page-header">
         <div className="agx-page-heading">
-          <p className="agx-eyebrow">
-            <History size={13} />
-            SESSION SYNC
-          </p>
-          <h2>{vi ? "Session management" : "Session management"}</h2>
-          <span>
-            {vi
-              ? "Đồng bộ lịch sử hội thoại giữa Antigravity IDE và CLI trong một kho chung; xem transcript, xuất Markdown hoặc dọn dẹp session."
-              : "Keep user conversations in one shared history between Antigravity IDE and CLI; inspect transcripts, export, or clean up."}
-          </span>
+          <h2>{vi ? "Phiên làm việc" : "Sessions"}</h2>
         </div>
 
         <div className="agx-header-actions">
-          <div className="agx-target-pill">
-            <span>Sync to</span>
-            <strong>Shared history (IDE ↔ CLI)</strong>
-          </div>
-
           <button
             type="button"
-            className="agx-btn agx-btn--secondary"
-            onClick={() => void onRefresh()}
-            disabled={loading}
-          >
-            {loading ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
-            <span>{vi ? "Check sessions" : "Check sessions"}</span>
-          </button>
-
-          <button
-            type="button"
-            className="agx-btn agx-btn--primary"
+            className="agx-btn agx-btn--primary agx-btn--sm"
             disabled={busyAction === "sync"}
             onClick={async () => {
               setBusyAction("sync");
@@ -173,8 +143,8 @@ export function SessionsPage({
               }
             }}
           >
-            {busyAction === "sync" ? <Loader2 className="spin" size={15} /> : <Zap size={15} />}
-            <span>{vi ? "Sync sessions" : "Sync sessions"}</span>
+            {busyAction === "sync" ? <Loader2 className="spin" size={14} /> : <Zap size={14} />}
+            <span>{vi ? "Đồng bộ" : "Sync"}</span>
           </button>
         </div>
       </header>
@@ -186,21 +156,20 @@ export function SessionsPage({
         }`}
       >
         <div className="agx-session-banner-left">
-          {unsyncedCount === 0 ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}
+          {unsyncedCount === 0 ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}
           <strong>
             {unsyncedCount === 0
               ? vi
-                ? "All sessions are synced"
-                : "All sessions are synced"
+                ? "Đã đồng bộ"
+                : "Synced"
               : vi
-                ? `${unsyncedCount} session chưa đồng bộ giữa IDE và CLI`
-                : `${unsyncedCount} session(s) can be synced between IDE & CLI`}
+                ? `${unsyncedCount} phiên chưa đồng bộ`
+                : `${unsyncedCount} unsynced`}
           </strong>
         </div>
         <div className="agx-session-banner-right">
           <span>
-            {sessions.length} sessions · IDE: {scan?.ideCount ?? 0} · CLI: {scan?.cliCount ?? 0} ·{" "}
-            {formatBytes(scan?.totalSizeBytes ?? 0)}
+            {sessions.length} sessions · {formatBytes(scan?.totalSizeBytes ?? 0)}
           </span>
         </div>
       </div>
@@ -208,12 +177,9 @@ export function SessionsPage({
       {/* Main Local Sessions Panel */}
       <div className="agx-panel-card agx-session-panel">
         <div className="agx-panel-head">
-          <div>
-            <span className="agx-section-tag">LOCAL SESSIONS</span>
-            <h3>{vi ? "Folders & sessions" : "Folders & sessions"}</h3>
-          </div>
+          <h3>{vi ? "Danh sách phiên" : "Sessions"}</h3>
           <span className="agx-count-pill">
-            {filtered.length} / {sessions.length} shown
+            {filtered.length} / {sessions.length}
           </span>
         </div>
 
@@ -230,19 +196,6 @@ export function SessionsPage({
                   : "Search title / project / provider / ID"
               }
             />
-          </div>
-
-          <div className="agx-filter-seg">
-            {(["ALL", "IDE", "CLI"] as const).map((src) => (
-              <button
-                key={src}
-                type="button"
-                className={`agx-filter-seg-btn${sourceFilter === src ? " agx-filter-seg-btn--active" : ""}`}
-                onClick={() => setSourceFilter(src)}
-              >
-                {src}
-              </button>
-            ))}
           </div>
 
           <label className="agx-folder-toggle-btn">
@@ -461,17 +414,6 @@ function SessionRow({
         <div className="agx-session-row-copy">
           <div className="agx-session-row-title-line">
             <strong title={session.firstUserMessage || session.title}>{session.title}</strong>
-            <span
-              className={`agx-badge ${
-                session.source === "IDE + CLI"
-                  ? "agx-badge--success"
-                  : session.source === "IDE"
-                    ? "agx-badge--info"
-                    : "agx-badge--brand"
-              }`}
-            >
-              {session.source}
-            </span>
             {session.model && <span className="agx-badge agx-badge--muted">{session.model}</span>}
           </div>
           <div className="agx-session-row-sub">

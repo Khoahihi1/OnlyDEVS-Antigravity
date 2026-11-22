@@ -351,7 +351,7 @@ pub async fn check_for_updates(force: bool) -> Result<UpdateCheckResult, String>
         }
     }
 
-    // 2. Fallback: Cockpit/Tauri-style latest.json manifest on GitHub Releases
+    // 2. Fallback: Tauri-style latest.json manifest on GitHub Releases
     let manifest_res = client
         .get(GITHUB_LATEST_JSON_URL)
         .send()

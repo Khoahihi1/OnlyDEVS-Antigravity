@@ -1,34 +1,43 @@
 ﻿/* ============================================================================
-   OnlyDEVS — Antigravity Design System (Cockpit Tools Theme Parity)
+   OnlyDEVS — Antigravity Design System
+   Brand Palette: Crimson #EF2328 · OnlyBlue #0095D9/#00AFF0 · Gold #FACC15 · Ink #0B0D12
    ============================================================================ */
 
 :root {
-  --agx-bg: #f6f5f2;
-  --agx-bg-elevated: rgba(255, 255, 255, 0.82);
+  --agx-bg: #f5f6f8;
+  --agx-bg-elevated: rgba(255, 255, 255, 0.92);
   --agx-bg-solid: #ffffff;
-  --agx-bg-subtle: rgba(238, 242, 247, 0.82);
-  --agx-sidebar-bg: rgba(255, 255, 255, 0.78);
-  --agx-text: #0f172a;
-  --agx-text-secondary: #475569;
-  --agx-muted: #64748b;
-  --agx-subtle: #94a3b8;
-  --agx-border: rgba(15, 23, 42, 0.12);
-  --agx-border-strong: rgba(15, 23, 42, 0.24);
-  --agx-primary: #1d4ed8;
-  --agx-primary-hover: #1e40af;
-  --agx-primary-soft: rgba(29, 78, 216, 0.12);
-  --agx-accent: #0ea5a5;
-  --agx-heading-gradient: linear-gradient(135deg, #1d4ed8, #0ea5a5);
-  --agx-brand-red: #e11d48;
+  --agx-bg-subtle: #eef0f4;
+  --agx-sidebar-bg: #ffffff;
+  --agx-text: #0d1017;
+  --agx-text-secondary: #3f4756;
+  --agx-muted: #667085;
+  --agx-subtle: #98a2b3;
+  --agx-border: rgba(13, 16, 23, 0.1);
+  --agx-border-strong: rgba(13, 16, 23, 0.2);
+
+  /* OnlyDEVS Logo Signature Tokens */
+  --agx-primary: #ef2328;
+  --agx-primary-hover: #d81b20;
+  --agx-primary-soft: rgba(239, 35, 40, 0.1);
+  --agx-accent: #0095d9;
+  --agx-accent-soft: rgba(0, 149, 217, 0.12);
+  --agx-gold: #f59e0b;
+  --agx-gold-soft: rgba(245, 158, 11, 0.14);
+  --agx-heading-gradient: linear-gradient(135deg, #0d1017 0%, #ef2328 100%);
+  --agx-brand-red: #ef2328;
+
   --agx-success: #16a34a;
-  --agx-success-soft: rgba(22, 163, 74, 0.14);
+  --agx-success-soft: rgba(22, 163, 74, 0.12);
   --agx-warning: #d97706;
   --agx-warning-soft: rgba(217, 119, 6, 0.14);
   --agx-danger: #dc2626;
   --agx-danger-soft: rgba(220, 38, 38, 0.12);
-  --agx-shadow-sm: 0 2px 6px rgba(15, 23, 42, 0.08);
-  --agx-shadow-md: 0 12px 24px rgba(15, 23, 42, 0.12);
-  --agx-shadow-brand: 0 6px 18px rgba(29, 78, 216, 0.24);
+
+  --agx-shadow-sm: 0 1px 3px rgba(13, 16, 23, 0.06);
+  --agx-shadow-md: 0 10px 26px rgba(13, 16, 23, 0.1);
+  --agx-shadow-brand: 0 6px 18px rgba(239, 35, 40, 0.26);
+
   font-family: "Inter", "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, sans-serif;
   color: var(--agx-text);
   color-scheme: light;
@@ -51,12 +60,11 @@ body,
   -webkit-font-smoothing: antialiased;
 }
 
-/* Cockpit Tools Light Soft Gradient Canvas */
 body {
   background:
-    radial-gradient(circle at 12% 10%, rgba(29, 78, 216, 0.12), transparent 45%),
-    radial-gradient(circle at 90% 5%, rgba(14, 165, 165, 0.12), transparent 40%),
-    linear-gradient(180deg, #f8f7f4 0%, #eef1f6 100%);
+    radial-gradient(circle at 8% 0%, rgba(239, 35, 40, 0.07), transparent 38%),
+    radial-gradient(circle at 94% 100%, rgba(0, 149, 217, 0.08), transparent 40%),
+    #f5f6f8;
   color: var(--agx-text);
 }
 

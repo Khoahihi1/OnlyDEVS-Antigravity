@@ -329,11 +329,10 @@ export function AntigravityTokenUsagePanel({
         <div className="ag-token-usage__head">
           <div>
             <h3>{tr(lang, "usage.title")}</h3>
-            <p>{tr(lang, "usage.subtitle")}</p>
           </div>
           <button
             type="button"
-            className="agx-btn agx-btn--secondary"
+            className="agx-btn agx-btn--secondary agx-btn--sm"
             onClick={onBackToOverview}
           >
             {tr(lang, "usage.back")}
@@ -548,9 +547,6 @@ export function AntigravityTokenUsagePanel({
         </div>
 
         {error ? <div className="ag-token-usage__error">{error}</div> : null}
-
-        {/* Read-only info banner */}
-        <div className="ag-token-usage__hint">{tr(lang, "usage.readOnlyHint")}</div>
 
         {loading && !bundle ? (
           <div className="ag-token-usage__empty">

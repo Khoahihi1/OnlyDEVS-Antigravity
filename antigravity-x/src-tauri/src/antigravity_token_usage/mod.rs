@@ -1,7 +1,7 @@
 //! Antigravity local token usage module.
 //!
 //! Scans `~/.gemini/antigravity` (or custom data directory) strictly read-only,
-//! caching file fingerprints inside Cockpit Tools' own data folder (`antigravity_token_usage/`).
+//! caching file fingerprints inside OnlyDEVS's own data folder (`antigravity_token_usage/`).
 //!
 //! Concurrency design:
 //! - `SNAPSHOT_STORE` (`RwLock<Option<SnapshotEntry>>`): Lock-free/shared read path for

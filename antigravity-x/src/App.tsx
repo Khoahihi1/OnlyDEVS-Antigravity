@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { AppShell } from "./components/AppShell";
 import { UpdateNotification } from "./components/UpdateNotification";
 import { AccountsPage } from "./pages/AccountsPage";
+import { ApiServicePage } from "./pages/ApiServicePage";
 import { PluginsPage } from "./pages/PluginsPage";
 import { PromptsPage, type PromptDraft } from "./pages/PromptsPage";
 import { SessionsPage } from "./pages/SessionsPage";
@@ -10,6 +11,7 @@ import { AboutPage } from "./pages/AboutPage";
 import { agxInvoke } from "./platform/invoke";
 import type {
   AntigravityAccount,
+  ApiServiceStatus,
   AppLanguage,
   AppTab,
   AppTheme,
@@ -31,7 +33,7 @@ import type {
   VersionJumpInfo,
 } from "./types";
 
-const APP_VERSION = "1.0.0";
+const APP_VERSION = "1.1.0";
 
 const VALID_LANGS: AppLanguage[] = ["vi", "en", "zh-CN", "zh-TW", "ja", "ko", "ru", "de"];
 const VALID_THEME_COLORS: AppThemeColor[] = [
@@ -93,6 +95,7 @@ export default function App() {
   const [instructionMode, setInstructionMode] = useState<InstructionMode>("replace");
   const [sessionScan, setSessionScan] = useState<SessionScanResult | null>(null);
   const [mcpSkills, setMcpSkills] = useState<McpSkillsState | null>(null);
+  const [apiServiceStatus, setApiServiceStatus] = useState<ApiServiceStatus | null>(null);
 
   const [toast, setToast] = useState<string | null>(null);
   const [pendingUpdate, setPendingUpdate] = useState<UpdateCheckResult | null>(null);
@@ -105,7 +108,7 @@ export default function App() {
   const refreshAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [ov, accs, usage, hist, plug, pr, cats, cfg, agents, mode, sess, ms] =
+      const [ov, accs, usage, hist, plug, pr, cats, cfg, agents, mode, sess, ms, apiSt] =
         await Promise.all([
           agxInvoke<OverviewState>("get_overview_state"),
           agxInvoke<AntigravityAccount[]>("list_accounts"),
@@ -119,6 +122,7 @@ export default function App() {
           agxInvoke<string>("get_instruction_mode"),
           agxInvoke<SessionScanResult>("list_sessions"),
           agxInvoke<McpSkillsState>("list_mcp_and_skills"),
+          agxInvoke<ApiServiceStatus>("api_service_get_status").catch(() => null),
         ]);
       setOverview(ov);
       setAccounts(accs);
@@ -132,6 +136,7 @@ export default function App() {
       setInstructionMode(mode === "append" ? "append" : "replace");
       setSessionScan(sess);
       setMcpSkills(ms);
+      setApiServiceStatus(apiSt);
     } catch (error) {
       showToast(error instanceof Error ? error.message : String(error));
     } finally {
@@ -170,7 +175,7 @@ export default function App() {
     void refreshAll();
   }, [refreshAll]);
 
-  // Cockpit-style startup version jump notice + silent background update check
+  // Startup version jump notice + silent background update check
   useEffect(() => {
     let active = true;
     void (async () => {
@@ -202,11 +207,44 @@ export default function App() {
     };
   }, [showToast]);
 
-  const runtimeLabel = useMemo(() => {
-    if (!overview) return "Detecting...";
-    if (overview.cliVersion) return `CLI v${overview.cliVersion} · Linked`;
-    return overview.configExists ? "CLI / IDE Linked" : "Config Missing";
-  }, [overview]);
+  const handleToggleAccountInApiPool = useCallback(
+    async (accountId: string) => {
+      const st =
+        apiServiceStatus ??
+        (await agxInvoke<ApiServiceStatus>("api_service_get_status"));
+      const cfg = st.config;
+      let nextIds: string[];
+      let added: boolean;
+
+      if (cfg.memberAccountIds.length === 0 && cfg.useAllAccountsWhenEmpty) {
+        // Currently implicitly using all accounts -> switching to explicit list without this account
+        nextIds = accounts.map((a) => a.id).filter((id) => id !== accountId);
+        added = false;
+      } else if (cfg.memberAccountIds.includes(accountId)) {
+        nextIds = cfg.memberAccountIds.filter((id) => id !== accountId);
+        added = false;
+      } else {
+        nextIds = [...cfg.memberAccountIds, accountId];
+        added = true;
+      }
+
+      const nextCfg = {
+        ...cfg,
+        memberAccountIds: nextIds,
+        useAllAccountsWhenEmpty: false,
+      };
+      await agxInvoke("api_service_save_config", { config: nextCfg });
+      const refreshed = await agxInvoke<ApiServiceStatus>("api_service_get_status");
+      setApiServiceStatus(refreshed);
+      const email = accounts.find((a) => a.id === accountId)?.email ?? accountId;
+      showToast(
+        added
+          ? `Đã thêm ${email} vào API Pool`
+          : `Đã gỡ ${email} khỏi API Pool`,
+      );
+    },
+    [accounts, apiServiceStatus, showToast],
+  );
 
   const navBadges = useMemo(() => {
     const enabledPlugs = plugins.filter((p) => p.enabled).length;
@@ -218,12 +256,13 @@ export default function App() {
 
     return {
       accounts: accounts.length,
+      "api-service": apiServiceStatus?.running ? "ON" : "OFF",
       plugins: `${enabledPlugs}/${plugins.length}`,
       prompts: enabledPrompts > 0 ? "ON" : prompts.length,
       sessions: totalSess,
       "mcp-skills": totalMcpSkills,
     };
-  }, [accounts, plugins, prompts, sessionScan, mcpSkills]);
+  }, [accounts, apiServiceStatus, plugins, prompts, sessionScan, mcpSkills]);
 
   const page = (() => {
     switch (tab) {
@@ -235,7 +274,8 @@ export default function App() {
             tokenUsage={tokenUsage}
             switchHistory={switchHistory}
             loading={loading}
-            runtimeLabel={runtimeLabel}
+            apiServiceStatus={apiServiceStatus}
+            onToggleApiPool={handleToggleAccountInApiPool}
             onRefreshAllData={refreshAll}
             onImportLocalAccount={async () => {
               const acc = await agxInvoke<AntigravityAccount>("import_local_account");
@@ -276,12 +316,19 @@ export default function App() {
               await refreshAll();
               return stats;
             }}
-            onSwitchAccount={async (accountId, switchTarget) => {
+            onSwitchAccount={async (accountId, switchTarget, launch, customPath, workingDir) => {
               const acc = await agxInvoke<AntigravityAccount>("switch_account", {
                 accountId,
                 switchTarget,
+                launch,
+                customPath: customPath ?? null,
+                workingDir: workingDir ?? null,
               });
-              showToast(`Đã chuyển sang tài khoản: ${acc.email}`);
+              showToast(
+                launch
+                  ? `Đã chuyển & mở: ${acc.email}`
+                  : `Đã chuyển tài khoản: ${acc.email}`,
+              );
               await refreshAll();
             }}
             onUpdateMetadata={async (payload) => {
@@ -310,6 +357,17 @@ export default function App() {
               showToast("Đã xóa lịch sử chuyển đổi");
               await refreshAll();
             }}
+          />
+        );
+
+      case "api-service":
+        return (
+          <ApiServicePage
+            lang={lang}
+            accounts={accounts}
+            onRefreshAccounts={refreshAll}
+            onNavigateAccounts={() => setTab("accounts")}
+            onStatusChange={setApiServiceStatus}
           />
         );
 
@@ -568,7 +626,6 @@ export default function App() {
         themeColor={themeColor}
         onThemeColorChange={setThemeColor}
         appVersion={APP_VERSION}
-        runtimeLabel={runtimeLabel}
         badges={navBadges}
       >
         {page}

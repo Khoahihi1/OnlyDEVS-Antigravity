@@ -11,7 +11,6 @@ import {
   RefreshCw,
   Save,
   Settings2,
-  Sparkles,
   Trash2,
   Upload,
   X,
@@ -288,14 +287,9 @@ export function PromptsPage({
         }}
       />
 
-      {/* 1. Header — exact Codex-X layout */}
       <header className="cx-prompts-header">
         <div className="cx-prompts-heading">
-          <p>
-            <Sparkles size={14} aria-hidden="true" />
-            PROMPT INJECTION
-          </p>
-          <h2>Manage instruction prompts</h2>
+          <h2>{vi ? "Quản lý Prompt" : "Prompts"}</h2>
         </div>
 
         <div className="cx-prompts-header-actions">

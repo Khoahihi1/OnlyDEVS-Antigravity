@@ -15,19 +15,19 @@ export const SUPPORTED_LANGUAGES: ReadonlyArray<{
   { code: "de", nativeLabel: "Deutsch", short: "DE" },
 ];
 
-export const COCKPIT_THEME_PACKS: ReadonlyArray<{
+export const THEME_PACKS: ReadonlyArray<{
   id: AppThemeColor;
   label: string;
   primary: string;
   accent: string;
 }> = [
-  { id: "default", label: "Cockpit Ocean", primary: "#3b82f6", accent: "#14b8a6" },
+  { id: "default", label: "OnlyDEVS", primary: "#ef2328", accent: "#00aff0" },
   { id: "nord", label: "Nord", primary: "#5e81ac", accent: "#88c0d0" },
   { id: "tokyo-night", label: "Tokyo Night", primary: "#7aa2f7", accent: "#bb9af7" },
-  { id: "catppuccin", label: "Catppuccin", primary: "#89b4fa", accent: "#cba6f7" },
-  { id: "gruvbox", label: "Gruvbox", primary: "#d79921", accent: "#689d6a" },
+  { id: "catppuccin", label: "Catppuccin", primary: "#f38ba8", accent: "#89b4fa" },
+  { id: "gruvbox", label: "Gruvbox", primary: "#d79921", accent: "#83a598" },
   { id: "everforest", label: "Everforest", primary: "#a7c080", accent: "#7fbbb3" },
-  { id: "oled", label: "OLED Pure", primary: "#3b82f6", accent: "#ffffff" },
+  { id: "oled", label: "OLED Pure", primary: "#ef2328", accent: "#00aff0" },
 ];
 
 type Dict = Record<string, string>;
@@ -35,6 +35,7 @@ type Dict = Record<string, string>;
 const DICTS: Record<AppLanguage, Dict> = {
   vi: {
     "nav.accounts": "Tài khoản",
+    "nav.apiService": "API Service",
     "nav.plugins": "Plugin",
     "nav.prompts": "Prompt",
     "nav.sessions": "Phiên làm việc",
@@ -82,7 +83,7 @@ const DICTS: Record<AppLanguage, Dict> = {
     "acc.refreshedAt": "Lần làm mới",
     "acc.addAccount": "Thêm tài khoản",
     "acc.importLocal": "Đồng bộ TK trên máy",
-    "acc.importCockpit": "Nhập từ Cockpit Tools",
+    "acc.importFolder": "Nhập từ thư mục",
     "acc.refresh": "Làm mới",
     "acc.rescan": "Quét lại",
     "acc.export": "Xuất JSON",
@@ -128,6 +129,7 @@ const DICTS: Record<AppLanguage, Dict> = {
   },
   en: {
     "nav.accounts": "Account",
+    "nav.apiService": "API Service",
     "nav.plugins": "Plugin",
     "nav.prompts": "Prompt",
     "nav.sessions": "Session",
@@ -175,7 +177,7 @@ const DICTS: Record<AppLanguage, Dict> = {
     "acc.refreshedAt": "Refreshed",
     "acc.addAccount": "Add Account",
     "acc.importLocal": "Import Local Client",
-    "acc.importCockpit": "Import from Cockpit",
+    "acc.importFolder": "Import Folder",
     "acc.refresh": "Refresh",
     "acc.rescan": "Rescan",
     "acc.export": "Export JSON",
@@ -221,6 +223,7 @@ const DICTS: Record<AppLanguage, Dict> = {
   },
   "zh-CN": {
     "nav.accounts": "账号管理",
+    "nav.apiService": "API 服务",
     "nav.plugins": "插件",
     "nav.prompts": "提示词",
     "nav.sessions": "会话管理",
@@ -268,7 +271,7 @@ const DICTS: Record<AppLanguage, Dict> = {
     "acc.refreshedAt": "最近刷新",
     "acc.addAccount": "添加账号",
     "acc.importLocal": "导入本地客户端",
-    "acc.importCockpit": "从 Cockpit 导入",
+    "acc.importFolder": "从文件夹导入",
     "acc.refresh": "刷新",
     "acc.rescan": "重新扫描",
     "acc.export": "导出 JSON",
@@ -314,6 +317,7 @@ const DICTS: Record<AppLanguage, Dict> = {
   },
   "zh-TW": {
     "nav.accounts": "帳號管理",
+    "nav.apiService": "API 服務",
     "nav.plugins": "外掛",
     "nav.prompts": "提示詞",
     "nav.sessions": "工作階段",
@@ -361,7 +365,7 @@ const DICTS: Record<AppLanguage, Dict> = {
     "acc.refreshedAt": "最近重新整理",
     "acc.addAccount": "新增帳號",
     "acc.importLocal": "匯入本機用戶端",
-    "acc.importCockpit": "從 Cockpit 匯入",
+    "acc.importFolder": "從資料夾匯入",
     "acc.refresh": "重新整理",
     "acc.rescan": "重新掃描",
     "acc.export": "匯出 JSON",
@@ -407,6 +411,7 @@ const DICTS: Record<AppLanguage, Dict> = {
   },
   ja: {
     "nav.accounts": "アカウント",
+    "nav.apiService": "API サービス",
     "nav.plugins": "プラグイン",
     "nav.prompts": "プロンプト",
     "nav.sessions": "セッション",
@@ -454,7 +459,7 @@ const DICTS: Record<AppLanguage, Dict> = {
     "acc.refreshedAt": "更新日時",
     "acc.addAccount": "アカウント追加",
     "acc.importLocal": "ローカルから同期",
-    "acc.importCockpit": "Cockpitから読込",
+    "acc.importFolder": "フォルダから読込",
     "acc.refresh": "更新",
     "acc.rescan": "再スキャン",
     "acc.export": "JSON出力",
@@ -500,6 +505,7 @@ const DICTS: Record<AppLanguage, Dict> = {
   },
   ko: {
     "nav.accounts": "계정 관리",
+    "nav.apiService": "API 서비스",
     "nav.plugins": "플러그인",
     "nav.prompts": "프롬프트",
     "nav.sessions": "세션",
@@ -547,7 +553,7 @@ const DICTS: Record<AppLanguage, Dict> = {
     "acc.refreshedAt": "새로고침",
     "acc.addAccount": "계정 추가",
     "acc.importLocal": "로컬 계정 가져오기",
-    "acc.importCockpit": "Cockpit에서 가져오기",
+    "acc.importFolder": "폴더에서 가져오기",
     "acc.refresh": "새로고침",
     "acc.rescan": "재스캔",
     "acc.export": "JSON 내보내기",
@@ -593,6 +599,7 @@ const DICTS: Record<AppLanguage, Dict> = {
   },
   ru: {
     "nav.accounts": "Аккаунты",
+    "nav.apiService": "API Сервис",
     "nav.plugins": "Плагины",
     "nav.prompts": "Промпты",
     "nav.sessions": "Сессии",
@@ -640,7 +647,7 @@ const DICTS: Record<AppLanguage, Dict> = {
     "acc.refreshedAt": "Обновлён",
     "acc.addAccount": "Добавить",
     "acc.importLocal": "Импорт с ПК",
-    "acc.importCockpit": "Из Cockpit Tools",
+    "acc.importFolder": "Из папки",
     "acc.refresh": "Обновить",
     "acc.rescan": "Пересканировать",
     "acc.export": "Экспорт JSON",
@@ -686,6 +693,7 @@ const DICTS: Record<AppLanguage, Dict> = {
   },
   de: {
     "nav.accounts": "Konten",
+    "nav.apiService": "API-Dienst",
     "nav.plugins": "Plugins",
     "nav.prompts": "Prompts",
     "nav.sessions": "Sitzungen",
@@ -733,7 +741,7 @@ const DICTS: Record<AppLanguage, Dict> = {
     "acc.refreshedAt": "Aktualisiert",
     "acc.addAccount": "Konto hinzufügen",
     "acc.importLocal": "Lokal importieren",
-    "acc.importCockpit": "Aus Cockpit",
+    "acc.importFolder": "Aus Ordner",
     "acc.refresh": "Aktualisieren",
     "acc.rescan": "Neu scannen",
     "acc.export": "JSON Export",

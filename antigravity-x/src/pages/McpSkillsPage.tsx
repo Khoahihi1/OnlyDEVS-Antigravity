@@ -1,13 +1,10 @@
 import { useMemo, useState } from "react";
 import {
-  Cpu,
   FileCode2,
   FileJson,
-  Loader2,
   PencilLine,
   PlugZap,
   Plus,
-  RefreshCw,
   Save,
   Search,
   Sparkles,
@@ -55,8 +52,6 @@ type McpSkillsPageProps = {
 export function McpSkillsPage({
   lang,
   state,
-  loading,
-  onRefresh,
   onToggleMcp,
   onUpsertMcp,
   onDeleteMcp,
@@ -159,40 +154,21 @@ export function McpSkillsPage({
     <section className="agx-page">
       <header className="agx-page-header">
         <div className="agx-page-heading">
-          <p className="agx-eyebrow">
-            <Cpu size={13} />
-            SKILLS & MCP SERVERS
-          </p>
-          <h2>{vi ? "MCP & Skills" : "Skills & MCP"}</h2>
-          <span>
-            {vi
-              ? "Quản lý các MCP Server trong ~/.gemini/config/mcp_config.json và kho Agent Skills cục bộ."
-              : "Manage MCP servers in ~/.gemini/config/mcp_config.json and local Agent Skills."}
-          </span>
+          <h2>MCP & Skills</h2>
         </div>
 
         <div className="agx-header-actions">
           <button
             type="button"
-            className="agx-btn agx-btn--secondary"
+            className="agx-btn agx-btn--secondary agx-btn--sm"
             onClick={async () => {
               const raw = await onGetMcpConfigRaw();
               setMcpRawDraft(raw);
               setMcpRawOpen(true);
             }}
           >
-            <FileJson size={15} />
+            <FileJson size={14} />
             <span>mcp_config.json</span>
-          </button>
-
-          <button
-            type="button"
-            className="agx-btn agx-btn--secondary"
-            onClick={() => void onRefresh()}
-            disabled={loading}
-          >
-            {loading ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
-            <span>{vi ? "Làm mới" : "Refresh"}</span>
           </button>
 
           {subTab === "mcp" ? (

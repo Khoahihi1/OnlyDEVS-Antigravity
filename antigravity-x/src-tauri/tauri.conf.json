@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "OnlyDEVS-Antigravity",
   "mainBinaryName": "OnlyDEVS-Antigravity",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "identifier": "com.onlydevs.antigravity",
   "build": {
     "beforeDevCommand": "pnpm dev:web",

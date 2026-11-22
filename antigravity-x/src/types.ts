@@ -21,6 +21,7 @@ export type AppThemeColor =
 
 export type AppTab =
   | "accounts"
+  | "api-service"
   | "plugins"
   | "prompts"
   | "sessions"
@@ -150,7 +151,7 @@ export type McpSkillsState = {
 };
 
 // ============================================================================
-// Antigravity Account Types (ported from cockpit-tools)
+// Antigravity Account Types
 // ============================================================================
 
 export type TokenData = {
@@ -231,6 +232,13 @@ export type AntigravityAccount = {
   isCurrent: boolean;
 };
 
+export type LaunchTargetInfo = {
+  id: string;
+  label: string;
+  available: boolean;
+  resolvedPath?: string | null;
+};
+
 export type SwitchHistoryItem = {
   id: string;
   timestamp: number;
@@ -279,7 +287,7 @@ export type TotpCodeResult = {
 };
 
 // ============================================================================
-// Antigravity Local Session Token Usage (Cockpit Tools full parity)
+// Antigravity Local Session Token Usage
 // ============================================================================
 
 export type AgConversationKind = "main" | "swarm" | "subagent";
@@ -563,7 +571,7 @@ export type DashboardBundleResponse = {
 };
 
 // ============================================================================
-// Auto-Update System (Cockpit Tools parity)
+// Auto-Update System
 // ============================================================================
 
 export type UpdateSettings = {
@@ -601,4 +609,153 @@ export type UpdateProgressPayload = {
   total?: number | null;
   percent: number;
   status: string;
+};
+
+// ============================================================================
+// Antigravity API Service / Router
+// ============================================================================
+
+export type ModelAliasRule = {
+  id: string;
+  pattern: string;
+  targetModel: string;
+  enabled: boolean;
+};
+
+export type ApiServiceConfig = {
+  port: number;
+  accessScope: "local" | "lan" | string;
+  routingStrategy: "round_robin" | "highest_quota" | "sticky_session" | "failover" | string;
+  memberAccountIds: string[];
+  useAllAccountsWhenEmpty: boolean;
+  autoStart: boolean;
+  timeoutSeconds: number;
+  maxRetries: number;
+  cooldownSeconds: number;
+  proxyUrl?: string | null;
+  modelRules: ModelAliasRule[];
+};
+
+export type ApiKeyRecord = {
+  id: string;
+  label: string;
+  key: string;
+  enabled: boolean;
+  isMaster: boolean;
+  allowedModels: string[];
+  pinnedAccountIds: string[];
+  createdAt: number;
+  lastUsedAt?: number | null;
+  totalRequests: number;
+  totalTokens: number;
+};
+
+export type AccountCooldownInfo = {
+  accountId: string;
+  email: string;
+  untilTs: number;
+  remainingSeconds: number;
+  reason: string;
+};
+
+export type ApiServiceStatus = {
+  running: boolean;
+  host: string;
+  port: number;
+  baseUrl: string;
+  lanUrl?: string | null;
+  startedAt?: number | null;
+  activeRequests: number;
+  poolTotal: number;
+  poolHealthy: number;
+  cooldowns: AccountCooldownInfo[];
+  config: ApiServiceConfig;
+  keys: ApiKeyRecord[];
+};
+
+export type ApiAvailableModel = {
+  id: string;
+  displayName: string;
+  family: string;
+  thinking: boolean;
+  source: string;
+};
+
+export type ApiRequestLogItem = {
+  id: string;
+  timestamp: number;
+  apiKeyId: string;
+  apiKeyLabel: string;
+  accountId: string;
+  accountEmail: string;
+  protocol: string;
+  requestModel: string;
+  resolvedModel: string;
+  stream: boolean;
+  statusCode: number;
+  latencyMs: number;
+  inputTokens: number;
+  outputTokens: number;
+  thinkingTokens: number;
+  cacheReadTokens: number;
+  totalTokens: number;
+  errorMessage?: string | null;
+  requestPreview: string;
+  responsePreview: string;
+};
+
+export type ApiUsageBreakdownRow = {
+  key: string;
+  label: string;
+  requests: number;
+  errors: number;
+  inputTokens: number;
+  thinkingTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  totalTokens: number;
+  avgLatencyMs: number;
+};
+
+export type ApiUsageTimePoint = {
+  bucket: string;
+  requests: number;
+  errors: number;
+  inputTokens: number;
+  thinkingTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  totalTokens: number;
+};
+
+export type ApiServiceUsageSummary = {
+  range: string;
+  totalRequests: number;
+  successRequests: number;
+  errorRequests: number;
+  successRate: number;
+  avgLatencyMs: number;
+  inputTokens: number;
+  thinkingTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  totalTokens: number;
+  byModel: ApiUsageBreakdownRow[];
+  byAccount: ApiUsageBreakdownRow[];
+  byKey: ApiUsageBreakdownRow[];
+  timeSeries: ApiUsageTimePoint[];
+};
+
+export type ApiTestChatResult = {
+  ok: boolean;
+  statusCode: number;
+  accountEmail: string;
+  resolvedModel: string;
+  latencyMs: number;
+  text: string;
+  thinking: string;
+  inputTokens: number;
+  outputTokens: number;
+  thinkingTokens: number;
+  error?: string | null;
 };

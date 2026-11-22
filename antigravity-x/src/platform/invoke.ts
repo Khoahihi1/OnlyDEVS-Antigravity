@@ -2,6 +2,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type {
   AntigravityAccount,
+  ApiAvailableModel,
+  ApiKeyRecord,
+  ApiRequestLogItem,
+  ApiServiceConfig,
+  ApiServiceStatus,
+  ApiServiceUsageSummary,
+  ApiTestChatResult,
   InstructionMode,
   McpSkillsState,
   OAuthPrepareResult,
@@ -273,6 +280,63 @@ let mockMcpSkills: McpSkillsState = {
   ],
 };
 
+let mockApiRunning = false;
+let mockApiConfig: ApiServiceConfig = {
+  port: 57120,
+  accessScope: "local",
+  routingStrategy: "highest_quota",
+  memberAccountIds: [],
+  useAllAccountsWhenEmpty: true,
+  autoStart: false,
+  timeoutSeconds: 180,
+  maxRetries: 3,
+  cooldownSeconds: 60,
+  proxyUrl: null,
+  modelRules: [
+    { id: "r1", pattern: "gpt-4o", targetModel: "gemini-3.1-pro-high", enabled: true },
+    { id: "r2", pattern: "gpt-4o-mini", targetModel: "gemini-3-flash", enabled: true },
+    { id: "r3", pattern: "claude-3-5-sonnet*", targetModel: "claude-sonnet-4-6", enabled: true },
+    { id: "r4", pattern: "claude-3-opus*", targetModel: "claude-opus-4-6-thinking", enabled: true },
+  ],
+};
+let mockApiKeys: ApiKeyRecord[] = [
+  {
+    id: "key-master",
+    label: "Master Key",
+    key: "agt_onlydevs_mock_master_key_1234567890",
+    enabled: true,
+    isMaster: true,
+    allowedModels: [],
+    pinnedAccountIds: [],
+    createdAt: Math.floor(Date.now() / 1000) - 86400,
+    lastUsedAt: null,
+    totalRequests: 0,
+    totalTokens: 0,
+  },
+];
+let mockApiLogs: ApiRequestLogItem[] = [];
+
+function buildMockApiStatus(): ApiServiceStatus {
+  const host = mockApiConfig.accessScope === "lan" ? "0.0.0.0" : "127.0.0.1";
+  return {
+    running: mockApiRunning,
+    host,
+    port: mockApiConfig.port,
+    baseUrl: `http://localhost:${mockApiConfig.port}/v1`,
+    lanUrl:
+      mockApiConfig.accessScope === "lan"
+        ? `http://192.168.1.100:${mockApiConfig.port}/v1`
+        : null,
+    startedAt: mockApiRunning ? Math.floor(Date.now() / 1000) : null,
+    activeRequests: 0,
+    poolTotal: mockAccounts.length,
+    poolHealthy: mockAccounts.length,
+    cooldowns: [],
+    config: mockApiConfig,
+    keys: mockApiKeys,
+  };
+}
+
 export async function agxInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (isTauri()) {
     return invoke<T>(command, args);
@@ -407,6 +471,12 @@ export async function agxInvoke<T>(command: string, args?: Record<string, unknow
       return mockAccounts[0] as T;
     case "refresh_all_quotas":
       return { total: mockAccounts.length, success: mockAccounts.length, failed: 0, details: [] } as RefreshStats as T;
+    case "detect_launch_targets":
+      return [
+        { id: "antigravity_ide", label: "Antigravity IDE", available: true, resolvedPath: "C:\\Users\\KhoaHihi\\AppData\\Local\\Programs\\Antigravity IDE\\Antigravity IDE.exe" },
+        { id: "antigravity", label: "Antigravity", available: true, resolvedPath: "C:\\Users\\KhoaHihi\\AppData\\Local\\Programs\\antigravity\\Antigravity.exe" },
+        { id: "cli", label: "Terminal CLI", available: true, resolvedPath: "agy" },
+      ] as T;
     case "switch_account": {
       const id = String(args?.accountId ?? "");
       mockAccounts = mockAccounts.map((a) => ({ ...a, isCurrent: a.id === id }));
@@ -557,6 +627,136 @@ export async function agxInvoke<T>(command: string, args?: Record<string, unknow
           isCustomDataDir: false,
         },
       } as T;
+    case "api_service_get_status":
+      return buildMockApiStatus() as T;
+    case "api_service_start":
+      mockApiRunning = true;
+      return buildMockApiStatus() as T;
+    case "api_service_stop":
+      mockApiRunning = false;
+      return buildMockApiStatus() as T;
+    case "api_service_restart":
+      mockApiRunning = true;
+      return buildMockApiStatus() as T;
+    case "api_service_save_config": {
+      if (args?.config) {
+        mockApiConfig = { ...mockApiConfig, ...(args.config as ApiServiceConfig) };
+      }
+      return buildMockApiStatus() as T;
+    }
+    case "api_service_create_key": {
+      const rec: ApiKeyRecord = {
+        id: `key-${Date.now()}`,
+        label: String(args?.label ?? "API Key"),
+        key: `agt_onlydevs_${Math.random().toString(36).slice(2, 18)}`,
+        enabled: true,
+        isMaster: false,
+        allowedModels: (args?.allowedModels as string[]) ?? [],
+        pinnedAccountIds: (args?.pinnedAccountIds as string[]) ?? [],
+        createdAt: Math.floor(Date.now() / 1000),
+        lastUsedAt: null,
+        totalRequests: 0,
+        totalTokens: 0,
+      };
+      mockApiKeys = [rec, ...mockApiKeys];
+      return rec as T;
+    }
+    case "api_service_update_key": {
+      const id = String(args?.id ?? "");
+      mockApiKeys = mockApiKeys.map((k) =>
+        k.id === id
+          ? {
+              ...k,
+              label: args?.label !== undefined ? String(args.label) : k.label,
+              enabled: args?.enabled !== undefined ? Boolean(args.enabled) : k.enabled,
+            }
+          : k,
+      );
+      return (mockApiKeys.find((k) => k.id === id) ?? mockApiKeys[0]) as T;
+    }
+    case "api_service_rotate_key": {
+      const id = String(args?.id ?? "");
+      mockApiKeys = mockApiKeys.map((k) =>
+        k.id === id
+          ? { ...k, key: `agt_onlydevs_${Math.random().toString(36).slice(2, 18)}` }
+          : k,
+      );
+      return (mockApiKeys.find((k) => k.id === id) ?? mockApiKeys[0]) as T;
+    }
+    case "api_service_delete_key": {
+      const id = String(args?.id ?? "");
+      mockApiKeys = mockApiKeys.filter((k) => k.id !== id);
+      return buildMockApiStatus() as T;
+    }
+    case "api_service_list_models": {
+      const list: ApiAvailableModel[] = [
+        {
+          id: "gemini-3.1-pro-high",
+          displayName: "Gemini 3.1 Pro High",
+          family: "gemini",
+          thinking: true,
+          source: "builtin",
+        },
+        {
+          id: "claude-sonnet-4-6",
+          displayName: "Claude Sonnet 4.6",
+          family: "claude",
+          thinking: true,
+          source: "builtin",
+        },
+        {
+          id: "claude-opus-4-6-thinking",
+          displayName: "Claude Opus 4.6 Thinking",
+          family: "claude",
+          thinking: true,
+          source: "builtin",
+        },
+      ];
+      return list as T;
+    }
+    case "api_service_list_logs":
+      return [...mockApiLogs] as T;
+    case "api_service_clear_logs":
+      mockApiLogs = [];
+      return 0 as T;
+    case "api_service_clear_cooldowns":
+      return buildMockApiStatus() as T;
+    case "api_service_get_usage": {
+      const summary: ApiServiceUsageSummary = {
+        range: String(args?.range ?? "30d"),
+        totalRequests: mockApiLogs.length,
+        successRequests: mockApiLogs.filter((l) => l.statusCode < 400).length,
+        errorRequests: mockApiLogs.filter((l) => l.statusCode >= 400).length,
+        successRate: 100,
+        avgLatencyMs: 0,
+        inputTokens: 0,
+        thinkingTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        totalTokens: 0,
+        byModel: [],
+        byAccount: [],
+        byKey: [],
+        timeSeries: [],
+      };
+      return summary as T;
+    }
+    case "api_service_test_chat": {
+      const res: ApiTestChatResult = {
+        ok: true,
+        statusCode: 200,
+        accountEmail: mockAccounts[0]?.email ?? "mock@onlydevs.online",
+        resolvedModel: String(args?.model ?? "gemini-3.1-pro-high"),
+        latencyMs: 320,
+        text: "[Browser Preview Mock] Antigravity API Router ready.",
+        thinking: "",
+        inputTokens: 12,
+        outputTokens: 10,
+        thinkingTokens: 0,
+        error: null,
+      };
+      return res as T;
+    }
     default:
       return undefined as T;
   }

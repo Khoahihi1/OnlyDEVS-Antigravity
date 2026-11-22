@@ -1,7 +1,6 @@
 import { useRef, useState } from "react";
 import {
   Archive,
-  Blocks,
   CheckCircle2,
   Code2,
   Download,
@@ -12,7 +11,6 @@ import {
   Loader2,
   Play,
   Plus,
-  RefreshCw,
   Save,
   ShieldCheck,
   Terminal,
@@ -64,8 +62,6 @@ export function PluginsPage({
   lang,
   plugins,
   configRaw,
-  loading,
-  onRefresh,
   onInstallBundled,
   onInstallFromFolder,
   onInstallFromZip,
@@ -201,51 +197,32 @@ export function PluginsPage({
 
       <header className="agx-page-header">
         <div className="agx-page-heading">
-          <p className="agx-eyebrow">
-            <Blocks size={13} />
-            LIFECYCLE & EXTENSION ENGINE
-          </p>
-          <h2>{vi ? "Quản lý Plugin Antigravity" : "Manage Antigravity Plugins"}</h2>
-          <span>
-            {vi
-              ? "Plugin mặc định của công cụ là antigravity-filter-bypass (bật/tắt 1 chạm). Hỗ trợ thêm plugin mới từ Thư mục, file ZIP, Git URL hoặc tạo theo ID."
-              : "Default built-in toggleable plugin is antigravity-filter-bypass. Also add plugins from Folder, ZIP archive, Git URL, or Plugin ID."}
-          </span>
+          <h2>{vi ? "Plugin" : "Plugins"}</h2>
         </div>
 
         <div className="agx-header-actions">
           <button
             type="button"
-            className="agx-btn agx-btn--secondary"
+            className="agx-btn agx-btn--secondary agx-btn--sm"
             onClick={() => {
               setConfigDraft(configRaw);
               setConfigModalOpen(true);
             }}
           >
-            <FileJson size={15} />
+            <FileJson size={14} />
             <span>config.json</span>
           </button>
 
           <button
             type="button"
-            className="agx-btn agx-btn--secondary"
-            onClick={() => void onRefresh()}
-            disabled={loading}
-          >
-            {loading ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
-            <span>{vi ? "Làm mới" : "Refresh"}</span>
-          </button>
-
-          <button
-            type="button"
-            className="agx-btn agx-btn--primary"
+            className="agx-btn agx-btn--primary agx-btn--sm"
             onClick={() => {
               setAddMethod("folder");
               setAddModalOpen(true);
             }}
           >
-            <Plus size={15} />
-            <span>{vi ? "Thêm Plugin..." : "Add Plugin..."}</span>
+            <Plus size={14} />
+            <span>{vi ? "Thêm Plugin" : "Add Plugin"}</span>
           </button>
         </div>
       </header>
@@ -261,28 +238,16 @@ export function PluginsPage({
               <div className="agx-hero-plugin-title-row">
                 <h3>antigravity-filter-bypass</h3>
                 <span className="agx-badge agx-badge--brand">
-                  {vi ? "MẶC ĐỊNH CỦA TOOL" : "DEFAULT TOOL PLUGIN"} · v
-                  {filterBypass.version ?? "1.3.1"}
+                  v{filterBypass.version ?? "1.3.1"}
                 </span>
                 <span
                   className={`agx-badge ${
                     filterBypass.enabled ? "agx-badge--success" : "agx-badge--warning"
                   }`}
                 >
-                  {filterBypass.enabled
-                    ? vi
-                      ? "Đang bật (Active)"
-                      : "Enabled & Active"
-                    : vi
-                      ? "Đang tắt (Disabled)"
-                      : "Disabled"}
+                  {filterBypass.enabled ? (vi ? "Đang bật" : "Active") : vi ? "Đã tắt" : "Off"}
                 </span>
               </div>
-              <p className="agx-hero-plugin-desc">
-                {vi
-                  ? "Plugin mặc định tích hợp sẵn từ source local: gạt công tắc BẬT sẽ tự động cài đặt / đồng bộ hooks từ thư mục nguồn và kích hoạt ngay trong ~/.gemini/config/config.json."
-                  : "Default built-in plugin: toggling ON automatically installs/syncs hooks from the bundled source directory and enables it in ~/.gemini/config/config.json."}
-              </p>
             </div>
           </div>
 
@@ -410,80 +375,14 @@ export function PluginsPage({
         )}
       </article>
 
-      {/* Quick Multi-Method Add Plugin Bar */}
-      <div className="agx-add-methods-bar">
-        <div className="agx-add-methods-copy">
-          <strong>{vi ? "Thêm Plugin bằng nhiều cách:" : "Add plugins via multiple methods:"}</strong>
-          <span>
-            {vi
-              ? "Chọn nguồn bên phải để cài thêm plugin vào ~/.gemini/config/plugins và tự động bật trong config.json."
-              : "Choose any source on the right to install into ~/.gemini/config/plugins."}
-          </span>
-        </div>
-        <div className="agx-add-methods-btns">
-          <button
-            type="button"
-            className="agx-btn agx-btn--secondary agx-btn--sm"
-            onClick={() => {
-              setAddMethod("folder");
-              setAddModalOpen(true);
-            }}
-          >
-            <FolderInput size={14} />
-            <span>{vi ? "Từ Thư mục" : "From Folder"}</span>
-          </button>
-
-          <button
-            type="button"
-            className="agx-btn agx-btn--secondary agx-btn--sm"
-            onClick={() => {
-              setAddMethod("zip");
-              setAddModalOpen(true);
-            }}
-          >
-            <Archive size={14} />
-            <span>{vi ? "Từ File .ZIP" : "From .ZIP"}</span>
-          </button>
-
-          <button
-            type="button"
-            className="agx-btn agx-btn--secondary agx-btn--sm"
-            onClick={() => {
-              setAddMethod("git");
-              setAddModalOpen(true);
-            }}
-          >
-            <GitBranch size={14} />
-            <span>{vi ? "Từ Git URL" : "From Git URL"}</span>
-          </button>
-
-          <button
-            type="button"
-            className="agx-btn agx-btn--secondary agx-btn--sm"
-            onClick={() => {
-              setAddMethod("custom");
-              setAddModalOpen(true);
-            }}
-          >
-            <Plus size={14} />
-            <span>{vi ? "Theo ID / Tạo mới" : "By ID / Custom"}</span>
-          </button>
-        </div>
-      </div>
-
-      {/* All Plugins Table / List */}
+      {/* All Plugins List */}
       <div className="agx-panel-card">
         <div className="agx-panel-head">
-          <div>
-            <span className="agx-section-tag">
-              {vi ? "DANH SÁCH PLUGIN" : "REGISTERED PLUGINS"}
-            </span>
-            <h3>
-              {vi
-                ? `Tất cả Plugin (${enabledCount}/${plugins.length} đang bật)`
-                : `All Plugins (${enabledCount}/${plugins.length} enabled)`}
-            </h3>
-          </div>
+          <h3>
+            {vi
+              ? `Danh sách Plugin (${enabledCount}/${plugins.length})`
+              : `Plugins (${enabledCount}/${plugins.length})`}
+          </h3>
         </div>
 
         <div className="agx-plugin-list">

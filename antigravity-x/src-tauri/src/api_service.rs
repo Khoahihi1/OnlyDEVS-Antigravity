@@ -1,0 +1,2847 @@
+//! OnlyDEVS Antigravity Local API Router
+//!
+//! Native OpenAI & Anthropic compatible proxy forwarding to Antigravity Cloud Code
+//! with multi-account pooling, quota-aware routing, cooldown failover, API keys,
+//! model alias rules, request logs, and token usage analytics.
+
+use chrono::Utc;
+use regex::Regex;
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
+use uuid::Uuid;
+
+use crate::accounts::{self, AntigravityAccount};
+use crate::prompts::open_db;
+
+// ============================================================================
+// Antigravity Cloud Code Constants & Protocol Signatures
+// ============================================================================
+
+const ANTIGRAVITY_BASE_URLS: &[&str] = &[
+    "https://cloudcode-pa.googleapis.com",
+    "https://daily-cloudcode-pa.googleapis.com",
+];
+
+// Official Antigravity IDE fingerprint
+const ANTIGRAVITY_IDE_USER_AGENT: &str = "antigravity/ide/2.1.1 darwin/arm64";
+const MAX_ANTIGRAVITY_OUTPUT_TOKENS: u64 = 64_000;
+
+// Default thinking signature for Gemini 3+ functionCall backfill
+const DEFAULT_THINKING_AG_SIGNATURE: &str = "EuwGCukGAXLI2nxwZIq54WWSoL/YN0P3TsDZ7zRnLi8g0S4aVr2HUGxvaHKySuY6HAVzcE0GPGjXrytLIldxthSvfxgUlJh6Qa9Z+Oj5QZBlYdg6HaJ6yuY5R7waE6rdwBsRf7Ft2j3DJ9rMi9qhWFqApewYtPhls3VHtuvND3l8Rm09+lbAXQs6KKWEWrxNLKTBkfpMgXhRERc/TQRMZu1twAablm6/Zk1tsYRvfWKLsNbeKF+CCojJdXJKvnR/8Ouuoa+Y2Ti20hcW7aZIIjZDFYPU//k6Ybmhg69J/imbFai2ckhfLaisqdDkdoIiBJScTOUvYqP6AE9d4MsydSC+UlhIMk4hoP76R8vUSCZRMkjOaDXstf/QoVZKbt94wyRZgAJ1G0BqI8L5ow86kLpA4wJEtxsRGymOE4bKUvApveBakYDNM9APkf+LbtbzWSseGjoZcSlycF9iN8Q2XNYKRrHbv3Lr5Y8JjdH/5y/6SHkNehTEZugaeGnSPSyCTWto1kQgHpxdWmhkLfJGNUGLmue7Mesj4TSms4J33mRpYVhNB/J333FCqIP0hr/E7BkkjEn7yZ4X7SQlh+xKPurapsnHRwiKmtsilmEFrnTE9iQr+pMr6M29qqFNv1tr5yumbaJw8JW9sB15tNsRv+dW6BjNanbsKz7HCgKUBc8tGy+7YuhXzAfViyRefcjK7eZW0Fbyt7AbybJTKz78W8NH7ye6LAwzOebXpeZ4D43fNIt8bKh26qgduSQv/7o+pAflkuqHZ99YWgHQ8h8OkZFi3eOiSYjsjhdZ/czWOdoPI/OnqIldzMPF5YlrKBLFX8VhRKVmqgsmWf5PHGulHhMkVlS+XG2UIseGy69ARa93D78Gsa+1n1kJr7EEB7Rh+27vUMxVYLdz1yMSvE5nalTAlg/ZeG8+XQ0cHuAI3KbQpHW2Q++RdXfm5JzD5WdJZUU+Zn8t8UUn85BH4RxZLeE0qJikgSsKoYVBc6YhiMjhPgkR95ReimY4Z0xCJdRo1gjexOFeODZMpQF6Yxnoic7IrdgsFA3iePTbFnPp3IAM1fAThWhXJUn3QInUOTd5o1qmTmn6REbL15g/JQNl+dqUoPkhleeb2V3kjqp1okmO3wMZbPknR3S1LZNmlS72/iBQUm+n2b/RCn4PjmM2";
+
+const BLACKLISTED_FIELDS: &[&str] = &[
+    "output_config",
+    "thinking",
+    "reasoning_effort",
+    "reasoning",
+    "enable_thinking",
+    "thinking_budget",
+    "thinkingConfig",
+];
+
+// Built-in Antigravity model catalog
+const BUILTIN_MODELS: &[(&str, &str, &str, bool)] = &[
+    ("gemini-3-flash-agent", "Gemini 3.5 Flash (High)", "gemini", true),
+    ("gemini-3.5-flash-low", "Gemini 3.5 Flash (Medium)", "gemini", true),
+    ("gemini-3.5-flash-extra-low", "Gemini 3.5 Flash (Low)", "gemini", true),
+    ("gemini-pro-agent", "Gemini 3.1 Pro (High)", "gemini", true),
+    ("gemini-3.1-pro-low", "Gemini 3.1 Pro (Low)", "gemini", true),
+    ("gemini-3-flash", "Gemini 3 Flash", "gemini", false),
+    ("gemini-4-argon-high", "Gemini 4 Argon (High)", "gemini", true),
+    ("gemini-4-argon-medium", "Gemini 4 Argon (Medium)", "gemini", true),
+    ("gemini-4-carbon-high", "Gemini 4 Carbon (High)", "gemini", true),
+    ("gemini-4-carbon-medium", "Gemini 4 Carbon (Medium)", "gemini", true),
+    ("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)", "gemini", true),
+    ("claude-sonnet-4-6", "Claude Sonnet 4.6 (Thinking)", "claude", true),
+    ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)", "claude", true),
+    ("claude-sonnet-4-5-thinking", "Claude Sonnet 4.5 (Thinking)", "claude", true),
+    ("claude-opus-4-5-thinking", "Claude Opus 4.5 (Thinking)", "claude", true),
+    ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)", "openai", true),
+    ("gemini-3.1-flash-image", "Gemini 3.1 Flash (Image)", "image", false),
+];
+
+// ============================================================================
+// Data Models & State
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelAliasRule {
+    pub id: String,
+    pub pattern: String,
+    pub target_model: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiServiceConfig {
+    pub port: u16,
+    /// "local" -> 127.0.0.1, "lan" -> 0.0.0.0
+    pub access_scope: String,
+    /// "round_robin" | "highest_quota" | "sticky_session" | "failover"
+    pub routing_strategy: String,
+    /// Account IDs in the API service pool; empty = use all active accounts
+    pub member_account_ids: Vec<String>,
+    /// If true and member_account_ids is empty, automatically include all non-disabled accounts
+    pub use_all_accounts_when_empty: bool,
+    pub auto_start: bool,
+    pub timeout_seconds: u64,
+    pub max_retries: u32,
+    pub cooldown_seconds: u64,
+    pub proxy_url: Option<String>,
+    pub model_rules: Vec<ModelAliasRule>,
+}
+
+impl Default for ApiServiceConfig {
+    fn default() -> Self {
+        Self {
+            port: 57120,
+            access_scope: "local".into(),
+            routing_strategy: "highest_quota".into(),
+            member_account_ids: Vec::new(),
+            use_all_accounts_when_empty: true,
+            auto_start: false,
+            timeout_seconds: 180,
+            max_retries: 2,
+            cooldown_seconds: 60,
+            proxy_url: None,
+            model_rules: vec![
+                ModelAliasRule {
+                    id: "rule-gpt4o".into(),
+                    pattern: "gpt-4o".into(),
+                    target_model: "gemini-pro-agent".into(),
+                    enabled: true,
+                },
+                ModelAliasRule {
+                    id: "rule-gpt4o-mini".into(),
+                    pattern: "gpt-4o-mini".into(),
+                    target_model: "gemini-3-flash-agent".into(),
+                    enabled: true,
+                },
+                ModelAliasRule {
+                    id: "rule-claude-sonnet".into(),
+                    pattern: "claude-3-5-sonnet*".into(),
+                    target_model: "claude-sonnet-4-6".into(),
+                    enabled: true,
+                },
+                ModelAliasRule {
+                    id: "rule-claude-opus".into(),
+                    pattern: "claude-3-opus*".into(),
+                    target_model: "claude-opus-4-6-thinking".into(),
+                    enabled: true,
+                },
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyRecord {
+    pub id: String,
+    pub label: String,
+    pub key: String,
+    pub enabled: bool,
+    pub is_master: bool,
+    pub allowed_models: Vec<String>,
+    pub pinned_account_ids: Vec<String>,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    pub total_requests: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountCooldownInfo {
+    pub account_id: String,
+    pub email: String,
+    pub until_ts: i64,
+    pub remaining_seconds: i64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiServiceStatus {
+    pub running: bool,
+    pub host: String,
+    pub port: u16,
+    pub base_url: String,
+    pub lan_url: Option<String>,
+    pub started_at: Option<i64>,
+    pub active_requests: usize,
+    pub pool_total: usize,
+    pub pool_healthy: usize,
+    pub cooldowns: Vec<AccountCooldownInfo>,
+    pub config: ApiServiceConfig,
+    pub keys: Vec<ApiKeyRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiAvailableModel {
+    pub id: String,
+    pub display_name: String,
+    pub family: String,
+    pub thinking: bool,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiRequestLogItem {
+    pub id: String,
+    pub timestamp: i64,
+    pub api_key_id: String,
+    pub api_key_label: String,
+    pub account_id: String,
+    pub account_email: String,
+    pub protocol: String,
+    pub request_model: String,
+    pub resolved_model: String,
+    pub stream: bool,
+    pub status_code: u16,
+    pub latency_ms: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub thinking_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub total_tokens: u64,
+    pub error_message: Option<String>,
+    pub request_preview: String,
+    pub response_preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiUsageBreakdownRow {
+    pub key: String,
+    pub label: String,
+    pub requests: u64,
+    pub errors: u64,
+    pub input_tokens: u64,
+    pub thinking_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub total_tokens: u64,
+    pub avg_latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiUsageTimePoint {
+    pub bucket: String,
+    pub requests: u64,
+    pub errors: u64,
+    pub input_tokens: u64,
+    pub thinking_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiServiceUsageSummary {
+    pub range: String,
+    pub total_requests: u64,
+    pub success_requests: u64,
+    pub error_requests: u64,
+    pub success_rate: f64,
+    pub avg_latency_ms: u64,
+    pub input_tokens: u64,
+    pub thinking_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub total_tokens: u64,
+    pub by_model: Vec<ApiUsageBreakdownRow>,
+    pub by_account: Vec<ApiUsageBreakdownRow>,
+    pub by_key: Vec<ApiUsageBreakdownRow>,
+    pub time_series: Vec<ApiUsageTimePoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiTestChatResult {
+    pub ok: bool,
+    pub status_code: u16,
+    pub account_email: String,
+    pub resolved_model: String,
+    pub latency_ms: u64,
+    pub text: String,
+    pub thinking: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub thinking_tokens: u64,
+    pub error: Option<String>,
+}
+
+struct RunningServer {
+    host: String,
+    port: u16,
+    started_at: i64,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+}
+
+struct CooldownEntry {
+    email: String,
+    until_ts: i64,
+    reason: String,
+}
+
+static SERVER_STATE: OnceLock<Mutex<Option<RunningServer>>> = OnceLock::new();
+static ACTIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+static RR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static COOLDOWNS: OnceLock<Mutex<HashMap<String, CooldownEntry>>> = OnceLock::new();
+static STICKY_MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn server_lock() -> &'static Mutex<Option<RunningServer>> {
+    SERVER_STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn cooldown_lock() -> &'static Mutex<HashMap<String, CooldownEntry>> {
+    COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn sticky_lock() -> &'static Mutex<HashMap<String, String>> {
+    STICKY_MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// ============================================================================
+// SQLite Schema & Persistence
+// ============================================================================
+
+fn ensure_api_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS api_service_keys (
+            id TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            key_value TEXT NOT NULL UNIQUE,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            is_master INTEGER NOT NULL DEFAULT 0,
+            allowed_models_json TEXT NOT NULL DEFAULT '[]',
+            pinned_account_ids_json TEXT NOT NULL DEFAULT '[]',
+            created_at INTEGER NOT NULL,
+            last_used_at INTEGER,
+            total_requests INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS api_service_logs (
+            id TEXT PRIMARY KEY,
+            timestamp INTEGER NOT NULL,
+            api_key_id TEXT NOT NULL,
+            api_key_label TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            account_email TEXT NOT NULL,
+            protocol TEXT NOT NULL,
+            request_model TEXT NOT NULL,
+            resolved_model TEXT NOT NULL,
+            stream INTEGER NOT NULL DEFAULT 0,
+            status_code INTEGER NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            thinking_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            error_message TEXT,
+            request_preview TEXT NOT NULL DEFAULT '',
+            response_preview TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_api_logs_ts ON api_service_logs(timestamp DESC);
+        ",
+    )
+    .map_err(|e| format!("Init api_service schema: {e}"))?;
+
+    // Ensure at least one master API key exists
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM api_service_keys", [], |r| r.get(0))
+        .unwrap_or(0);
+    if count == 0 {
+        let now = Utc::now().timestamp();
+        let key_val = generate_api_key_value();
+        let _ = conn.execute(
+            "INSERT INTO api_service_keys
+             (id, label, key_value, enabled, is_master, allowed_models_json, pinned_account_ids_json, created_at)
+             VALUES (?1, ?2, ?3, 1, 1, '[]', '[]', ?4)",
+            params!["master", "Default Master Key", key_val, now],
+        );
+    }
+    Ok(())
+}
+
+fn generate_api_key_value() -> String {
+    let raw = Uuid::new_v4().to_string().replace('-', "");
+    let raw2 = Uuid::new_v4().to_string().replace('-', "");
+    format!("agt_onlydevs_{}{}", &raw[..16], &raw2[..12])
+}
+
+pub fn load_config() -> Result<ApiServiceConfig, String> {
+    let conn = open_db()?;
+    ensure_api_schema(&conn)?;
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = 'api_service_config'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("Read api_service_config: {e}"))?;
+    Ok(raw
+        .and_then(|s| serde_json::from_str::<ApiServiceConfig>(&s).ok())
+        .unwrap_or_default())
+}
+
+pub fn save_config(config: ApiServiceConfig) -> Result<ApiServiceConfig, String> {
+    let conn = open_db()?;
+    ensure_api_schema(&conn)?;
+    let mut cfg = config;
+    if cfg.port < 1024 {
+        cfg.port = 57120;
+    }
+    if cfg.timeout_seconds < 10 {
+        cfg.timeout_seconds = 180;
+    }
+    let raw = serde_json::to_string(&cfg).map_err(|e| format!("Serialize config: {e}"))?;
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES ('api_service_config', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![raw],
+    )
+    .map_err(|e| format!("Save api_service_config: {e}"))?;
+    Ok(cfg)
+}
+
+pub fn list_api_keys() -> Result<Vec<ApiKeyRecord>, String> {
+    let conn = open_db()?;
+    ensure_api_schema(&conn)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, label, key_value, enabled, is_master, allowed_models_json,
+                    pinned_account_ids_json, created_at, last_used_at, total_requests, total_tokens
+             FROM api_service_keys
+             ORDER BY is_master DESC, created_at ASC",
+        )
+        .map_err(|e| format!("Prepare list_api_keys: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            let allowed_raw: String = r.get(5)?;
+            let pinned_raw: String = r.get(6)?;
+            Ok(ApiKeyRecord {
+                id: r.get(0)?,
+                label: r.get(1)?,
+                key: r.get(2)?,
+                enabled: r.get::<_, i64>(3)? != 0,
+                is_master: r.get::<_, i64>(4)? != 0,
+                allowed_models: serde_json::from_str(&allowed_raw).unwrap_or_default(),
+                pinned_account_ids: serde_json::from_str(&pinned_raw).unwrap_or_default(),
+                created_at: r.get(7)?,
+                last_used_at: r.get(8)?,
+                total_requests: r.get::<_, i64>(9)?.max(0) as u64,
+                total_tokens: r.get::<_, i64>(10)?.max(0) as u64,
+            })
+        })
+        .map_err(|e| format!("Query list_api_keys: {e}"))?;
+    Ok(rows.flatten().collect())
+}
+
+pub fn create_api_key(
+    label: String,
+    allowed_models: Vec<String>,
+    pinned_account_ids: Vec<String>,
+) -> Result<ApiKeyRecord, String> {
+    let clean_label = label.trim();
+    if clean_label.is_empty() {
+        return Err("Tên API Key không được để trống.".into());
+    }
+    let conn = open_db()?;
+    ensure_api_schema(&conn)?;
+    let id = Uuid::new_v4().to_string();
+    let key = generate_api_key_value();
+    let now = Utc::now().timestamp();
+    let allowed_json = serde_json::to_string(&allowed_models).unwrap_or_else(|_| "[]".into());
+    let pinned_json = serde_json::to_string(&pinned_account_ids).unwrap_or_else(|_| "[]".into());
+    conn.execute(
+        "INSERT INTO api_service_keys
+         (id, label, key_value, enabled, is_master, allowed_models_json, pinned_account_ids_json, created_at)
+         VALUES (?1, ?2, ?3, 1, 0, ?4, ?5, ?6)",
+        params![id, clean_label, key, allowed_json, pinned_json, now],
+    )
+    .map_err(|e| format!("Create API key: {e}"))?;
+
+    Ok(ApiKeyRecord {
+        id,
+        label: clean_label.to_string(),
+        key,
+        enabled: true,
+        is_master: false,
+        allowed_models,
+        pinned_account_ids,
+        created_at: now,
+        last_used_at: None,
+        total_requests: 0,
+        total_tokens: 0,
+    })
+}
+
+pub fn update_api_key(
+    id: String,
+    label: Option<String>,
+    enabled: Option<bool>,
+    allowed_models: Option<Vec<String>>,
+    pinned_account_ids: Option<Vec<String>>,
+) -> Result<ApiKeyRecord, String> {
+    let conn = open_db()?;
+    ensure_api_schema(&conn)?;
+    let keys = list_api_keys()?;
+    let mut target = keys
+        .into_iter()
+        .find(|k| k.id == id)
+        .ok_or_else(|| format!("Không tìm thấy API Key {id}"))?;
+    if let Some(l) = label.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        target.label = l;
+    }
+    if let Some(e) = enabled {
+        target.enabled = e;
+    }
+    if let Some(m) = allowed_models {
+        target.allowed_models = m;
+    }
+    if let Some(p) = pinned_account_ids {
+        target.pinned_account_ids = p;
+    }
+    let allowed_json =
+        serde_json::to_string(&target.allowed_models).unwrap_or_else(|_| "[]".into());
+    let pinned_json =
+        serde_json::to_string(&target.pinned_account_ids).unwrap_or_else(|_| "[]".into());
+    conn.execute(
+        "UPDATE api_service_keys
+         SET label = ?1, enabled = ?2, allowed_models_json = ?3, pinned_account_ids_json = ?4
+         WHERE id = ?5",
+        params![
+            target.label,
+            if target.enabled { 1 } else { 0 },
+            allowed_json,
+            pinned_json,
+            target.id
+        ],
+    )
+    .map_err(|e| format!("Update API key: {e}"))?;
+    Ok(target)
+}
+
+pub fn rotate_api_key(id: String) -> Result<ApiKeyRecord, String> {
+    let conn = open_db()?;
+    ensure_api_schema(&conn)?;
+    let new_key = generate_api_key_value();
+    let changed = conn
+        .execute(
+            "UPDATE api_service_keys SET key_value = ?1 WHERE id = ?2",
+            params![&new_key, &id],
+        )
+        .map_err(|e| format!("Rotate API key: {e}"))?;
+    if changed == 0 {
+        return Err(format!("Không tìm thấy API Key {id}"));
+    }
+    list_api_keys()?
+        .into_iter()
+        .find(|k| k.id == id)
+        .ok_or_else(|| "Rotate API key thất bại".into())
+}
+
+pub fn delete_api_key(id: String) -> Result<(), String> {
+    let conn = open_db()?;
+    ensure_api_schema(&conn)?;
+    let is_master: i64 = conn
+        .query_row(
+            "SELECT is_master FROM api_service_keys WHERE id = ?1",
+            params![&id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if is_master != 0 {
+        return Err("Không thể xóa Master Key mặc định — bạn có thể bấm Xoay khóa (Rotate).".into());
+    }
+    conn.execute("DELETE FROM api_service_keys WHERE id = ?1", params![&id])
+        .map_err(|e| format!("Delete API key: {e}"))?;
+    Ok(())
+}
+
+fn find_valid_api_key(token: &str) -> Option<ApiKeyRecord> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    list_api_keys()
+        .ok()?
+        .into_iter()
+        .find(|k| k.enabled && k.key == trimmed)
+}
+
+fn record_api_log(item: &ApiRequestLogItem) {
+    let Ok(conn) = open_db() else { return };
+    if ensure_api_schema(&conn).is_err() {
+        return;
+    }
+    let _ = conn.execute(
+        "INSERT INTO api_service_logs
+         (id, timestamp, api_key_id, api_key_label, account_id, account_email, protocol,
+          request_model, resolved_model, stream, status_code, latency_ms,
+          input_tokens, output_tokens, thinking_tokens, cache_read_tokens, total_tokens,
+          error_message, request_preview, response_preview)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+        params![
+            item.id,
+            item.timestamp,
+            item.api_key_id,
+            item.api_key_label,
+            item.account_id,
+            item.account_email,
+            item.protocol,
+            item.request_model,
+            item.resolved_model,
+            if item.stream { 1 } else { 0 },
+            item.status_code as i64,
+            item.latency_ms as i64,
+            item.input_tokens as i64,
+            item.output_tokens as i64,
+            item.thinking_tokens as i64,
+            item.cache_read_tokens as i64,
+            item.total_tokens as i64,
+            item.error_message,
+            item.request_preview,
+            item.response_preview,
+        ],
+    );
+    let _ = conn.execute(
+        "UPDATE api_service_keys
+         SET last_used_at = ?1,
+             total_requests = total_requests + 1,
+             total_tokens = total_tokens + ?2
+         WHERE id = ?3",
+        params![item.timestamp, item.total_tokens as i64, item.api_key_id],
+    );
+    // Keep table bounded to last 5000 logs
+    let _ = conn.execute(
+        "DELETE FROM api_service_logs WHERE id IN (
+            SELECT id FROM api_service_logs ORDER BY timestamp DESC LIMIT -1 OFFSET 5000
+         )",
+        [],
+    );
+}
+
+// ============================================================================
+// Cooldown & Pool Management
+// ============================================================================
+
+fn active_cooldowns() -> Vec<AccountCooldownInfo> {
+    let now = Utc::now().timestamp();
+    let Ok(mut map) = cooldown_lock().lock() else {
+        return Vec::new();
+    };
+    map.retain(|_, v| v.until_ts > now);
+    map.iter()
+        .map(|(id, e)| AccountCooldownInfo {
+            account_id: id.clone(),
+            email: e.email.clone(),
+            until_ts: e.until_ts,
+            remaining_seconds: (e.until_ts - now).max(0),
+            reason: e.reason.clone(),
+        })
+        .collect()
+}
+
+fn mark_account_cooldown(account_id: &str, email: &str, seconds: u64, reason: String) {
+    let until_ts = Utc::now().timestamp() + (seconds.max(5) as i64);
+    if let Ok(mut map) = cooldown_lock().lock() {
+        map.insert(
+            account_id.to_string(),
+            CooldownEntry {
+                email: email.to_string(),
+                until_ts,
+                reason,
+            },
+        );
+    }
+}
+
+pub fn clear_account_cooldowns(account_id: Option<String>) -> Result<(), String> {
+    if let Ok(mut map) = cooldown_lock().lock() {
+        if let Some(id) = account_id.filter(|s| !s.trim().is_empty()) {
+            map.remove(&id);
+        } else {
+            map.clear();
+        }
+    }
+    Ok(())
+}
+
+fn is_on_cooldown(account_id: &str) -> bool {
+    let now = Utc::now().timestamp();
+    let Ok(map) = cooldown_lock().lock() else {
+        return false;
+    };
+    map.get(account_id).is_some_and(|e| e.until_ts > now)
+}
+
+fn parse_retry_seconds_from_body(body: &str, default_secs: u64) -> u64 {
+    // Matches Antigravity quota reset format: "Your quota will reset after 2h7m23s"
+    if let Ok(re) = Regex::new(r"(?i)(?:(\d+)h)?(?:(\d+)m)?(\d+)s") {
+        if let Some(caps) = re.captures(body) {
+            let h: u64 = caps.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            let m: u64 = caps.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            let s: u64 = caps.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+            let total = h * 3600 + m * 60 + s;
+            if total > 0 {
+                return total.min(3600);
+            }
+        }
+    }
+    default_secs.max(15)
+}
+
+fn account_quota_score(acc: &AntigravityAccount, model: &str) -> i32 {
+    let Some(q) = acc.quota.as_ref() else {
+        return 50;
+    };
+    if q.is_forbidden {
+        return -100;
+    }
+    let lower = model.to_ascii_lowercase();
+    let preferred_bucket = if lower.contains("claude") {
+        "claude:5h"
+    } else if lower.contains("argon") {
+        "argon:weekly"
+    } else if lower.contains("carbon") {
+        "carbon:weekly"
+    } else {
+        "gemini:5h"
+    };
+    for m in &q.models {
+        if m.name == preferred_bucket
+            || (preferred_bucket == "claude:5h" && m.name == "3p-5h")
+            || (preferred_bucket == "gemini:5h" && m.name == "gemini-5h")
+        {
+            return m.percentage;
+        }
+    }
+    if q.models.is_empty() {
+        return 50;
+    }
+    let sum: i32 = q.models.iter().map(|m| m.percentage).sum();
+    sum / (q.models.len() as i32)
+}
+
+fn resolve_pool_accounts(
+    cfg: &ApiServiceConfig,
+    key: &ApiKeyRecord,
+    model: &str,
+    excluded: &HashSet<String>,
+) -> Vec<AntigravityAccount> {
+    let all = accounts::list_accounts_sync().unwrap_or_default();
+    let mut pool: Vec<AntigravityAccount> = all
+        .into_iter()
+        .filter(|a| {
+            if a.disabled || a.token.refresh_token.trim().is_empty() {
+                return false;
+            }
+            if excluded.contains(&a.id) {
+                return false;
+            }
+            if !key.pinned_account_ids.is_empty() {
+                return key.pinned_account_ids.contains(&a.id);
+            }
+            if !cfg.member_account_ids.is_empty() {
+                return cfg.member_account_ids.contains(&a.id);
+            }
+            cfg.use_all_accounts_when_empty
+        })
+        .collect();
+
+    // Filter out accounts currently on cooldown unless ALL are cooling down
+    let healthy: Vec<AntigravityAccount> = pool
+        .iter()
+        .filter(|a| !is_on_cooldown(&a.id))
+        .cloned()
+        .collect();
+    if !healthy.is_empty() {
+        pool = healthy;
+    }
+
+    match cfg.routing_strategy.as_str() {
+        "highest_quota" => {
+            pool.sort_by(|a, b| {
+                account_quota_score(b, model)
+                    .cmp(&account_quota_score(a, model))
+                    .then_with(|| a.email.cmp(&b.email))
+            });
+        }
+        "round_robin" => {
+            if !pool.is_empty() {
+                let idx = RR_COUNTER.fetch_add(1, Ordering::Relaxed) % pool.len();
+                pool.rotate_left(idx);
+            }
+        }
+        "sticky_session" => {
+            let sticky_key = format!("{}:{model}", key.id);
+            if let Ok(map) = sticky_lock().lock() {
+                if let Some(pinned_id) = map.get(&sticky_key) {
+                    if let Some(pos) = pool.iter().position(|a| &a.id == pinned_id) {
+                        let chosen = pool.remove(pos);
+                        pool.insert(0, chosen);
+                    }
+                }
+            }
+        }
+        _ => {
+            // failover: preserve member_account_ids order or current-first order
+            if !cfg.member_account_ids.is_empty() {
+                pool.sort_by_key(|a| {
+                    cfg.member_account_ids
+                        .iter()
+                        .position(|id| id == &a.id)
+                        .unwrap_or(usize::MAX)
+                });
+            }
+        }
+    }
+
+    pool
+}
+
+// ============================================================================
+// Model Resolution & Catalog
+// ============================================================================
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p = pattern.trim().to_ascii_lowercase();
+    let t = text.trim().to_ascii_lowercase();
+    if p == t {
+        return true;
+    }
+    if let Some(prefix) = p.strip_suffix('*') {
+        return t.starts_with(prefix);
+    }
+    if let Some(suffix) = p.strip_prefix('*') {
+        return t.ends_with(suffix);
+    }
+    false
+}
+
+fn resolve_model_alias(cfg: &ApiServiceConfig, requested: &str) -> String {
+    let clean = requested
+        .trim()
+        .strip_prefix("antigravity/")
+        .or_else(|| requested.trim().strip_prefix("ag/"))
+        .unwrap_or(requested.trim());
+
+    for rule in &cfg.model_rules {
+        if rule.enabled && glob_match(&rule.pattern, clean) {
+            return rule.target_model.trim().to_string();
+        }
+    }
+    clean.to_string()
+}
+
+pub fn list_available_models() -> Result<Vec<ApiAvailableModel>, String> {
+    let mut seen = HashSet::new();
+    let mut models = Vec::new();
+
+    for (id, display, family, thinking) in BUILTIN_MODELS {
+        seen.insert((*id).to_string());
+        models.push(ApiAvailableModel {
+            id: (*id).to_string(),
+            display_name: (*display).to_string(),
+            family: (*family).to_string(),
+            thinking: *thinking,
+            source: "builtin".into(),
+        });
+    }
+
+    // Add live discovered models from user's fetched Antigravity accounts
+    if let Ok(accs) = accounts::list_accounts_sync() {
+        for acc in accs {
+            if let Some(q) = acc.quota {
+                for m in q.models {
+                    let n = m.name.trim();
+                    if n.is_empty()
+                        || n.contains(':')
+                        || n.ends_with("-5h")
+                        || n.ends_with("-weekly")
+                        || seen.contains(n)
+                    {
+                        continue;
+                    }
+                    seen.insert(n.to_string());
+                    let lower = n.to_ascii_lowercase();
+                    let family = if lower.contains("claude") {
+                        "claude"
+                    } else if lower.contains("image") {
+                        "image"
+                    } else if lower.contains("gpt") {
+                        "openai"
+                    } else {
+                        "gemini"
+                    };
+                    models.push(ApiAvailableModel {
+                        id: n.to_string(),
+                        display_name: m.display_name.unwrap_or_else(|| n.to_string()),
+                        family: family.into(),
+                        thinking: lower.contains("thinking")
+                            || lower.contains("pro")
+                            || lower.contains("argon")
+                            || lower.contains("carbon")
+                            || lower.contains("high"),
+                        source: "account-live".into(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Add enabled custom aliases so clients see them in /v1/models too
+    if let Ok(cfg) = load_config() {
+        for rule in cfg.model_rules {
+            if rule.enabled && !rule.pattern.contains('*') && !seen.contains(&rule.pattern) {
+                seen.insert(rule.pattern.clone());
+                models.push(ApiAvailableModel {
+                    id: rule.pattern.clone(),
+                    display_name: format!("{} → {}", rule.pattern, rule.target_model),
+                    family: "alias".into(),
+                    thinking: true,
+                    source: "alias".into(),
+                });
+            }
+        }
+    }
+
+    Ok(models)
+}
+
+// ============================================================================
+// Request Translators (OpenAI & Anthropic -> Antigravity Cloud Code)
+// ============================================================================
+
+fn sanitize_function_name(name: &str) -> String {
+    let mut s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        return "_unknown".into();
+    }
+    if !s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') {
+        s.insert(0, '_');
+    }
+    s.chars().take(64).collect()
+}
+
+fn clean_json_schema_for_antigravity(val: Value) -> Value {
+    match val {
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (k, v) in map {
+                if matches!(
+                    k.as_str(),
+                    "$schema"
+                        | "$id"
+                        | "$defs"
+                        | "definitions"
+                        | "additionalProperties"
+                        | "default"
+                        | "examples"
+                        | "title"
+                        | "exclusiveMinimum"
+                        | "exclusiveMaximum"
+                        | "const"
+                        | "propertyNames"
+                        | "patternProperties"
+                ) {
+                    continue;
+                }
+                if k == "type" {
+                    if let Value::Array(arr) = &v {
+                        if let Some(first) = arr
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .find(|s| *s != "null")
+                        {
+                            out.insert(k, Value::String(first.to_string()));
+                            continue;
+                        }
+                    }
+                }
+                out.insert(k, clean_json_schema_for_antigravity(v));
+            }
+            if out.get("type").and_then(Value::as_str) == Some("object")
+                && !out.contains_key("properties")
+            {
+                out.insert("properties".into(), json!({}));
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(
+            arr.into_iter()
+                .map(clean_json_schema_for_antigravity)
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn extract_text_from_value(val: &Value) -> String {
+    match val {
+        Value::String(s) => s.clone(),
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|item| {
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn convert_openai_content_to_parts(val: &Value) -> Vec<Value> {
+    match val {
+        Value::String(s) => {
+            if s.is_empty() {
+                vec![]
+            } else {
+                vec![json!({ "text": s })]
+            }
+        }
+        Value::Array(arr) => {
+            let mut parts = Vec::new();
+            for item in arr {
+                let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+                if kind == "text" {
+                    if let Some(t) = item.get("text").and_then(Value::as_str) {
+                        if !t.is_empty() {
+                            parts.push(json!({ "text": t }));
+                        }
+                    }
+                } else if kind == "image_url" {
+                    if let Some(url) = item.pointer("/image_url/url").and_then(Value::as_str) {
+                        if let Some(rest) = url.strip_prefix("data:") {
+                            if let Some((meta, b64)) = rest.split_once(";base64,") {
+                                parts.push(json!({
+                                    "inlineData": {
+                                        "mimeType": meta,
+                                        "data": b64
+                                    }
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+            parts
+        }
+        _ => vec![],
+    }
+}
+
+fn merge_adjacent_contents(contents: Vec<Value>) -> Vec<Value> {
+    let mut merged: Vec<Value> = Vec::new();
+    for item in contents {
+        let Some(role) = item.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(parts) = item.get("parts").and_then(Value::as_array) else {
+            continue;
+        };
+        if parts.is_empty() {
+            continue;
+        }
+        if let Some(last) = merged.last_mut() {
+            if last.get("role").and_then(Value::as_str) == Some(role) {
+                if let Some(last_parts) = last.get_mut("parts").and_then(Value::as_array_mut) {
+                    last_parts.extend(parts.iter().cloned());
+                    continue;
+                }
+            }
+        }
+        merged.push(item);
+    }
+    merged
+}
+
+fn openai_body_to_antigravity_envelope(
+    body: &Value,
+    resolved_model: &str,
+    project_id: &str,
+    session_seed: &str,
+) -> (Value, String) {
+    let mut system_texts: Vec<String> = Vec::new();
+    let mut contents: Vec<Value> = Vec::new();
+    let mut tool_id_to_name: HashMap<String, String> = HashMap::new();
+    let mut first_user_preview = String::new();
+
+    if let Some(msgs) = body.get("messages").and_then(Value::as_array) {
+        for m in msgs {
+            if m.get("role").and_then(Value::as_str) == Some("assistant") {
+                if let Some(tcs) = m.get("tool_calls").and_then(Value::as_array) {
+                    for tc in tcs {
+                        if let (Some(id), Some(name)) = (
+                            tc.get("id").and_then(Value::as_str),
+                            tc.pointer("/function/name").and_then(Value::as_str),
+                        ) {
+                            tool_id_to_name.insert(id.to_string(), name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        for m in msgs {
+            let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
+            let content = m.get("content").unwrap_or(&Value::Null);
+            match role {
+                "system" | "developer" => {
+                    let t = extract_text_from_value(content);
+                    if !t.trim().is_empty() {
+                        system_texts.push(t);
+                    }
+                }
+                "user" => {
+                    let parts = convert_openai_content_to_parts(content);
+                    if first_user_preview.is_empty() {
+                        first_user_preview = extract_text_from_value(content);
+                    }
+                    if !parts.is_empty() {
+                        contents.push(json!({ "role": "user", "parts": parts }));
+                    }
+                }
+                "assistant" => {
+                    let mut parts = Vec::new();
+                    let text = extract_text_from_value(content);
+                    if !text.is_empty() {
+                        parts.push(json!({ "text": text }));
+                    }
+                    if let Some(tcs) = m.get("tool_calls").and_then(Value::as_array) {
+                        for tc in tcs {
+                            let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                            let name = tc
+                                .pointer("/function/name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("tool");
+                            let args_str = tc
+                                .pointer("/function/arguments")
+                                .and_then(Value::as_str)
+                                .unwrap_or("{}");
+                            let args: Value =
+                                serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
+                            parts.push(json!({
+                                "thoughtSignature": DEFAULT_THINKING_AG_SIGNATURE,
+                                "functionCall": {
+                                    "id": id,
+                                    "name": sanitize_function_name(name),
+                                    "args": args
+                                }
+                            }));
+                        }
+                    }
+                    if !parts.is_empty() {
+                        contents.push(json!({ "role": "model", "parts": parts }));
+                    }
+                }
+                "tool" => {
+                    let tc_id = m.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
+                    let name = tool_id_to_name
+                        .get(tc_id)
+                        .cloned()
+                        .or_else(|| m.get("name").and_then(Value::as_str).map(str::to_string))
+                        .unwrap_or_else(|| "tool".into());
+                    let raw_text = extract_text_from_value(content);
+                    let parsed = serde_json::from_str::<Value>(&raw_text)
+                        .unwrap_or_else(|_| json!({ "result": raw_text }));
+                    let resp_obj = if parsed.is_object() {
+                        json!({ "result": parsed })
+                    } else {
+                        json!({ "result": parsed })
+                    };
+                    contents.push(json!({
+                        "role": "user",
+                        "parts": [{
+                            "functionResponse": {
+                                "id": tc_id,
+                                "name": sanitize_function_name(&name),
+                                "response": resp_obj
+                            }
+                        }]
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let merged_contents = merge_adjacent_contents(contents);
+    let mut gen_cfg = Map::new();
+    if let Some(t) = body.get("temperature").and_then(Value::as_f64) {
+        gen_cfg.insert("temperature".into(), json!(t));
+    }
+    if let Some(p) = body.get("top_p").and_then(Value::as_f64) {
+        gen_cfg.insert("topP".into(), json!(p));
+    }
+    let max_out = body
+        .get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(8192)
+        .min(MAX_ANTIGRAVITY_OUTPUT_TOKENS);
+    gen_cfg.insert("maxOutputTokens".into(), json!(max_out));
+
+    let mut req_obj = Map::new();
+    req_obj.insert("contents".into(), Value::Array(merged_contents.clone()));
+    req_obj.insert("generationConfig".into(), Value::Object(gen_cfg));
+    if !system_texts.is_empty() {
+        req_obj.insert(
+            "systemInstruction".into(),
+            json!({
+                "role": "user",
+                "parts": [{ "text": system_texts.join("\n\n") }]
+            }),
+        );
+    }
+
+    // Tools conversion (OpenAI & Anthropic shapes)
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        let mut decls = Vec::new();
+        let mut seen_names = HashSet::new();
+        for t in tools {
+            let (name, desc, params_val) = if let Some(f) = t.get("function") {
+                (
+                    f.get("name").and_then(Value::as_str).unwrap_or(""),
+                    f.get("description").and_then(Value::as_str).unwrap_or(""),
+                    f.get("parameters").cloned(),
+                )
+            } else {
+                (
+                    t.get("name").and_then(Value::as_str).unwrap_or(""),
+                    t.get("description").and_then(Value::as_str).unwrap_or(""),
+                    t.get("input_schema").cloned(),
+                )
+            };
+            if name.is_empty() {
+                continue;
+            }
+            let clean_name = sanitize_function_name(name);
+            if !seen_names.insert(clean_name.clone()) {
+                continue;
+            }
+            let parameters = params_val
+                .map(clean_json_schema_for_antigravity)
+                .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+            decls.push(json!({
+                "name": clean_name,
+                "description": desc,
+                "parameters": parameters
+            }));
+        }
+        if !decls.is_empty() {
+            req_obj.insert("tools".into(), json!([{ "functionDeclarations": decls }]));
+            req_obj.insert(
+                "toolConfig".into(),
+                json!({ "functionCallingConfig": { "mode": "VALIDATED" } }),
+            );
+        }
+    }
+
+    for k in BLACKLISTED_FIELDS {
+        req_obj.remove(*k);
+    }
+    let session_id = format!("{}-{}", Uuid::new_v4(), Utc::now().timestamp_millis());
+    req_obj.insert("sessionId".into(), Value::String(session_id));
+
+    let conv_id = Uuid::new_v4();
+    let traj_id = Uuid::new_v4();
+    let step = (merged_contents.len() * 2).saturating_sub(1).max(1);
+    let request_id = format!(
+        "agent/{}/{}/{}/{}",
+        conv_id,
+        Utc::now().timestamp_millis(),
+        traj_id,
+        step
+    );
+    let _ = session_seed;
+
+    let envelope = json!({
+        "project": project_id,
+        "model": resolved_model,
+        "userAgent": "antigravity",
+        "requestType": "agent",
+        "requestId": request_id,
+        "request": Value::Object(req_obj)
+    });
+
+    let preview: String = first_user_preview.chars().take(240).collect();
+    (envelope, preview)
+}
+
+fn anthropic_body_to_openai_body(body: &Value) -> Value {
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(sys) = body.get("system") {
+        let sys_text = extract_text_from_value(sys);
+        if !sys_text.trim().is_empty() {
+            messages.push(json!({ "role": "system", "content": sys_text }));
+        }
+    }
+    if let Some(src_msgs) = body.get("messages").and_then(Value::as_array) {
+        for m in src_msgs {
+            let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
+            let content = m.get("content").unwrap_or(&Value::Null);
+            if let Value::String(s) = content {
+                messages.push(json!({ "role": role, "content": s }));
+                continue;
+            }
+            if let Value::Array(blocks) = content {
+                let mut text_parts = Vec::new();
+                let mut tool_calls = Vec::new();
+                let mut tool_results = Vec::new();
+                for b in blocks {
+                    let btype = b.get("type").and_then(Value::as_str).unwrap_or("");
+                    match btype {
+                        "text" => {
+                            if let Some(t) = b.get("text").and_then(Value::as_str) {
+                                text_parts.push(t.to_string());
+                            }
+                        }
+                        "tool_use" => {
+                            let id = b.get("id").and_then(Value::as_str).unwrap_or("");
+                            let name = b.get("name").and_then(Value::as_str).unwrap_or("tool");
+                            let input = b.get("input").cloned().unwrap_or_else(|| json!({}));
+                            tool_calls.push(json!({
+                                "id": id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": serde_json::to_string(&input).unwrap_or_else(|_| "{}".into())
+                                }
+                            }));
+                        }
+                        "tool_result" => {
+                            let tid = b.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
+                            let txt = extract_text_from_value(b.get("content").unwrap_or(&Value::Null));
+                            tool_results.push(json!({
+                                "role": "tool",
+                                "tool_call_id": tid,
+                                "content": txt
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+                if !tool_results.is_empty() {
+                    messages.extend(tool_results);
+                }
+                if !text_parts.is_empty() || !tool_calls.is_empty() {
+                    let mut obj = Map::new();
+                    obj.insert("role".into(), json!(role));
+                    obj.insert("content".into(), json!(text_parts.join("\n")));
+                    if !tool_calls.is_empty() {
+                        obj.insert("tool_calls".into(), Value::Array(tool_calls));
+                    }
+                    messages.push(Value::Object(obj));
+                }
+            }
+        }
+    }
+
+    let mut out = Map::new();
+    out.insert(
+        "model".into(),
+        body.get("model")
+            .cloned()
+            .unwrap_or_else(|| json!("claude-sonnet-4-6")),
+    );
+    out.insert("messages".into(), Value::Array(messages));
+    if let Some(m) = body.get("max_tokens") {
+        out.insert("max_tokens".into(), m.clone());
+    }
+    if let Some(t) = body.get("temperature") {
+        out.insert("temperature".into(), t.clone());
+    }
+    if let Some(p) = body.get("top_p") {
+        out.insert("top_p".into(), p.clone());
+    }
+    if let Some(s) = body.get("stream") {
+        out.insert("stream".into(), s.clone());
+    }
+    if let Some(tools) = body.get("tools") {
+        out.insert("tools".into(), tools.clone());
+    }
+    Value::Object(out)
+}
+
+// ============================================================================
+// Upstream Antigravity Execution + SSE Parser
+// ============================================================================
+
+#[derive(Default)]
+struct ParsedUpstreamChunk {
+    text: String,
+    thinking: String,
+    tool_calls: Vec<(String, String, Value)>,
+    finish_reason: Option<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+    thinking_tokens: u64,
+    cache_read_tokens: u64,
+}
+
+fn parse_antigravity_response_payload(val: &Value) -> ParsedUpstreamChunk {
+    let mut out = ParsedUpstreamChunk::default();
+    let root = val.get("response").unwrap_or(val);
+
+    if let Some(usage) = root.get("usageMetadata") {
+        out.input_tokens = usage
+            .get("promptTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        out.thinking_tokens = usage
+            .get("thoughtsTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let candidates_tokens = usage
+            .get("candidatesTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        out.output_tokens = candidates_tokens.saturating_sub(out.thinking_tokens);
+        out.cache_read_tokens = usage
+            .get("cachedContentTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+    }
+
+    if let Some(cands) = root.get("candidates").and_then(Value::as_array) {
+        if let Some(first) = cands.first() {
+            if let Some(fr) = first.get("finishReason").and_then(Value::as_str) {
+                out.finish_reason = Some(match fr {
+                    "STOP" => "stop".into(),
+                    "MAX_TOKENS" => "length".into(),
+                    other => other.to_ascii_lowercase(),
+                });
+            }
+            if let Some(parts) = first.pointer("/content/parts").and_then(Value::as_array) {
+                for p in parts {
+                    let is_thought = p.get("thought").and_then(Value::as_bool).unwrap_or(false);
+                    if let Some(t) = p.get("text").and_then(Value::as_str) {
+                        if is_thought {
+                            out.thinking.push_str(t);
+                        } else {
+                            out.text.push_str(t);
+                        }
+                    }
+                    if let Some(fc) = p.get("functionCall") {
+                        let id = fc
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("call_{}", &Uuid::new_v4().to_string()[..12]));
+                        let name = fc
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool")
+                            .to_string();
+                        let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
+                        out.tool_calls.push((id, name, args));
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn build_upstream_client(cfg: &ApiServiceConfig) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(cfg.timeout_seconds.max(30)))
+        .user_agent(ANTIGRAVITY_IDE_USER_AGENT);
+    if let Some(proxy_str) = cfg
+        .proxy_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Ok(p) = reqwest::Proxy::all(proxy_str) {
+            builder = builder.proxy(p);
+        }
+    }
+    builder
+        .build()
+        .map_err(|e| format!("Build upstream HTTP client: {e}"))
+}
+
+fn generate_fallback_project_id() -> String {
+    let id = Uuid::new_v4().to_string();
+    format!("bright-spark-{}", &id[..5])
+}
+
+async fn send_upstream_with_failover(
+    cfg: &ApiServiceConfig,
+    key: &ApiKeyRecord,
+    resolved_model: &str,
+    openai_body: &Value,
+    stream: bool,
+) -> Result<(reqwest::Response, AntigravityAccount, String), (u16, String, String, String)> {
+    let client = build_upstream_client(cfg)
+        .map_err(|e| (500u16, e, String::new(), String::new()))?;
+    let mut tried = HashSet::new();
+    let max_attempts = (cfg.max_retries as usize) + 1;
+    let mut last_err = (503u16, "Không có tài khoản Antigravity khả dụng trong pool.".to_string(), String::new(), String::new());
+
+    for _ in 0..max_attempts {
+        let candidates = resolve_pool_accounts(cfg, key, resolved_model, &tried);
+        let Some(candidate) = candidates.into_iter().next() else {
+            break;
+        };
+        tried.insert(candidate.id.clone());
+
+        let acc = match accounts::ensure_fresh_access_token(&candidate.id, false).await {
+            Ok(a) => a,
+            Err(e) => {
+                mark_account_cooldown(&candidate.id, &candidate.email, cfg.cooldown_seconds, e.clone());
+                last_err = (401, e, candidate.id.clone(), candidate.email.clone());
+                continue;
+            }
+        };
+
+        let project_id = acc
+            .quota
+            .as_ref()
+            .and_then(|q| q.project_id.clone())
+            .or_else(|| acc.token.project_id.clone())
+            .filter(|p| !p.trim().is_empty() && p != "aicode-consumers")
+            .unwrap_or_else(generate_fallback_project_id);
+
+        let (envelope, preview) =
+            openai_body_to_antigravity_envelope(openai_body, resolved_model, &project_id, &key.id);
+
+        let action = if stream {
+            "streamGenerateContent?alt=sse"
+        } else {
+            "generateContent"
+        };
+
+        let mut succeeded = None;
+        for base_url in ANTIGRAVITY_BASE_URLS {
+            let url = format!("{base_url}/v1internal:{action}");
+            let send_res = client
+                .post(&url)
+                .bearer_auth(&acc.token.access_token)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::USER_AGENT, ANTIGRAVITY_IDE_USER_AGENT)
+                .json(&envelope)
+                .send()
+                .await;
+
+            match send_res {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    if resp.status().is_success() {
+                        if cfg.routing_strategy == "sticky_session" {
+                            if let Ok(mut map) = sticky_lock().lock() {
+                                map.insert(format!("{}:{resolved_model}", key.id), acc.id.clone());
+                            }
+                        }
+                        succeeded = Some((resp, acc.clone(), preview.clone()));
+                        break;
+                    }
+                    let err_body = resp.text().await.unwrap_or_default();
+                    if status == 401 {
+                        if let Ok(re_acc) =
+                            accounts::ensure_fresh_access_token(&acc.id, true).await
+                        {
+                            if let Ok(retry_resp) = client
+                                .post(&url)
+                                .bearer_auth(&re_acc.token.access_token)
+                                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                                .header(reqwest::header::USER_AGENT, ANTIGRAVITY_IDE_USER_AGENT)
+                                .json(&envelope)
+                                .send()
+                                .await
+                            {
+                                if retry_resp.status().is_success() {
+                                    succeeded = Some((retry_resp, re_acc, preview.clone()));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if status == 429 || status == 503 || status == 500 || status == 502 {
+                        let cool = parse_retry_seconds_from_body(&err_body, cfg.cooldown_seconds);
+                        mark_account_cooldown(
+                            &acc.id,
+                            &acc.email,
+                            cool,
+                            format!("HTTP {status}"),
+                        );
+                        last_err = (status, err_body, acc.id.clone(), acc.email.clone());
+                        continue;
+                    }
+                    // 400 / 403 / 404: return directly or try fallback endpoint once
+                    last_err = (status, err_body, acc.id.clone(), acc.email.clone());
+                    if status == 403 {
+                        mark_account_cooldown(&acc.id, &acc.email, 300, "HTTP 403".into());
+                        break;
+                    }
+                }
+                Err(e) => {
+                    last_err = (502, e.to_string(), acc.id.clone(), acc.email.clone());
+                }
+            }
+        }
+
+        if let Some(ok) = succeeded {
+            return Ok(ok);
+        }
+    }
+
+    Err(last_err)
+}
+
+// ============================================================================
+// HTTP/1.1 Server Handling (/v1/models, /v1/chat/completions, /v1/messages, /health)
+// ============================================================================
+
+struct HttpRequest {
+    method: String,
+    path: String,
+    query: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
+    let mut buf = Vec::with_capacity(4096);
+    let mut temp = [0u8; 4096];
+    let header_end;
+
+    loop {
+        let n = stream
+            .read(&mut temp)
+            .await
+            .map_err(|e| format!("Read socket: {e}"))?;
+        if n == 0 {
+            return Err("EOF".into());
+        }
+        buf.extend_from_slice(&temp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            header_end = pos + 4;
+            break;
+        }
+        if buf.len() > 128 * 1024 {
+            return Err("Header too large".into());
+        }
+    }
+
+    let head_str = String::from_utf8_lossy(&buf[..header_end - 4]);
+    let mut lines = head_str.lines();
+    let req_line = lines.next().ok_or("Empty request line")?;
+    let mut parts = req_line.split_whitespace();
+    let method = parts.next().unwrap_or("GET").to_uppercase();
+    let raw_target = parts.next().unwrap_or("/");
+    let (path, query) = match raw_target.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (raw_target.to_string(), String::new()),
+    };
+
+    let mut headers = HashMap::new();
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        }
+    }
+
+    let content_length: usize = headers
+        .get("content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if content_length > 20 * 1024 * 1024 {
+        return Err("Payload too large".into());
+    }
+
+    let mut body = buf[header_end..].to_vec();
+    while body.len() < content_length {
+        let n = stream
+            .read(&mut temp)
+            .await
+            .map_err(|e| format!("Read body: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&temp[..n]);
+    }
+    body.truncate(content_length);
+
+    Ok(HttpRequest {
+        method,
+        path,
+        query,
+        headers,
+        body,
+    })
+}
+
+async fn write_json_response(stream: &mut TcpStream, status: u16, body: &Value) {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Internal Server Error",
+    };
+    let payload = serde_json::to_string(body).unwrap_or_else(|_| "{}".into());
+    let resp = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: application/json; charset=utf-8\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Headers: *\r\n\
+         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n\
+         {payload}",
+        payload.len()
+    );
+    let _ = stream.write_all(resp.as_bytes()).await;
+    let _ = stream.flush().await;
+}
+
+async fn write_sse_headers(stream: &mut TcpStream) -> Result<(), String> {
+    let head = "HTTP/1.1 200 OK\r\n\
+        Content-Type: text/event-stream; charset=utf-8\r\n\
+        Cache-Control: no-cache\r\n\
+        Connection: keep-alive\r\n\
+        Access-Control-Allow-Origin: *\r\n\
+        Access-Control-Allow-Headers: *\r\n\r\n";
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .map_err(|e| format!("Write SSE headers: {e}"))?;
+    let _ = stream.flush().await;
+    Ok(())
+}
+
+fn extract_api_token(req: &HttpRequest) -> Option<String> {
+    if let Some(auth) = req.headers.get("authorization") {
+        let trimmed = auth.trim();
+        if let Some(bearer) = trimmed.strip_prefix("Bearer ").or_else(|| trimmed.strip_prefix("bearer ")) {
+            return Some(bearer.trim().to_string());
+        }
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(key) = req.headers.get("x-api-key") {
+        if !key.trim().is_empty() {
+            return Some(key.trim().to_string());
+        }
+    }
+    if let Some(key) = req.headers.get("x-goog-api-key") {
+        if !key.trim().is_empty() {
+            return Some(key.trim().to_string());
+        }
+    }
+    for pair in req.query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == "key" && !v.trim().is_empty() {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+async fn handle_connection(mut stream: TcpStream) {
+    let req = match read_http_request(&mut stream).await {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    if req.method == "OPTIONS" {
+        let resp = "HTTP/1.1 204 No Content\r\n\
+            Access-Control-Allow-Origin: *\r\n\
+            Access-Control-Allow-Headers: *\r\n\
+            Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+            Content-Length: 0\r\n\
+            Connection: close\r\n\r\n";
+        let _ = stream.write_all(resp.as_bytes()).await;
+        return;
+    }
+
+    if req.path == "/health" || req.path == "/v1/health" {
+        let status = get_status().ok();
+        write_json_response(
+            &mut stream,
+            200,
+            &json!({
+                "status": "ok",
+                "service": "OnlyDEVS Antigravity API Router",
+                "poolTotal": status.as_ref().map(|s| s.pool_total).unwrap_or(0),
+                "poolHealthy": status.as_ref().map(|s| s.pool_healthy).unwrap_or(0),
+            }),
+        )
+        .await;
+        return;
+    }
+
+    // Authenticate API Key
+    let token = extract_api_token(&req).unwrap_or_default();
+    let Some(api_key) = find_valid_api_key(&token) else {
+        write_json_response(
+            &mut stream,
+            401,
+            &json!({
+                "error": {
+                    "message": "Invalid or disabled OnlyDEVS API key. Pass Authorization: Bearer <key> or x-api-key.",
+                    "type": "authentication_error"
+                }
+            }),
+        )
+        .await;
+        return;
+    };
+
+    if req.method == "GET" && (req.path == "/v1/models" || req.path == "/models") {
+        let models = list_available_models().unwrap_or_default();
+        let data: Vec<Value> = models
+            .into_iter()
+            .filter(|m| {
+                api_key.allowed_models.is_empty()
+                    || api_key.allowed_models.iter().any(|a| glob_match(a, &m.id))
+            })
+            .map(|m| {
+                json!({
+                    "id": m.id,
+                    "object": "model",
+                    "created": 1735689600,
+                    "owned_by": format!("antigravity-{}", m.family),
+                    "display_name": m.display_name
+                })
+            })
+            .collect();
+        write_json_response(&mut stream, 200, &json!({ "object": "list", "data": data })).await;
+        return;
+    }
+
+    let is_openai = req.method == "POST"
+        && (req.path == "/v1/chat/completions" || req.path == "/chat/completions");
+    let is_anthropic =
+        req.method == "POST" && (req.path == "/v1/messages" || req.path == "/messages");
+
+    if !is_openai && !is_anthropic {
+        write_json_response(
+            &mut stream,
+            404,
+            &json!({
+                "error": {
+                    "message": format!("Unsupported endpoint: {} {}. Use /v1/models, /v1/chat/completions, or /v1/messages.", req.method, req.path),
+                    "type": "not_found_error"
+                }
+            }),
+        )
+        .await;
+        return;
+    }
+
+    let raw_body: Value = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => {
+            write_json_response(
+                &mut stream,
+                400,
+                &json!({ "error": { "message": format!("Invalid JSON body: {e}"), "type": "invalid_request_error" } }),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let cfg = load_config().unwrap_or_default();
+    let protocol = if is_anthropic { "anthropic" } else { "openai" };
+    let openai_body = if is_anthropic {
+        anthropic_body_to_openai_body(&raw_body)
+    } else {
+        raw_body.clone()
+    };
+
+    let request_model = openai_body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("gemini-3-flash-agent")
+        .to_string();
+    let resolved_model = resolve_model_alias(&cfg, &request_model);
+    let is_stream = openai_body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if !api_key.allowed_models.is_empty()
+        && !api_key
+            .allowed_models
+            .iter()
+            .any(|p| glob_match(p, &request_model) || glob_match(p, &resolved_model))
+    {
+        write_json_response(
+            &mut stream,
+            403,
+            &json!({
+                "error": {
+                    "message": format!("API key '{}' is not allowed to call model '{}'", api_key.label, request_model),
+                    "type": "permission_error"
+                }
+            }),
+        )
+        .await;
+        return;
+    }
+
+    ACTIVE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    let log_id = Uuid::new_v4().to_string();
+
+    let upstream_res =
+        send_upstream_with_failover(&cfg, &api_key, &resolved_model, &openai_body, is_stream).await;
+
+    match upstream_res {
+        Err((status, err_msg, acc_id, acc_email)) => {
+            ACTIVE_REQUESTS.fetch_sub(1, Ordering::Relaxed);
+            record_api_log(&ApiRequestLogItem {
+                id: log_id,
+                timestamp: Utc::now().timestamp(),
+                api_key_id: api_key.id,
+                api_key_label: api_key.label,
+                account_id: acc_id,
+                account_email: acc_email,
+                protocol: protocol.into(),
+                request_model,
+                resolved_model,
+                stream: is_stream,
+                status_code: status,
+                latency_ms: started.elapsed().as_millis() as u64,
+                input_tokens: 0,
+                output_tokens: 0,
+                thinking_tokens: 0,
+                cache_read_tokens: 0,
+                total_tokens: 0,
+                error_message: Some(err_msg.clone()),
+                request_preview: String::new(),
+                response_preview: String::new(),
+            });
+            write_json_response(
+                &mut stream,
+                status,
+                &json!({
+                    "error": {
+                        "message": err_msg,
+                        "type": "upstream_error"
+                    }
+                }),
+            )
+            .await;
+        }
+        Ok((mut resp, acc, req_preview)) => {
+            let mut total_in = 0u64;
+            let mut total_out = 0u64;
+            let mut total_think = 0u64;
+            let mut total_cache = 0u64;
+            let mut collected_text = String::new();
+            let mut collected_think = String::new();
+            let mut collected_tools: Vec<(String, String, Value)> = Vec::new();
+            let mut finish_reason = "stop".to_string();
+            let completion_id = format!("chatcmpl-{}", &Uuid::new_v4().to_string()[..12]);
+            let msg_id = format!("msg_{}", &Uuid::new_v4().to_string()[..16]);
+            let created_ts = Utc::now().timestamp();
+
+            if is_stream {
+                if write_sse_headers(&mut stream).await.is_ok() {
+                    let mut sse_buf = String::new();
+                    let mut anthropic_started = false;
+                    let mut anthropic_block_idx = 0usize;
+                    let mut anthropic_in_thinking = false;
+                    let mut anthropic_in_text = false;
+
+                    while let Ok(Some(chunk)) = resp.chunk().await {
+                        sse_buf.push_str(&String::from_utf8_lossy(&chunk));
+                        while let Some(nl) = sse_buf.find('\n') {
+                            let line = sse_buf[..nl].trim().to_string();
+                            sse_buf.drain(..=nl);
+                            let Some(data_str) = line.strip_prefix("data:") else {
+                                continue;
+                            };
+                            let data_trim = data_str.trim();
+                            if data_trim.is_empty() || data_trim == "[DONE]" {
+                                continue;
+                            }
+                            let Ok(val) = serde_json::from_str::<Value>(data_trim) else {
+                                continue;
+                            };
+                            let parsed = parse_antigravity_response_payload(&val);
+                            if parsed.input_tokens > 0 {
+                                total_in = parsed.input_tokens;
+                            }
+                            if parsed.output_tokens > 0 {
+                                total_out = parsed.output_tokens;
+                            }
+                            if parsed.thinking_tokens > 0 {
+                                total_think = parsed.thinking_tokens;
+                            }
+                            if parsed.cache_read_tokens > 0 {
+                                total_cache = parsed.cache_read_tokens;
+                            }
+                            if let Some(fr) = parsed.finish_reason {
+                                finish_reason = fr;
+                            }
+
+                            if is_openai {
+                                let mut delta = Map::new();
+                                if !parsed.thinking.is_empty() {
+                                    collected_think.push_str(&parsed.thinking);
+                                    delta.insert("reasoning_content".into(), json!(parsed.thinking));
+                                }
+                                if !parsed.text.is_empty() {
+                                    collected_text.push_str(&parsed.text);
+                                    delta.insert("content".into(), json!(parsed.text));
+                                }
+                                if !parsed.tool_calls.is_empty() {
+                                    let tc_json: Vec<Value> = parsed
+                                        .tool_calls
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, (id, name, args))| {
+                                            collected_tools.push((id.clone(), name.clone(), args.clone()));
+                                            json!({
+                                                "index": i,
+                                                "id": id,
+                                                "type": "function",
+                                                "function": {
+                                                    "name": name,
+                                                    "arguments": serde_json::to_string(args).unwrap_or_else(|_| "{}".into())
+                                                }
+                                            })
+                                        })
+                                        .collect();
+                                    delta.insert("tool_calls".into(), Value::Array(tc_json));
+                                    finish_reason = "tool_calls".into();
+                                }
+                                if !delta.is_empty() {
+                                    let frame = json!({
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created_ts,
+                                        "model": request_model,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": Value::Object(delta),
+                                            "finish_reason": Value::Null
+                                        }]
+                                    });
+                                    let msg = format!("data: {}\n\n", frame);
+                                    let _ = stream.write_all(msg.as_bytes()).await;
+                                    let _ = stream.flush().await;
+                                }
+                            } else {
+                                // Anthropic SSE stream
+                                if !anthropic_started {
+                                    anthropic_started = true;
+                                    let ev = json!({
+                                        "type": "message_start",
+                                        "message": {
+                                            "id": msg_id,
+                                            "type": "message",
+                                            "role": "assistant",
+                                            "content": [],
+                                            "model": request_model,
+                                            "stop_reason": Value::Null,
+                                            "usage": { "input_tokens": total_in, "output_tokens": 0 }
+                                        }
+                                    });
+                                    let _ = stream
+                                        .write_all(format!("event: message_start\ndata: {ev}\n\n").as_bytes())
+                                        .await;
+                                }
+                                if !parsed.thinking.is_empty() {
+                                    collected_think.push_str(&parsed.thinking);
+                                    if !anthropic_in_thinking {
+                                        anthropic_in_thinking = true;
+                                        let ev = json!({
+                                            "type": "content_block_start",
+                                            "index": anthropic_block_idx,
+                                            "content_block": { "type": "thinking", "thinking": "" }
+                                        });
+                                        let _ = stream.write_all(format!("event: content_block_start\ndata: {ev}\n\n").as_bytes()).await;
+                                    }
+                                    let ev = json!({
+                                        "type": "content_block_delta",
+                                        "index": anthropic_block_idx,
+                                        "delta": { "type": "thinking_delta", "thinking": parsed.thinking }
+                                    });
+                                    let _ = stream.write_all(format!("event: content_block_delta\ndata: {ev}\n\n").as_bytes()).await;
+                                }
+                                if !parsed.text.is_empty() {
+                                    collected_text.push_str(&parsed.text);
+                                    if anthropic_in_thinking {
+                                        let ev = json!({ "type": "content_block_stop", "index": anthropic_block_idx });
+                                        let _ = stream.write_all(format!("event: content_block_stop\ndata: {ev}\n\n").as_bytes()).await;
+                                        anthropic_in_thinking = false;
+                                        anthropic_block_idx += 1;
+                                    }
+                                    if !anthropic_in_text {
+                                        anthropic_in_text = true;
+                                        let ev = json!({
+                                            "type": "content_block_start",
+                                            "index": anthropic_block_idx,
+                                            "content_block": { "type": "text", "text": "" }
+                                        });
+                                        let _ = stream.write_all(format!("event: content_block_start\ndata: {ev}\n\n").as_bytes()).await;
+                                    }
+                                    let ev = json!({
+                                        "type": "content_block_delta",
+                                        "index": anthropic_block_idx,
+                                        "delta": { "type": "text_delta", "text": parsed.text }
+                                    });
+                                    let _ = stream.write_all(format!("event: content_block_delta\ndata: {ev}\n\n").as_bytes()).await;
+                                }
+                                for (id, name, args) in parsed.tool_calls {
+                                    collected_tools.push((id.clone(), name.clone(), args.clone()));
+                                    if anthropic_in_thinking || anthropic_in_text {
+                                        let ev = json!({ "type": "content_block_stop", "index": anthropic_block_idx });
+                                        let _ = stream.write_all(format!("event: content_block_stop\ndata: {ev}\n\n").as_bytes()).await;
+                                        anthropic_in_thinking = false;
+                                        anthropic_in_text = false;
+                                        anthropic_block_idx += 1;
+                                    }
+                                    let ev1 = json!({
+                                        "type": "content_block_start",
+                                        "index": anthropic_block_idx,
+                                        "content_block": { "type": "tool_use", "id": id, "name": name, "input": {} }
+                                    });
+                                    let ev2 = json!({
+                                        "type": "content_block_delta",
+                                        "index": anthropic_block_idx,
+                                        "delta": { "type": "input_json_delta", "partial_json": serde_json::to_string(&args).unwrap_or_else(|_| "{}".into()) }
+                                    });
+                                    let ev3 = json!({ "type": "content_block_stop", "index": anthropic_block_idx });
+                                    let _ = stream.write_all(format!("event: content_block_start\ndata: {ev1}\n\nevent: content_block_delta\ndata: {ev2}\n\nevent: content_block_stop\ndata: {ev3}\n\n").as_bytes()).await;
+                                    anthropic_block_idx += 1;
+                                    finish_reason = "tool_use".into();
+                                }
+                                let _ = stream.flush().await;
+                            }
+                        }
+                    }
+
+                    // Send stream termination frames
+                    if is_openai {
+                        let done_frame = json!({
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": request_model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": finish_reason
+                            }],
+                            "usage": {
+                                "prompt_tokens": total_in,
+                                "completion_tokens": total_out + total_think,
+                                "total_tokens": total_in + total_out + total_think
+                            }
+                        });
+                        let _ = stream
+                            .write_all(format!("data: {done_frame}\n\ndata: [DONE]\n\n").as_bytes())
+                            .await;
+                    } else {
+                        if anthropic_in_thinking || anthropic_in_text {
+                            let ev = json!({ "type": "content_block_stop", "index": anthropic_block_idx });
+                            let _ = stream.write_all(format!("event: content_block_stop\ndata: {ev}\n\n").as_bytes()).await;
+                        }
+                        let stop_reason = if finish_reason == "tool_use" {
+                            "tool_use"
+                        } else if finish_reason == "length" {
+                            "max_tokens"
+                        } else {
+                            "end_turn"
+                        };
+                        let ev_delta = json!({
+                            "type": "message_delta",
+                            "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
+                            "usage": { "output_tokens": total_out + total_think }
+                        });
+                        let ev_stop = json!({ "type": "message_stop" });
+                        let _ = stream
+                            .write_all(
+                                format!("event: message_delta\ndata: {ev_delta}\n\nevent: message_stop\ndata: {ev_stop}\n\n")
+                                    .as_bytes(),
+                            )
+                            .await;
+                    }
+                    let _ = stream.flush().await;
+                }
+            } else {
+                // Non-streaming JSON response
+                let raw_text = resp.text().await.unwrap_or_default();
+                let parsed = serde_json::from_str::<Value>(&raw_text)
+                    .map(|v| parse_antigravity_response_payload(&v))
+                    .unwrap_or_default();
+                total_in = parsed.input_tokens;
+                total_out = parsed.output_tokens;
+                total_think = parsed.thinking_tokens;
+                total_cache = parsed.cache_read_tokens;
+                collected_text = parsed.text;
+                collected_think = parsed.thinking;
+                collected_tools = parsed.tool_calls;
+                if let Some(fr) = parsed.finish_reason {
+                    finish_reason = fr;
+                }
+                if !collected_tools.is_empty() {
+                    finish_reason = if is_anthropic {
+                        "tool_use".into()
+                    } else {
+                        "tool_calls".into()
+                    };
+                }
+
+                if is_openai {
+                    let mut message = Map::new();
+                    message.insert("role".into(), json!("assistant"));
+                    message.insert("content".into(), json!(collected_text));
+                    if !collected_think.is_empty() {
+                        message.insert("reasoning_content".into(), json!(collected_think));
+                    }
+                    if !collected_tools.is_empty() {
+                        let tcs: Vec<Value> = collected_tools
+                            .iter()
+                            .map(|(id, name, args)| {
+                                json!({
+                                    "id": id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": serde_json::to_string(args).unwrap_or_else(|_| "{}".into())
+                                    }
+                                })
+                            })
+                            .collect();
+                        message.insert("tool_calls".into(), Value::Array(tcs));
+                    }
+                    let out_json = json!({
+                        "id": completion_id,
+                        "object": "chat.completion",
+                        "created": created_ts,
+                        "model": request_model,
+                        "choices": [{
+                            "index": 0,
+                            "message": Value::Object(message),
+                            "finish_reason": finish_reason
+                        }],
+                        "usage": {
+                            "prompt_tokens": total_in,
+                            "completion_tokens": total_out + total_think,
+                            "total_tokens": total_in + total_out + total_think
+                        }
+                    });
+                    write_json_response(&mut stream, 200, &out_json).await;
+                } else {
+                    let mut blocks = Vec::new();
+                    if !collected_think.is_empty() {
+                        blocks.push(json!({ "type": "thinking", "thinking": collected_think }));
+                    }
+                    if !collected_text.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": collected_text }));
+                    }
+                    for (id, name, args) in &collected_tools {
+                        blocks.push(json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": args
+                        }));
+                    }
+                    let stop_reason = if !collected_tools.is_empty() {
+                        "tool_use"
+                    } else if finish_reason == "length" {
+                        "max_tokens"
+                    } else {
+                        "end_turn"
+                    };
+                    let out_json = json!({
+                        "id": msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": request_model,
+                        "content": blocks,
+                        "stop_reason": stop_reason,
+                        "usage": {
+                            "input_tokens": total_in,
+                            "output_tokens": total_out + total_think,
+                            "cache_read_input_tokens": total_cache
+                        }
+                    });
+                    write_json_response(&mut stream, 200, &out_json).await;
+                }
+            }
+
+            ACTIVE_REQUESTS.fetch_sub(1, Ordering::Relaxed);
+            let total_tokens = total_in + total_out + total_think + total_cache;
+            let resp_preview: String = collected_text.chars().take(260).collect();
+            record_api_log(&ApiRequestLogItem {
+                id: log_id,
+                timestamp: Utc::now().timestamp(),
+                api_key_id: api_key.id,
+                api_key_label: api_key.label,
+                account_id: acc.id,
+                account_email: acc.email,
+                protocol: protocol.into(),
+                request_model,
+                resolved_model,
+                stream: is_stream,
+                status_code: 200,
+                latency_ms: started.elapsed().as_millis() as u64,
+                input_tokens: total_in,
+                output_tokens: total_out,
+                thinking_tokens: total_think,
+                cache_read_tokens: total_cache,
+                total_tokens,
+                error_message: None,
+                request_preview: req_preview,
+                response_preview: resp_preview,
+            });
+        }
+    }
+}
+
+// ============================================================================
+// Server Lifecycle & Status
+// ============================================================================
+
+fn detect_local_lan_ip() -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    Some(sock.local_addr().ok()?.ip().to_string())
+}
+
+pub async fn start_server() -> Result<ApiServiceStatus, String> {
+    let cfg = load_config()?;
+    // If already running on same bind/port, return status
+    let bind_host = if cfg.access_scope == "lan" {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    };
+    {
+        let guard = server_lock().lock().map_err(|_| "Lock poisoned")?;
+        if let Some(running) = guard.as_ref() {
+            if running.host == bind_host && running.port == cfg.port {
+                drop(guard);
+                return get_status();
+            }
+        }
+    }
+
+    stop_server()?;
+
+    let addr = format!("{bind_host}:{}", cfg.port);
+    let listener = TcpListener::bind(&addr)
+        .await
+        .map_err(|e| format!("Không thể mở cổng {addr}: {e}"))?;
+
+    let (tx, mut rx) = oneshot::channel::<()>();
+    let started_at = Utc::now().timestamp();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => {
+                    break;
+                }
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((stream, _peer)) => {
+                            tokio::spawn(handle_connection(stream));
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    {
+        let mut guard = server_lock().lock().map_err(|_| "Lock poisoned")?;
+        *guard = Some(RunningServer {
+            host: bind_host.to_string(),
+            port: cfg.port,
+            started_at,
+            shutdown_tx: Some(tx),
+        });
+    }
+
+    get_status()
+}
+
+pub fn stop_server() -> Result<ApiServiceStatus, String> {
+    if let Ok(mut guard) = server_lock().lock() {
+        if let Some(mut running) = guard.take() {
+            if let Some(tx) = running.shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+    get_status()
+}
+
+pub async fn restart_server() -> Result<ApiServiceStatus, String> {
+    let _ = stop_server();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    start_server().await
+}
+
+pub fn get_status() -> Result<ApiServiceStatus, String> {
+    let cfg = load_config()?;
+    let keys = list_api_keys()?;
+    let all_accs = accounts::list_accounts_sync().unwrap_or_default();
+    let pool_accs: Vec<AntigravityAccount> = all_accs
+        .into_iter()
+        .filter(|a| {
+            if a.disabled || a.token.refresh_token.trim().is_empty() {
+                return false;
+            }
+            if !cfg.member_account_ids.is_empty() {
+                cfg.member_account_ids.contains(&a.id)
+            } else {
+                cfg.use_all_accounts_when_empty
+            }
+        })
+        .collect();
+    let pool_total = pool_accs.len();
+    let pool_healthy = pool_accs.iter().filter(|a| !is_on_cooldown(&a.id)).count();
+    let cooldowns = active_cooldowns();
+
+    let (running, host, port, started_at) = {
+        let guard = server_lock().lock().map_err(|_| "Lock poisoned")?;
+        match guard.as_ref() {
+            Some(r) => (true, r.host.clone(), r.port, Some(r.started_at)),
+            None => (
+                false,
+                if cfg.access_scope == "lan" {
+                    "0.0.0.0".to_string()
+                } else {
+                    "127.0.0.1".to_string()
+                },
+                cfg.port,
+                None,
+            ),
+        }
+    };
+
+    let base_url = format!("http://localhost:{port}/v1");
+    let lan_url = if cfg.access_scope == "lan" {
+        detect_local_lan_ip().map(|ip| format!("http://{ip}:{port}/v1"))
+    } else {
+        None
+    };
+
+    Ok(ApiServiceStatus {
+        running,
+        host,
+        port,
+        base_url,
+        lan_url,
+        started_at,
+        active_requests: ACTIVE_REQUESTS.load(Ordering::Relaxed),
+        pool_total,
+        pool_healthy,
+        cooldowns,
+        config: cfg,
+        keys,
+    })
+}
+
+// ============================================================================
+// Request Logs & API Usage Analytics
+// ============================================================================
+
+pub fn list_request_logs(limit: Option<usize>) -> Result<Vec<ApiRequestLogItem>, String> {
+    let conn = open_db()?;
+    ensure_api_schema(&conn)?;
+    let lim = limit.unwrap_or(200).min(1000) as i64;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, timestamp, api_key_id, api_key_label, account_id, account_email,
+                    protocol, request_model, resolved_model, stream, status_code, latency_ms,
+                    input_tokens, output_tokens, thinking_tokens, cache_read_tokens, total_tokens,
+                    error_message, request_preview, response_preview
+             FROM api_service_logs
+             ORDER BY timestamp DESC
+             LIMIT ?1",
+        )
+        .map_err(|e| format!("Prepare list logs: {e}"))?;
+    let rows = stmt
+        .query_map(params![lim], |r| {
+            Ok(ApiRequestLogItem {
+                id: r.get(0)?,
+                timestamp: r.get(1)?,
+                api_key_id: r.get(2)?,
+                api_key_label: r.get(3)?,
+                account_id: r.get(4)?,
+                account_email: r.get(5)?,
+                protocol: r.get(6)?,
+                request_model: r.get(7)?,
+                resolved_model: r.get(8)?,
+                stream: r.get::<_, i64>(9)? != 0,
+                status_code: r.get::<_, i64>(10)?.max(0) as u16,
+                latency_ms: r.get::<_, i64>(11)?.max(0) as u64,
+                input_tokens: r.get::<_, i64>(12)?.max(0) as u64,
+                output_tokens: r.get::<_, i64>(13)?.max(0) as u64,
+                thinking_tokens: r.get::<_, i64>(14)?.max(0) as u64,
+                cache_read_tokens: r.get::<_, i64>(15)?.max(0) as u64,
+                total_tokens: r.get::<_, i64>(16)?.max(0) as u64,
+                error_message: r.get(17)?,
+                request_preview: r.get(18)?,
+                response_preview: r.get(19)?,
+            })
+        })
+        .map_err(|e| format!("Query list logs: {e}"))?;
+    Ok(rows.flatten().collect())
+}
+
+pub fn clear_request_logs() -> Result<(), String> {
+    let conn = open_db()?;
+    ensure_api_schema(&conn)?;
+    conn.execute("DELETE FROM api_service_logs", [])
+        .map_err(|e| format!("Clear api logs: {e}"))?;
+    conn.execute(
+        "UPDATE api_service_keys SET total_requests = 0, total_tokens = 0",
+        [],
+    )
+    .ok();
+    Ok(())
+}
+
+pub fn get_usage_summary(range: Option<String>) -> Result<ApiServiceUsageSummary, String> {
+    let conn = open_db()?;
+    ensure_api_schema(&conn)?;
+    let range_key = range.unwrap_or_else(|| "30d".into());
+    let now = Utc::now().timestamp();
+    let cutoff = match range_key.as_str() {
+        "today" => now - 86_400,
+        "7d" => now - 7 * 86_400,
+        "30d" => now - 30 * 86_400,
+        _ => 0,
+    };
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT timestamp, api_key_id, api_key_label, account_id, account_email,
+                    resolved_model, status_code, latency_ms,
+                    input_tokens, output_tokens, thinking_tokens, cache_read_tokens, total_tokens
+             FROM api_service_logs
+             WHERE timestamp >= ?1
+             ORDER BY timestamp ASC",
+        )
+        .map_err(|e| format!("Prepare usage summary: {e}"))?;
+
+    let mut total_requests = 0u64;
+    let mut success_requests = 0u64;
+    let mut error_requests = 0u64;
+    let mut latency_sum = 0u64;
+    let mut in_sum = 0u64;
+    let mut think_sum = 0u64;
+    let mut out_sum = 0u64;
+    let mut cache_sum = 0u64;
+    let mut tok_sum = 0u64;
+
+    let mut by_model: HashMap<String, (ApiUsageBreakdownRow, u64)> = HashMap::new();
+    let mut by_account: HashMap<String, (ApiUsageBreakdownRow, u64)> = HashMap::new();
+    let mut by_key: HashMap<String, (ApiUsageBreakdownRow, u64)> = HashMap::new();
+    let mut series: BTreeMap<String, ApiUsageTimePoint> = BTreeMap::new();
+
+    let rows = stmt
+        .query_map(params![cutoff], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?.max(0) as u64,
+                r.get::<_, i64>(8)?.max(0) as u64,
+                r.get::<_, i64>(9)?.max(0) as u64,
+                r.get::<_, i64>(10)?.max(0) as u64,
+                r.get::<_, i64>(11)?.max(0) as u64,
+                r.get::<_, i64>(12)?.max(0) as u64,
+            ))
+        })
+        .map_err(|e| format!("Query usage summary: {e}"))?;
+
+    for row in rows.flatten() {
+        let (ts, key_id, key_label, acc_id, acc_email, model, status, lat, inp, out, think, cache, tot) =
+            row;
+        let is_ok = (200..300).contains(&status);
+        total_requests += 1;
+        if is_ok {
+            success_requests += 1;
+        } else {
+            error_requests += 1;
+        }
+        latency_sum += lat;
+        in_sum += inp;
+        think_sum += think;
+        out_sum += out;
+        cache_sum += cache;
+        tok_sum += tot;
+
+        let bump = |map: &mut HashMap<String, (ApiUsageBreakdownRow, u64)>, k: String, lbl: String| {
+            let entry = map.entry(k.clone()).or_insert_with(|| {
+                (
+                    ApiUsageBreakdownRow {
+                        key: k,
+                        label: lbl,
+                        requests: 0,
+                        errors: 0,
+                        input_tokens: 0,
+                        thinking_tokens: 0,
+                        output_tokens: 0,
+                        cache_read_tokens: 0,
+                        total_tokens: 0,
+                        avg_latency_ms: 0,
+                    },
+                    0,
+                )
+            });
+            entry.0.requests += 1;
+            if !is_ok {
+                entry.0.errors += 1;
+            }
+            entry.0.input_tokens += inp;
+            entry.0.thinking_tokens += think;
+            entry.0.output_tokens += out;
+            entry.0.cache_read_tokens += cache;
+            entry.0.total_tokens += tot;
+            entry.1 += lat;
+            entry.0.avg_latency_ms = entry.1 / entry.0.requests.max(1);
+        };
+
+        bump(&mut by_model, model.clone(), model);
+        let acc_k = if acc_id.is_empty() { "none".into() } else { acc_id };
+        let acc_l = if acc_email.is_empty() { "No Account".into() } else { acc_email };
+        bump(&mut by_account, acc_k, acc_l);
+        bump(&mut by_key, key_id, key_label);
+
+        let bucket = chrono::DateTime::from_timestamp(ts, 0)
+            .map(|dt| {
+                if range_key == "today" {
+                    dt.format("%H:00").to_string()
+                } else {
+                    dt.format("%m-%d").to_string()
+                }
+            })
+            .unwrap_or_else(|| "unknown".into());
+        let pt = series.entry(bucket.clone()).or_insert(ApiUsageTimePoint {
+            bucket,
+            requests: 0,
+            errors: 0,
+            input_tokens: 0,
+            thinking_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            total_tokens: 0,
+        });
+        pt.requests += 1;
+        if !is_ok {
+            pt.errors += 1;
+        }
+        pt.input_tokens += inp;
+        pt.thinking_tokens += think;
+        pt.output_tokens += out;
+        pt.cache_read_tokens += cache;
+        pt.total_tokens += tot;
+    }
+
+    let finalize = |map: HashMap<String, (ApiUsageBreakdownRow, u64)>| -> Vec<ApiUsageBreakdownRow> {
+        let mut v: Vec<ApiUsageBreakdownRow> = map.into_values().map(|(r, _)| r).collect();
+        v.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens).then_with(|| b.requests.cmp(&a.requests)));
+        v
+    };
+
+    Ok(ApiServiceUsageSummary {
+        range: range_key,
+        total_requests,
+        success_requests,
+        error_requests,
+        success_rate: if total_requests > 0 {
+            (success_requests as f64 / total_requests as f64) * 100.0
+        } else {
+            100.0
+        },
+        avg_latency_ms: if total_requests > 0 {
+            latency_sum / total_requests
+        } else {
+            0
+        },
+        input_tokens: in_sum,
+        thinking_tokens: think_sum,
+        output_tokens: out_sum,
+        cache_read_tokens: cache_sum,
+        total_tokens: tok_sum,
+        by_model: finalize(by_model),
+        by_account: finalize(by_account),
+        by_key: finalize(by_key),
+        time_series: series.into_values().collect(),
+    })
+}
+
+// ============================================================================
+// Built-in Live Playground Test Chat (uses real Antigravity upstream + logs it)
+// ============================================================================
+
+pub async fn test_chat_completion(
+    model: String,
+    prompt: String,
+) -> Result<ApiTestChatResult, String> {
+    let cfg = load_config()?;
+    let keys = list_api_keys()?;
+    let key = keys
+        .into_iter()
+        .find(|k| k.enabled)
+        .ok_or_else(|| "Không có API key đang bật.".to_string())?;
+    let resolved_model = resolve_model_alias(&cfg, &model);
+    let body = json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": prompt }],
+        "max_tokens": 1024,
+        "stream": false
+    });
+
+    let started = Instant::now();
+    match send_upstream_with_failover(&cfg, &key, &resolved_model, &body, false).await {
+        Ok((resp, acc, req_preview)) => {
+            let raw_text = resp.text().await.unwrap_or_default();
+            let parsed = serde_json::from_str::<Value>(&raw_text)
+                .map(|v| parse_antigravity_response_payload(&v))
+                .unwrap_or_default();
+            let latency_ms = started.elapsed().as_millis() as u64;
+            let total_tokens = parsed.input_tokens
+                + parsed.output_tokens
+                + parsed.thinking_tokens
+                + parsed.cache_read_tokens;
+            record_api_log(&ApiRequestLogItem {
+                id: Uuid::new_v4().to_string(),
+                timestamp: Utc::now().timestamp(),
+                api_key_id: key.id,
+                api_key_label: format!("{} (Test)", key.label),
+                account_id: acc.id,
+                account_email: acc.email.clone(),
+                protocol: "playground".into(),
+                request_model: model,
+                resolved_model: resolved_model.clone(),
+                stream: false,
+                status_code: 200,
+                latency_ms,
+                input_tokens: parsed.input_tokens,
+                output_tokens: parsed.output_tokens,
+                thinking_tokens: parsed.thinking_tokens,
+                cache_read_tokens: parsed.cache_read_tokens,
+                total_tokens,
+                error_message: None,
+                request_preview: req_preview,
+                response_preview: parsed.text.chars().take(260).collect(),
+            });
+            Ok(ApiTestChatResult {
+                ok: true,
+                status_code: 200,
+                account_email: acc.email,
+                resolved_model,
+                latency_ms,
+                text: parsed.text,
+                thinking: parsed.thinking,
+                input_tokens: parsed.input_tokens,
+                output_tokens: parsed.output_tokens,
+                thinking_tokens: parsed.thinking_tokens,
+                error: None,
+            })
+        }
+        Err((status, err, acc_id, acc_email)) => {
+            let latency_ms = started.elapsed().as_millis() as u64;
+            record_api_log(&ApiRequestLogItem {
+                id: Uuid::new_v4().to_string(),
+                timestamp: Utc::now().timestamp(),
+                api_key_id: key.id,
+                api_key_label: format!("{} (Test)", key.label),
+                account_id: acc_id,
+                account_email: acc_email.clone(),
+                protocol: "playground".into(),
+                request_model: model,
+                resolved_model: resolved_model.clone(),
+                stream: false,
+                status_code: status,
+                latency_ms,
+                input_tokens: 0,
+                output_tokens: 0,
+                thinking_tokens: 0,
+                cache_read_tokens: 0,
+                total_tokens: 0,
+                error_message: Some(err.clone()),
+                request_preview: prompt.chars().take(240).collect(),
+                response_preview: String::new(),
+            });
+            Ok(ApiTestChatResult {
+                ok: false,
+                status_code: status,
+                account_email: acc_email,
+                resolved_model,
+                latency_ms,
+                text: String::new(),
+                thinking: String::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                thinking_tokens: 0,
+                error: Some(err),
+            })
+        }
+    }
+}
+
+pub fn spawn_auto_start_if_enabled() {
+    if let Ok(cfg) = load_config() {
+        if cfg.auto_start {
+            tauri::async_runtime::spawn(async {
+                let _ = start_server().await;
+            });
+        }
+    }
+}

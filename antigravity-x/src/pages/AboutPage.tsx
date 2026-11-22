@@ -5,12 +5,9 @@ import {
   Download,
   ExternalLink,
   Globe,
-  Info,
   Loader2,
   MessageSquare,
-  RefreshCw,
   Rocket,
-  ShieldCheck,
 } from "lucide-react";
 import type {
   AppLanguage,
@@ -39,7 +36,6 @@ export function AboutPage({
   lang,
   overview,
   appVersion,
-  onRefresh,
   onOpenUpdateModal,
 }: AboutPageProps) {
   const vi = lang === "vi";
@@ -95,27 +91,7 @@ export function AboutPage({
     <section className="agx-page">
       <header className="agx-page-header">
         <div className="agx-page-heading">
-          <p className="agx-eyebrow">
-            <Info size={13} />
-            ABOUT ONLYDEVS
-          </p>
-          <h2>About OnlyDEVS</h2>
-          <span>
-            {vi
-              ? "Bộ công cụ điều khiển trung tâm cho Antigravity IDE & CLI — phát triển bởi KhoaHihi · OnlyDEVS."
-              : "Luxury Desktop Control Center for Antigravity IDE & CLI — built by KhoaHihi · OnlyDEVS."}
-          </span>
-        </div>
-
-        <div className="agx-header-actions">
-          <button
-            type="button"
-            className="agx-btn agx-btn--secondary"
-            onClick={() => void onRefresh()}
-          >
-            <RefreshCw size={15} />
-            <span>{vi ? "Làm mới thông tin" : "Refresh diagnostics"}</span>
-          </button>
+          <h2>OnlyDEVS</h2>
         </div>
       </header>
 
@@ -127,15 +103,7 @@ export function AboutPage({
             <div className="agx-about-hero-title-row">
               <h3>OnlyDEVS — Antigravity</h3>
               <span className="agx-badge agx-badge--brand">v{appVersion}</span>
-              <span className="agx-badge agx-badge--success">
-                <ShieldCheck size={12} /> OnlyDEVS-Antigravity.exe
-              </span>
             </div>
-            <p>
-              {vi
-                ? "Quản lý trọn vẹn Plugin (antigravity-filter-bypass), Prompt Injection (~/.gemini/config/AGENTS.md), đồng bộ Session (IDE ↔ CLI) và hệ sinh thái MCP / Agent Skills."
-                : "Complete control over Lifecycle Plugins (antigravity-filter-bypass), Prompt Injection (~/.gemini/config/AGENTS.md), Session Sync (IDE ↔ CLI), and MCP / Agent Skills."}
-            </p>
           </div>
         </div>
 
@@ -198,13 +166,10 @@ export function AboutPage({
         </div>
       </article>
 
-      {/* GitHub Auto-Update Card (Cockpit Tools Style) */}
+      {/* GitHub Auto-Update Card */}
       <article className="agx-panel-card">
         <div className="agx-panel-head">
-          <div>
-            <span className="agx-section-tag">GITHUB RELEASES · AUTO UPDATE</span>
-            <h3>{vi ? "Cập nhật phần mềm tự động" : "Automatic Software Updates"}</h3>
-          </div>
+          <h3>{vi ? "Cập nhật tự động" : "Auto Update"}</h3>
           {updateResult?.hasUpdate ? (
             <span className="agx-badge agx-badge--brand">
               v{updateResult.latestVersion} {vi ? "khả dụng" : "available"}
@@ -313,35 +278,22 @@ export function AboutPage({
         </div>
       </article>
 
-      {/* Codex-X Style Structured Info Card */}
+      {/* System Info Card */}
       <article className="agx-panel-card">
         <div className="agx-panel-head">
-          <div>
-            <span className="agx-section-tag">SYSTEM & ENVIRONMENT</span>
-            <h3>{vi ? "Thông số hệ thống & đường dẫn" : "Application & Runtime Details"}</h3>
-          </div>
-          <span className="agx-badge agx-badge--success">Up to date</span>
+          <h3>{vi ? "Hệ thống & Đường dẫn" : "System & Paths"}</h3>
         </div>
 
         <div className="agx-about-kv-list">
-          <KvRow label="Application" value={`OnlyDEVS (OnlyDEVS-Antigravity.exe) v${appVersion}`} />
-          <KvRow
-            label="Antigravity CLI Version"
-            value={overview?.cliVersion ? `v${overview.cliVersion}` : "Detected (.gemini)"}
-          />
-          <KvRow label="My Website" value={WEBSITE_URL} mono />
-          <KvRow label="My Server" value={DISCORD_URL} mono />
+          <KvRow label="Application" value={`OnlyDEVS v${appVersion}`} />
+          <KvRow label="Website" value={WEBSITE_URL} mono />
+          <KvRow label="Discord" value={DISCORD_URL} mono />
           <KvRow label="GEMINI_HOME" value={overview?.geminiHome ?? "~/.gemini"} mono />
           <KvRow label="AGENTS.md" value={overview?.agentsPath ?? "~/.gemini/config/AGENTS.md"} mono />
           <KvRow label="config.json" value={overview?.configPath ?? "~/.gemini/config/config.json"} mono />
           <KvRow
             label="mcp_config.json"
             value={overview?.mcpConfigPath ?? "~/.gemini/config/mcp_config.json"}
-            mono
-          />
-          <KvRow
-            label="Python Runtime"
-            value={overview?.pythonPath ?? "Auto-detected"}
             mono
           />
         </div>

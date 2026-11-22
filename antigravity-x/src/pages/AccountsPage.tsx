@@ -7,13 +7,13 @@ import {
   Check,
   Clock,
   Copy,
-  Database,
   Download,
   ExternalLink,
   Eye,
   EyeOff,
   FileJson,
   FileText,
+  FolderOpen,
   FolderPlus,
   GripVertical,
   History,
@@ -22,13 +22,17 @@ import {
   LayoutGrid,
   List,
   Loader2,
+  Monitor,
   Play,
   Plus,
+  Radio,
   RefreshCw,
   Rows3,
   Save,
   Search,
+  Sparkles,
   Tag,
+  Terminal,
   Trash2,
   Upload,
   UserCheck,
@@ -39,8 +43,10 @@ import type {
   AccountGroup,
   AgUsageRangePreset,
   AntigravityAccount,
+  ApiServiceStatus,
   AppLanguage,
   DashboardBundleResponse,
+  LaunchTargetInfo,
   OAuthPrepareResult,
   RefreshStats,
   SwitchHistoryItem,
@@ -71,7 +77,8 @@ type AccountsPageProps = {
   tokenUsage: TokenUsageSummary | null;
   switchHistory: SwitchHistoryItem[];
   loading: boolean;
-  runtimeLabel?: string;
+  apiServiceStatus: ApiServiceStatus | null;
+  onToggleApiPool: (accountId: string) => Promise<void>;
   onRefreshAllData: () => Promise<void>;
   onImportLocalAccount: () => Promise<void>;
   onAddByToken: (refreshToken: string, emailHint?: string) => Promise<void>;
@@ -84,7 +91,10 @@ type AccountsPageProps = {
   onRefreshAllQuotas: () => Promise<RefreshStats>;
   onSwitchAccount: (
     accountId: string,
-    switchTarget: "all" | "ide" | "cli",
+    switchTarget: string,
+    launch: boolean,
+    customPath?: string | null,
+    workingDir?: string | null,
   ) => Promise<void>;
   onUpdateMetadata: (payload: {
     accountId: string;
@@ -160,7 +170,8 @@ export function AccountsPage({
   accounts,
   switchHistory,
   loading,
-  runtimeLabel,
+  apiServiceStatus,
+  onToggleApiPool,
   onRefreshAllData,
   onImportLocalAccount,
   onAddByToken,
@@ -179,10 +190,10 @@ export function AccountsPage({
   const vi = lang === "vi";
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Cockpit 2-tab navigation ("Tổng quan tài khoản" | "Mức dùng phiên")
+  // 2-tab navigation ("Tổng quan tài khoản" | "Mức dùng phiên")
   const [subTab, setSubTab] = useState<AccountSubTab>("overview");
 
-  // Local Token Usage Summary Strip (powered by real Cockpit antigravity_token_usage backend!)
+  // Local Token Usage Summary Strip
   const [usageRange, setUsageRange] = useState<AgUsageRangePreset>("30d");
   const [usageBundle, setUsageBundle] =
     useState<DashboardBundleResponse | null>(null);
@@ -197,7 +208,6 @@ export function AccountsPage({
   const [sortBy, setSortBy] = useState<SortField>("overall");
   const [sortDir, setSortDir] = useState<"desc" | "asc">("desc");
   const [privacyMode, setPrivacyMode] = useState(false);
-  const [switchTarget, setSwitchTarget] = useState<"all" | "ide" | "cli">("all");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
   // Account groups & custom sort order
@@ -215,7 +225,7 @@ export function AccountsPage({
   // Modals
   const [addModalOpen, setAddModalOpen] = useState(false);
   const [addTab, setAddTab] = useState<
-    "oauth" | "local" | "cockpit" | "token" | "batch" | "json"
+    "oauth" | "local" | "token" | "batch" | "json"
   >("oauth");
   const [oauthPrep, setOauthPrep] = useState<OAuthPrepareResult | null>(null);
   const [oauthCallbackUrl, setOauthCallbackUrl] = useState("");
@@ -223,6 +233,76 @@ export function AccountsPage({
   const [tokenEmailHint, setTokenEmailHint] = useState("");
   const [batchInput, setBatchInput] = useState("");
   const [jsonInput, setJsonInput] = useState("");
+
+  // Launch / Switch Account Modal (opens ONLY when Play is clicked)
+  const [launchAccount, setLaunchAccount] = useState<AntigravityAccount | null>(null);
+  const [launchTargets, setLaunchTargets] = useState<LaunchTargetInfo[]>([]);
+  const [selectedLaunchTarget, setSelectedLaunchTarget] = useState<string>(() => {
+    try {
+      return window.localStorage.getItem("onlydevs.launchTarget") || "antigravity_ide";
+    } catch {
+      return "antigravity_ide";
+    }
+  });
+  const [launchCustomPath, setLaunchCustomPath] = useState("");
+  const [launchWorkingDir, setLaunchWorkingDir] = useState("");
+  const [launchError, setLaunchError] = useState<string | null>(null);
+
+  const isAccountInApiPool = useCallback(
+    (accountId: string): boolean => {
+      const cfg = apiServiceStatus?.config;
+      if (!cfg) return false;
+      if (cfg.memberAccountIds.length === 0 && cfg.useAllAccountsWhenEmpty) {
+        return true;
+      }
+      return cfg.memberAccountIds.includes(accountId);
+    },
+    [apiServiceStatus],
+  );
+
+  const openLaunchPopup = async (acc: AntigravityAccount) => {
+    setLaunchAccount(acc);
+    setLaunchError(null);
+    setLaunchCustomPath("");
+    try {
+      const targets = await agxInvoke<LaunchTargetInfo[]>("detect_launch_targets");
+      setLaunchTargets(targets ?? []);
+      if (targets && targets.length > 0) {
+        const currentValid = targets.find((t) => t.id === selectedLaunchTarget && t.available);
+        if (!currentValid) {
+          const firstAvail = targets.find((t) => t.available) ?? targets[0];
+          setSelectedLaunchTarget(firstAvail.id);
+        }
+      }
+    } catch {
+      setLaunchTargets([]);
+    }
+  };
+
+  const executeLaunchOrSwitch = async (launch: boolean) => {
+    if (!launchAccount) return;
+    setBusyKey(launch ? `launch-${launchAccount.id}` : `switch-${launchAccount.id}`);
+    setLaunchError(null);
+    try {
+      try {
+        window.localStorage.setItem("onlydevs.launchTarget", selectedLaunchTarget);
+      } catch {
+        // ignore
+      }
+      await onSwitchAccount(
+        launchAccount.id,
+        selectedLaunchTarget,
+        launch,
+        launchCustomPath.trim() || null,
+        selectedLaunchTarget === "cli" ? launchWorkingDir.trim() || null : null,
+      );
+      setLaunchAccount(null);
+    } catch (e) {
+      setLaunchError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyKey(null);
+    }
+  };
 
   // Account Info / Full Model Quota modal
   const [infoAccount, setInfoAccount] = useState<AntigravityAccount | null>(
@@ -603,17 +683,20 @@ export function AccountsPage({
     URL.revokeObjectURL(url);
   };
 
-  const handleImportCockpit = async () => {
-    setBusyKey("import-cockpit");
+  const handleImportDirectory = async () => {
+    setBusyKey("import-dir");
     try {
+      const picked = await agxInvoke<string | null>("pick_folder_dialog");
+      if (!picked) return;
       const imported = await agxInvoke<AntigravityAccount[]>(
-        "import_accounts_from_cockpit",
+        "import_accounts_from_directory",
+        { dirPath: picked },
       );
       flashMsg(
         "ok",
         vi
-          ? `Đã nhập ${imported.length} tài khoản từ Cockpit Tools`
-          : `Imported ${imported.length} accounts from Cockpit Tools`,
+          ? `Đã nhập ${imported.length} tài khoản từ thư mục`
+          : `Imported ${imported.length} accounts from folder`,
       );
       setAddModalOpen(false);
       await onRefreshAllData();
@@ -784,9 +867,12 @@ export function AccountsPage({
     const needsReauth = isAccountNeedsReauth(acc);
     const isForbidden = Boolean(acc.quota?.isForbidden);
     const isSelected = selectedIds.has(acc.id);
+    const inApiPool = isAccountInApiPool(acc.id);
     const isBusyCard =
       busyKey === `switch-${acc.id}` ||
+      busyKey === `launch-${acc.id}` ||
       busyKey === `quota-${acc.id}` ||
+      busyKey === `api-${acc.id}` ||
       busyKey === `del-${acc.id}`;
 
     if (viewMode === "compact") {
@@ -822,23 +908,41 @@ export function AccountsPage({
           <div className="ag-acc-card-actions">
             <button
               type="button"
-              className="ag-card-icon-btn"
-              title={vi ? "Chuyển tài khoản" : "Switch Account"}
+              className={`od-api-chip${inApiPool ? " is-in-pool" : ""}`}
+              title={
+                inApiPool
+                  ? vi
+                    ? "Gỡ khỏi API Pool"
+                    : "Remove from API Pool"
+                  : vi
+                    ? "Thêm vào API Pool"
+                    : "Add to API Pool"
+              }
               disabled={isBusyCard}
               onClick={async () => {
-                setBusyKey(`switch-${acc.id}`);
+                setBusyKey(`api-${acc.id}`);
                 try {
-                  await onSwitchAccount(acc.id, switchTarget);
+                  await onToggleApiPool(acc.id);
                 } finally {
                   setBusyKey(null);
                 }
               }}
             >
-              {busyKey === `switch-${acc.id}` ? (
-                <Loader2 size={14} className="spin" />
+              {busyKey === `api-${acc.id}` ? (
+                <Loader2 size={12} className="spin" />
               ) : (
-                <Play size={14} />
+                <Radio size={12} />
               )}
+              <span>{inApiPool ? "API ✓" : "+ API"}</span>
+            </button>
+            <button
+              type="button"
+              className="ag-card-icon-btn"
+              title={vi ? "Chuyển / Chạy tài khoản" : "Switch / Launch Account"}
+              disabled={isBusyCard}
+              onClick={() => void openLaunchPopup(acc)}
+            >
+              <Play size={14} />
             </button>
             <button
               type="button"
@@ -858,14 +962,6 @@ export function AccountsPage({
                 size={14}
                 className={busyKey === `quota-${acc.id}` ? "spin" : undefined}
               />
-            </button>
-            <button
-              type="button"
-              className="ag-card-icon-btn"
-              title={vi ? "Ghi chú & 2FA Vault" : "Notes & 2FA Vault"}
-              onClick={() => handleOpenVault(acc)}
-            >
-              <FileText size={14} />
             </button>
             <button
               type="button"
@@ -965,7 +1061,7 @@ export function AccountsPage({
           ) : null}
         </div>
 
-        {/* Exact Cockpit Quota Buckets Grid */}
+        {/* Quota Buckets Grid */}
         <AntigravityQuotaSection
           account={acc}
           lang={lang}
@@ -982,115 +1078,121 @@ export function AccountsPage({
           </span>
         </div>
 
-        {/* Exact 7-icon Cockpit Footer Action Row */}
+        {/* Footer Action Row: API Pool Toggle + Core Controls */}
         <div className="ag-acc-card__footer">
           <button
             type="button"
-            className="ag-card-icon-btn"
-            title={vi ? "Chi tiết tài khoản & toàn bộ mô hình" : "Account & Model Quota Details"}
-            onClick={() => setInfoAccount(acc)}
-          >
-            <Info size={14} />
-          </button>
-          <button
-            type="button"
-            className="ag-card-icon-btn"
-            title={vi ? "Chỉnh sửa thẻ (Tags)" : "Edit Tags"}
-            onClick={() => {
-              setTagAccount(acc);
-              setTagDraftInput(acc.tags.join(", "));
-            }}
-          >
-            <Tag size={14} />
-          </button>
-          <button
-            type="button"
-            className="ag-card-icon-btn"
-            title={vi ? "Ghi chú, Mật khẩu & 2FA Vault" : "Notes, Password & 2FA Vault"}
-            onClick={() => handleOpenVault(acc)}
-          >
-            <FileText size={14} />
-          </button>
-          <button
-            type="button"
-            className={`ag-card-icon-btn${acc.isCurrent ? " is-active-play" : ""}`}
+            className={`od-api-chip${inApiPool ? " is-in-pool" : ""}`}
             title={
-              vi
-                ? `Chuyển sang tài khoản này (${switchTarget.toUpperCase()})`
-                : `Switch to this account (${switchTarget.toUpperCase()})`
+              inApiPool
+                ? vi
+                  ? "Đang trong API Pool (bấm để gỡ)"
+                  : "In API Pool (click to remove)"
+                : vi
+                  ? "Thêm tài khoản này vào API Pool"
+                  : "Add account to API Pool"
             }
             disabled={isBusyCard}
             onClick={async () => {
-              setBusyKey(`switch-${acc.id}`);
+              setBusyKey(`api-${acc.id}`);
               try {
-                await onSwitchAccount(acc.id, switchTarget);
+                await onToggleApiPool(acc.id);
               } finally {
                 setBusyKey(null);
               }
             }}
           >
-            {busyKey === `switch-${acc.id}` ? (
-              <Loader2 size={14} className="spin" />
+            {busyKey === `api-${acc.id}` ? (
+              <Loader2 size={12} className="spin" />
             ) : (
-              <Play size={14} />
+              <Radio size={12} />
             )}
+            <span>{inApiPool ? (vi ? "API ✓" : "API ✓") : "+ API"}</span>
           </button>
-          <button
-            type="button"
-            className="ag-card-icon-btn"
-            title={vi ? "Làm mới Quota" : "Refresh Quota"}
-            disabled={isBusyCard}
-            onClick={async () => {
-              setBusyKey(`quota-${acc.id}`);
-              try {
-                await onFetchQuota(acc.id);
-              } finally {
-                setBusyKey(null);
-              }
-            }}
-          >
-            <RefreshCw
-              size={14}
-              className={busyKey === `quota-${acc.id}` ? "spin" : undefined}
-            />
-          </button>
-          <button
-            type="button"
-            className="ag-card-icon-btn"
-            title={vi ? "Xuất JSON tài khoản này" : "Export this account JSON"}
-            onClick={() => void handleOpenExport([acc.id], true)}
-          >
-            <Upload size={14} />
-          </button>
-          <button
-            type="button"
-            className="ag-card-icon-btn is-danger"
-            title={vi ? "Xóa tài khoản" : "Delete Account"}
-            disabled={isBusyCard}
-            onClick={async () => {
-              if (
-                !window.confirm(
-                  vi ? `Xóa tài khoản ${acc.email}?` : `Delete ${acc.email}?`,
+
+          <div className="od-card-actions-right">
+            <button
+              type="button"
+              className="ag-card-icon-btn"
+              title={vi ? "Chi tiết Quota" : "Quota Details"}
+              onClick={() => setInfoAccount(acc)}
+            >
+              <Info size={14} />
+            </button>
+            <button
+              type="button"
+              className="ag-card-icon-btn"
+              title={vi ? "Ghi chú & 2FA" : "Notes & 2FA"}
+              onClick={() => handleOpenVault(acc)}
+            >
+              <FileText size={14} />
+            </button>
+            <button
+              type="button"
+              className={`ag-card-icon-btn${acc.isCurrent ? " is-active-play" : ""}`}
+              title={vi ? "Chuyển / Mở tài khoản" : "Switch / Launch Account"}
+              disabled={isBusyCard}
+              onClick={() => void openLaunchPopup(acc)}
+            >
+              <Play size={14} />
+            </button>
+            <button
+              type="button"
+              className="ag-card-icon-btn"
+              title={vi ? "Làm mới Quota" : "Refresh Quota"}
+              disabled={isBusyCard}
+              onClick={async () => {
+                setBusyKey(`quota-${acc.id}`);
+                try {
+                  await onFetchQuota(acc.id);
+                } finally {
+                  setBusyKey(null);
+                }
+              }}
+            >
+              <RefreshCw
+                size={14}
+                className={busyKey === `quota-${acc.id}` ? "spin" : undefined}
+              />
+            </button>
+            <button
+              type="button"
+              className="ag-card-icon-btn"
+              title={vi ? "Xuất JSON" : "Export JSON"}
+              onClick={() => void handleOpenExport([acc.id], true)}
+            >
+              <Upload size={14} />
+            </button>
+            <button
+              type="button"
+              className="ag-card-icon-btn is-danger"
+              title={vi ? "Xóa tài khoản" : "Delete"}
+              disabled={isBusyCard}
+              onClick={async () => {
+                if (
+                  !window.confirm(
+                    vi ? `Xóa tài khoản ${acc.email}?` : `Delete ${acc.email}?`,
+                  )
                 )
-              )
-                return;
-              setBusyKey(`del-${acc.id}`);
-              try {
-                await onDeleteAccounts([acc.id]);
-              } finally {
-                setBusyKey(null);
-              }
-            }}
-          >
-            <Trash2 size={14} />
-          </button>
+                  return;
+                setBusyKey(`del-${acc.id}`);
+                try {
+                  await onDeleteAccounts([acc.id]);
+                } finally {
+                  setBusyKey(null);
+                }
+              }}
+            >
+              <Trash2 size={14} />
+            </button>
+          </div>
         </div>
       </article>
     );
   };
 
   return (
-    <div className="agx-page ag-cockpit-page">
+    <div className="agx-page od-page">
       {/* Hidden JSON file import input */}
       <input
         ref={fileInputRef}
@@ -1108,18 +1210,18 @@ export function AccountsPage({
         }}
       />
 
-      {/* Cockpit Top Sub-Tab Header */}
-      <header className="ag-cockpit-header">
-        <div className="ag-cockpit-header__left">
+      {/* Clean Header */}
+      <header className="od-header">
+        <div className="od-header__left">
           <h1>{tr(lang, "acc.title")}</h1>
         </div>
 
-        <nav className="ag-cockpit-subtabs" role="tablist">
+        <nav className="od-subtabs" role="tablist">
           <button
             type="button"
             role="tab"
             aria-selected={subTab === "overview"}
-            className={`ag-cockpit-subtab${subTab === "overview" ? " is-active" : ""}`}
+            className={`od-subtab${subTab === "overview" ? " is-active" : ""}`}
             onClick={() => setSubTab("overview")}
           >
             <Users size={15} />
@@ -1129,7 +1231,7 @@ export function AccountsPage({
             type="button"
             role="tab"
             aria-selected={subTab === "usage"}
-            className={`ag-cockpit-subtab${subTab === "usage" ? " is-active" : ""}`}
+            className={`od-subtab${subTab === "usage" ? " is-active" : ""}`}
             onClick={() => setSubTab("usage")}
           >
             <BarChart3 size={15} />
@@ -1137,16 +1239,23 @@ export function AccountsPage({
           </button>
         </nav>
 
-        <div className="ag-cockpit-header__right">
-          <span className="ag-runtime-badge">
-            <span className="ag-runtime-dot" />
-            {runtimeLabel || "Antigravity IDE"}
-          </span>
+        <div className="od-header__right">
+          <button
+            type="button"
+            className="agx-btn agx-btn--primary agx-btn--sm"
+            onClick={() => {
+              setAddTab("oauth");
+              setAddModalOpen(true);
+            }}
+          >
+            <Plus size={15} />
+            <span>{tr(lang, "acc.addAccount")}</span>
+          </button>
         </div>
       </header>
 
       {localMsg ? (
-        <div className={`ag-cockpit-banner is-${localMsg.tone}`}>
+        <div className={`od-banner is-${localMsg.tone}`}>
           <span>{localMsg.text}</span>
           <button
             type="button"
@@ -1273,16 +1382,16 @@ export function AccountsPage({
             </div>
           </section>
 
-          {/* 2. Cockpit Main Toolbar */}
-          <section className="ag-cockpit-toolbar">
-            <div className="ag-cockpit-toolbar__left">
-              <div className="ag-cockpit-search">
+          {/* 2. Main Toolbar */}
+          <section className="od-toolbar">
+            <div className="od-toolbar__left">
+              <div className="od-search">
                 <Search size={15} />
                 <input
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder={vi ? "Tìm kiếm tài khoản..." : "Search accounts..."}
+                  placeholder={vi ? "Tìm kiếm..." : "Search..."}
                 />
                 {searchQuery ? (
                   <button
@@ -1428,32 +1537,7 @@ export function AccountsPage({
               )}
             </div>
 
-            <div className="ag-cockpit-toolbar__right">
-              <select
-                className="agx-select ag-toolbar-select ag-target-select"
-                value={switchTarget}
-                onChange={(e) =>
-                  setSwitchTarget(e.target.value as "all" | "ide" | "cli")
-                }
-                title={vi ? "Phạm vi khi chuyển tài khoản" : "Switch target scope"}
-              >
-                <option value="all">IDE + CLI</option>
-                <option value="ide">{vi ? "Chỉ IDE" : "IDE Only"}</option>
-                <option value="cli">{vi ? "Chỉ CLI" : "CLI Only"}</option>
-              </select>
-
-              <button
-                type="button"
-                className="ag-toolbar-icon-btn is-primary"
-                title={vi ? "Thêm / Nhập tài khoản" : "Add / Import Account"}
-                onClick={() => {
-                  setAddTab("oauth");
-                  setAddModalOpen(true);
-                }}
-              >
-                <Plus size={16} />
-              </button>
-
+            <div className="od-toolbar__right">
               <button
                 type="button"
                 className="ag-toolbar-icon-btn"
@@ -1481,54 +1565,15 @@ export function AccountsPage({
                 title={
                   privacyMode
                     ? vi
-                      ? "Đang ẩn Email (bấm để hiện)"
-                      : "Privacy mode ON"
+                      ? "Đang ẩn Email"
+                      : "Privacy ON"
                     : vi
-                      ? "Chế độ riêng tư (ẩn Email)"
-                      : "Privacy mode"
+                      ? "Ẩn Email"
+                      : "Hide Emails"
                 }
                 onClick={() => setPrivacyMode((p) => !p)}
               >
                 {privacyMode ? <EyeOff size={15} /> : <Eye size={15} />}
-              </button>
-
-              <button
-                type="button"
-                className="ag-toolbar-icon-btn"
-                title={vi ? "Xuất JSON tài khoản" : "Export Accounts JSON"}
-                onClick={() =>
-                  void handleOpenExport(
-                    Array.from(selectedIds),
-                    exportIncludeSensitive,
-                  )
-                }
-              >
-                <Upload size={15} />
-              </button>
-
-              <button
-                type="button"
-                className="ag-toolbar-icon-btn"
-                title={
-                  vi
-                    ? "Đồng bộ tài khoản đang đăng nhập trên Antigravity IDE / CLI"
-                    : "Import currently logged-in local Antigravity client"
-                }
-                disabled={busyKey === "import-local"}
-                onClick={async () => {
-                  setBusyKey("import-local");
-                  try {
-                    await onImportLocalAccount();
-                  } finally {
-                    setBusyKey(null);
-                  }
-                }}
-              >
-                {busyKey === "import-local" ? (
-                  <Loader2 size={15} className="spin" />
-                ) : (
-                  <UserCheck size={15} />
-                )}
               </button>
 
               <button
@@ -1542,7 +1587,7 @@ export function AccountsPage({
             </div>
           </section>
 
-          {/* 3. Selection Bar & Account Group Tabs (exact Cockpit strip) */}
+          {/* 3. Selection Bar & Account Group Tabs */}
           <section className="ag-selection-group-bar">
             <div className="ag-selection-left">
               <label className="ag-select-all-label">
@@ -1661,17 +1706,12 @@ export function AccountsPage({
               <h3>
                 {accounts.length === 0
                   ? vi
-                    ? "Chưa có tài khoản Antigravity nào"
-                    : "No Antigravity accounts yet"
+                    ? "Chưa có tài khoản"
+                    : "No accounts"
                   : vi
-                    ? "Không có tài khoản khớp bộ lọc"
-                    : "No accounts match current filters"}
+                    ? "Không tìm thấy tài khoản"
+                    : "No matches"}
               </h3>
-              <p>
-                {vi
-                  ? "Đăng nhập Google OAuth, đồng bộ tài khoản đang mở trên máy, nhập từ Cockpit Tools hoặc dán Refresh Token / JSON."
-                  : "Sign in via Google OAuth, import local Antigravity client, import from Cockpit Tools, or paste Refresh Token / JSON."}
-              </p>
               <div className="ag-acc-empty-actions">
                 <button
                   type="button"
@@ -1698,16 +1738,7 @@ export function AccountsPage({
                   }}
                 >
                   <UserCheck size={15} />
-                  <span>{vi ? "Đồng bộ TK trên máy" : "Import Local Client"}</span>
-                </button>
-                <button
-                  type="button"
-                  className="agx-btn agx-btn--secondary"
-                  disabled={busyKey === "import-cockpit"}
-                  onClick={() => void handleImportCockpit()}
-                >
-                  <Database size={15} />
-                  <span>{vi ? "Nhập từ Cockpit Tools" : "Import from Cockpit"}</span>
+                  <span>{vi ? "Đồng bộ máy" : "Sync Local"}</span>
                 </button>
               </div>
             </div>
@@ -1754,18 +1785,18 @@ export function AccountsPage({
           MODALS
          ============================================================ */}
 
-      {/* Add / Import Account Modal */}
+      {/* Add / Import Account Modal — Redesigned Clean Card UI */}
       {addModalOpen ? (
         <div
           className="agx-modal-backdrop"
           onClick={() => setAddModalOpen(false)}
         >
           <div
-            className="agx-modal agx-modal--wide"
+            className="agx-modal od-add-modal"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="agx-modal-head">
-              <h3>{vi ? "Thêm / Nhập tài khoản Antigravity" : "Add / Import Antigravity Account"}</h3>
+              <h3>{vi ? "Thêm tài khoản" : "Add Account"}</h3>
               <button
                 type="button"
                 className="agx-icon-btn"
@@ -1775,54 +1806,49 @@ export function AccountsPage({
               </button>
             </div>
 
-            <div className="ag-add-tabs">
+            <div className="od-add-tabs">
               {(
                 [
-                  ["oauth", "Google OAuth"],
-                  ["local", vi ? "TK trên máy" : "Local Client"],
-                  ["cockpit", "Cockpit Tools"],
-                  ["token", "Refresh Token"],
-                  ["batch", vi ? "Nhập hàng loạt" : "Batch Lines"],
-                  ["json", "JSON"],
+                  ["oauth", "OAuth", ExternalLink],
+                  ["local", vi ? "Trên máy" : "Local", UserCheck],
+                  ["token", "Token", KeyRound],
+                  ["batch", vi ? "Hàng loạt" : "Batch", List],
+                  ["json", "JSON", FileJson],
                 ] as const
-              ).map(([key, label]) => (
+              ).map(([key, label, IconComp]) => (
                 <button
                   key={key}
                   type="button"
-                  className={addTab === key ? "is-active" : ""}
+                  className={`od-add-tab${addTab === key ? " is-active" : ""}`}
                   onClick={() => setAddTab(key)}
                 >
-                  {label}
+                  <IconComp size={14} />
+                  <span>{label}</span>
                 </button>
               ))}
             </div>
 
             <div className="agx-modal-body">
               {addTab === "oauth" ? (
-                <div className="ag-modal-stack">
-                  <p className="agx-muted">
-                    {vi
-                      ? "Đăng nhập bằng tài khoản Google Antigravity qua OAuth 2.0 loopback chính thức (giống hệt Cockpit Tools)."
-                      : "Sign in with Google Antigravity via official OAuth 2.0 loopback listener."}
-                  </p>
+                <div className="od-add-pane">
                   <button
                     type="button"
-                    className="agx-btn agx-btn--primary"
+                    className="agx-btn agx-btn--primary od-add-hero-btn"
                     disabled={busyKey === "oauth-prep"}
                     onClick={() => void handleStartOAuth()}
                   >
                     {busyKey === "oauth-prep" ? (
-                      <Loader2 size={15} className="spin" />
+                      <Loader2 size={16} className="spin" />
                     ) : (
-                      <ExternalLink size={15} />
+                      <ExternalLink size={16} />
                     )}
                     <span>
-                      {vi ? "Mở trình duyệt đăng nhập Google" : "Open Google Sign-In"}
+                      {vi ? "Đăng nhập Google OAuth" : "Sign in with Google"}
                     </span>
                   </button>
 
                   {oauthPrep ? (
-                    <div className="ag-oauth-box">
+                    <div className="od-oauth-box">
                       <div className="ag-oauth-url-row">
                         <code>{oauthPrep.authUrl}</code>
                         <button
@@ -1833,45 +1859,35 @@ export function AccountsPage({
                           {copiedId === "oauth-url" ? <Check size={13} /> : <Copy size={13} />}
                         </button>
                       </div>
-                      <label className="agx-field">
-                        <span>
-                          {vi
-                            ? "Dán URL callback (nếu trình duyệt không tự redirect về localhost):"
-                            : "Paste callback URL (if browser didn't auto-redirect):"}
-                        </span>
+                      <div className="od-inline-submit">
                         <input
                           type="text"
                           className="agx-input"
                           value={oauthCallbackUrl}
                           onChange={(e) => setOauthCallbackUrl(e.target.value)}
-                          placeholder="http://localhost:.../oauth-callback?code=...&state=..."
+                          placeholder="http://localhost:.../oauth-callback?code=..."
                         />
-                      </label>
-                      <button
-                        type="button"
-                        className="agx-btn agx-btn--primary"
-                        disabled={
-                          !oauthCallbackUrl.trim() || busyKey === "oauth-submit"
-                        }
-                        onClick={() => void handleSubmitCallback()}
-                      >
-                        {vi ? "Xác nhận Callback URL" : "Submit Callback URL"}
-                      </button>
+                        <button
+                          type="button"
+                          className="agx-btn agx-btn--primary"
+                          disabled={
+                            !oauthCallbackUrl.trim() || busyKey === "oauth-submit"
+                          }
+                          onClick={() => void handleSubmitCallback()}
+                        >
+                          {vi ? "Xác nhận" : "Confirm"}
+                        </button>
+                      </div>
                     </div>
                   ) : null}
                 </div>
               ) : null}
 
               {addTab === "local" ? (
-                <div className="ag-modal-stack">
-                  <p className="agx-muted">
-                    {vi
-                      ? "Tự động đọc token đang đăng nhập từ Windows Credential Manager (gemini:antigravity), ~/.gemini/jetski-standalone-oauth-token, ~/.gemini/antigravity-cli và state.vscdb."
-                      : "Reads currently signed-in token from Windows Credential Manager, ~/.gemini fallback, CLI session, and Antigravity state.vscdb."}
-                  </p>
+                <div className="od-add-pane">
                   <button
                     type="button"
-                    className="agx-btn agx-btn--primary"
+                    className="agx-btn agx-btn--primary od-add-hero-btn"
                     disabled={busyKey === "import-local"}
                     onClick={async () => {
                       setBusyKey("import-local");
@@ -1883,49 +1899,22 @@ export function AccountsPage({
                       }
                     }}
                   >
-                    <UserCheck size={15} />
+                    {busyKey === "import-local" ? (
+                      <Loader2 size={16} className="spin" />
+                    ) : (
+                      <UserCheck size={16} />
+                    )}
                     <span>
-                      {vi ? "Đọc & đồng bộ tài khoản đang dùng" : "Import Local Account"}
+                      {vi ? "Đồng bộ tài khoản đang đăng nhập" : "Sync Current Account"}
                     </span>
                   </button>
                 </div>
               ) : null}
 
-              {addTab === "cockpit" ? (
-                <div className="ag-modal-stack">
-                  <p className="agx-muted">
-                    {vi
-                      ? "Tự động quét thư mục dữ liệu Cockpit Tools trên máy để nhập danh sách tài khoản Antigravity. Nếu Cockpit Tools đang bật mã hóa lưu trữ, hãy bấm 'Xuất JSON' trong Cockpit Tools rồi nhập ở tab JSON."
-                      : "Scans local Cockpit Tools account folders. If Cockpit Tools encrypted account storage, export JSON from Cockpit Tools and import via the JSON tab."}
-                  </p>
-                  <div className="ag-modal-btn-row">
-                    <button
-                      type="button"
-                      className="agx-btn agx-btn--primary"
-                      disabled={busyKey === "import-cockpit"}
-                      onClick={() => void handleImportCockpit()}
-                    >
-                      <Database size={15} />
-                      <span>
-                        {vi ? "Quét & nhập từ Cockpit Tools" : "Scan & Import from Cockpit"}
-                      </span>
-                    </button>
-                    <button
-                      type="button"
-                      className="agx-btn agx-btn--secondary"
-                      onClick={() => fileInputRef.current?.click()}
-                    >
-                      <FileJson size={15} />
-                      <span>{vi ? "Chọn tệp JSON từ Cockpit" : "Pick Cockpit JSON File"}</span>
-                    </button>
-                  </div>
-                </div>
-              ) : null}
-
               {addTab === "token" ? (
-                <div className="ag-modal-stack">
+                <div className="od-add-pane">
                   <label className="agx-field">
-                    <span>Refresh Token (1//...)</span>
+                    <span>Refresh Token</span>
                     <input
                       type="text"
                       className="agx-input"
@@ -1935,7 +1924,7 @@ export function AccountsPage({
                     />
                   </label>
                   <label className="agx-field">
-                    <span>{vi ? "Gợi ý Email (tùy chọn)" : "Email hint (optional)"}</span>
+                    <span>Email ({vi ? "tùy chọn" : "optional"})</span>
                     <input
                       type="text"
                       className="agx-input"
@@ -1963,24 +1952,24 @@ export function AccountsPage({
                       }
                     }}
                   >
-                    {vi ? "Thêm tài khoản" : "Add Account"}
+                    {busyKey === "add-token" ? (
+                      <Loader2 size={15} className="spin" />
+                    ) : (
+                      <Plus size={15} />
+                    )}
+                    <span>{vi ? "Thêm tài khoản" : "Add Account"}</span>
                   </button>
                 </div>
               ) : null}
 
               {addTab === "batch" ? (
-                <div className="ag-modal-stack">
-                  <p className="agx-muted">
-                    {vi
-                      ? "Mỗi dòng 1 tài khoản: refresh_token hoặc email----password----2fa----refresh_token"
-                      : "One account per line: refresh_token or email----password----2fa----refresh_token"}
-                  </p>
+                <div className="od-add-pane">
                   <textarea
                     className="agx-textarea"
-                    rows={8}
+                    rows={7}
                     value={batchInput}
                     onChange={(e) => setBatchInput(e.target.value)}
-                    placeholder="user@gmail.com----pass123----JBSWY3DPEHPK3PXP----1//0g..."
+                    placeholder="1//0g...&#10;user@gmail.com----pass----2fa----1//0g..."
                   />
                   <button
                     type="button"
@@ -2003,20 +1992,33 @@ export function AccountsPage({
               ) : null}
 
               {addTab === "json" ? (
-                <div className="ag-modal-stack">
-                  <div className="ag-modal-btn-row">
+                <div className="od-add-pane">
+                  <div className="od-import-picks">
                     <button
                       type="button"
                       className="agx-btn agx-btn--secondary agx-btn--sm"
                       onClick={() => fileInputRef.current?.click()}
                     >
                       <FileJson size={14} />
-                      <span>{vi ? "Mở tệp .JSON" : "Load .JSON file"}</span>
+                      <span>{vi ? "Chọn tệp .JSON" : "Pick .JSON"}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="agx-btn agx-btn--secondary agx-btn--sm"
+                      disabled={busyKey === "import-dir"}
+                      onClick={() => void handleImportDirectory()}
+                    >
+                      {busyKey === "import-dir" ? (
+                        <Loader2 size={14} className="spin" />
+                      ) : (
+                        <FolderOpen size={14} />
+                      )}
+                      <span>{vi ? "Chọn thư mục JSON" : "Pick Folder"}</span>
                     </button>
                   </div>
                   <textarea
                     className="agx-textarea"
-                    rows={8}
+                    rows={7}
                     value={jsonInput}
                     onChange={(e) => setJsonInput(e.target.value)}
                     placeholder='[{"email":"...","refresh_token":"1//..."}]'
@@ -2036,10 +2038,204 @@ export function AccountsPage({
                       }
                     }}
                   >
-                    {vi ? "Nhập từ JSON" : "Import JSON"}
+                    {vi ? "Nhập JSON" : "Import JSON"}
                   </button>
                 </div>
               ) : null}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Launch / Switch Account Modal — Opens ONLY when clicking Play on an account */}
+      {launchAccount ? (
+        <div
+          className="agx-modal-backdrop"
+          onClick={() => {
+            if (!busyKey) setLaunchAccount(null);
+          }}
+        >
+          <div
+            className="agx-modal od-launch-modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="agx-modal-head">
+              <div className="od-launch-head-copy">
+                <h3>{vi ? "Chạy tài khoản" : "Run Account"}</h3>
+              </div>
+              <button
+                type="button"
+                className="agx-icon-btn"
+                disabled={Boolean(busyKey)}
+                onClick={() => setLaunchAccount(null)}
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="agx-modal-body">
+              <div className="od-launch-account-chip">
+                <strong title={launchAccount.email}>
+                  {maskEmail(launchAccount.email, privacyMode)}
+                </strong>
+                <span
+                  className={`ag-badge-tier is-${normalizeTierBadge(
+                    launchAccount.quota?.subscriptionTier,
+                  ).toLowerCase()}`}
+                >
+                  {normalizeTierBadge(launchAccount.quota?.subscriptionTier)}
+                </span>
+              </div>
+
+              <div className="od-launch-targets">
+                {(launchTargets.length > 0
+                  ? launchTargets
+                  : [
+                      {
+                        id: "antigravity_ide",
+                        label: "Antigravity IDE",
+                        available: false,
+                        resolvedPath: null,
+                      },
+                      {
+                        id: "antigravity",
+                        label: "Antigravity",
+                        available: false,
+                        resolvedPath: null,
+                      },
+                      {
+                        id: "cli",
+                        label: "Terminal CLI",
+                        available: false,
+                        resolvedPath: null,
+                      },
+                    ]
+                ).map((t) => {
+                  const active = selectedLaunchTarget === t.id;
+                  const IconComp =
+                    t.id === "cli"
+                      ? Terminal
+                      : t.id === "antigravity_ide"
+                        ? Sparkles
+                        : Monitor;
+                  return (
+                    <button
+                      key={t.id}
+                      type="button"
+                      className={`od-launch-target-card${active ? " is-active" : ""}`}
+                      onClick={() => {
+                        setSelectedLaunchTarget(t.id);
+                        setLaunchError(null);
+                      }}
+                    >
+                      <div className="od-launch-target-icon">
+                        <IconComp size={18} />
+                      </div>
+                      <span className="od-launch-target-name">{t.label}</span>
+                      <span
+                        className={`od-launch-target-dot${t.available ? " is-found" : ""}`}
+                      >
+                        {t.available
+                          ? vi
+                            ? "Sẵn sàng"
+                            : "Ready"
+                          : vi
+                            ? "Chưa thấy"
+                            : "Not found"}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {(() => {
+                const cur = launchTargets.find((t) => t.id === selectedLaunchTarget);
+                return (
+                  <div className="od-launch-path-row">
+                    <label className="agx-field">
+                      <span>
+                        {selectedLaunchTarget === "cli"
+                          ? vi
+                            ? "Thư mục làm việc (tùy chọn)"
+                            : "Working directory (optional)"
+                          : vi
+                            ? "Đường dẫn thực thi"
+                            : "Executable path"}
+                      </span>
+                      {selectedLaunchTarget === "cli" ? (
+                        <div className="od-inline-submit">
+                          <input
+                            type="text"
+                            className="agx-input"
+                            value={launchWorkingDir}
+                            onChange={(e) => setLaunchWorkingDir(e.target.value)}
+                            placeholder={vi ? "Mặc định: Home" : "Default: Home"}
+                          />
+                          <button
+                            type="button"
+                            className="agx-btn agx-btn--secondary"
+                            onClick={async () => {
+                              const p = await agxInvoke<string | null>("pick_folder_dialog");
+                              if (p) setLaunchWorkingDir(p);
+                            }}
+                          >
+                            <FolderOpen size={14} />
+                          </button>
+                        </div>
+                      ) : (
+                        <input
+                          type="text"
+                          className="agx-input"
+                          value={launchCustomPath}
+                          onChange={(e) => setLaunchCustomPath(e.target.value)}
+                          placeholder={cur?.resolvedPath || "C:\\...\\Antigravity.exe"}
+                        />
+                      )}
+                    </label>
+                  </div>
+                );
+              })()}
+
+              {launchError ? (
+                <div className="od-banner is-err">
+                  <span>{launchError}</span>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="agx-modal-foot">
+              <button
+                type="button"
+                className="agx-btn agx-btn--ghost"
+                disabled={Boolean(busyKey)}
+                onClick={() => setLaunchAccount(null)}
+              >
+                {tr(lang, "acc.cancel")}
+              </button>
+              <button
+                type="button"
+                className="agx-btn agx-btn--secondary"
+                disabled={Boolean(busyKey)}
+                onClick={() => void executeLaunchOrSwitch(false)}
+              >
+                {busyKey === `switch-${launchAccount.id}` ? (
+                  <Loader2 size={14} className="spin" />
+                ) : null}
+                <span>{vi ? "Chỉ chuyển" : "Switch Only"}</span>
+              </button>
+              <button
+                type="button"
+                className="agx-btn agx-btn--primary"
+                disabled={Boolean(busyKey)}
+                onClick={() => void executeLaunchOrSwitch(true)}
+              >
+                {busyKey === `launch-${launchAccount.id}` ? (
+                  <Loader2 size={14} className="spin" />
+                ) : (
+                  <Play size={14} />
+                )}
+                <span>{vi ? "Chuyển & Mở" : "Switch & Launch"}</span>
+              </button>
             </div>
           </div>
         </div>

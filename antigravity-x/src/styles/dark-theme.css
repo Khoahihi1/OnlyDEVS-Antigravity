@@ -1,141 +1,146 @@
 ﻿/* ============================================================================
-   Cockpit Tools Dark Theme + All 7 Color Packs
-   (default / nord / tokyo-night / catppuccin / gruvbox / everforest / oled)
+   OnlyDEVS Dark Theme & Accent Packs
+   (default: OnlyDEVS Crimson × OnlyBlue · nord · tokyo-night · catppuccin · gruvbox · everforest · oled)
    ============================================================================ */
 
 [data-theme="dark"] {
-  --agx-bg: #0b1424;
-  --agx-bg-elevated: rgba(18, 29, 47, 0.78);
-  --agx-bg-solid: #142136;
-  --agx-bg-subtle: rgba(13, 22, 37, 0.78);
-  --agx-sidebar-bg: rgba(11, 20, 36, 0.82);
-  --agx-text: #f1f5f9;
+  --agx-bg: #090a0f;
+  --agx-bg-elevated: rgba(17, 19, 26, 0.9);
+  --agx-bg-solid: #11131a;
+  --agx-bg-subtle: rgba(24, 27, 36, 0.86);
+  --agx-sidebar-bg: #0c0e14;
+  --agx-text: #f8fafc;
   --agx-text-secondary: #cbd5e1;
-  --agx-muted: #94a3b8;
-  --agx-subtle: #64748b;
-  --agx-border: rgba(255, 255, 255, 0.11);
-  --agx-border-strong: rgba(255, 255, 255, 0.22);
-  --agx-primary: #3b82f6;
-  --agx-primary-hover: #2563eb;
-  --agx-primary-soft: rgba(59, 130, 246, 0.17);
-  --agx-accent: #14b8a6;
-  --agx-heading-gradient: linear-gradient(135deg, #bfdbfe, #99f6e4);
-  --agx-success-soft: rgba(34, 197, 94, 0.18);
-  --agx-warning-soft: rgba(245, 158, 11, 0.18);
-  --agx-danger-soft: rgba(239, 68, 68, 0.18);
-  --agx-shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.28);
-  --agx-shadow-md: 0 14px 32px rgba(0, 0, 0, 0.42);
-  --agx-shadow-brand: 0 6px 20px rgba(59, 130, 246, 0.34);
+  --agx-muted: #8b95a7;
+  --agx-subtle: #5a6477;
+  --agx-border: rgba(255, 255, 255, 0.08);
+  --agx-border-strong: rgba(255, 255, 255, 0.16);
+
+  /* OnlyDEVS Logo Brand Tokens (Dark) */
+  --agx-primary: #ef2328;
+  --agx-primary-hover: #ff3b40;
+  --agx-primary-soft: rgba(239, 35, 40, 0.15);
+  --agx-accent: #00aff0;
+  --agx-accent-soft: rgba(0, 175, 240, 0.14);
+  --agx-gold: #facc15;
+  --agx-gold-soft: rgba(250, 204, 21, 0.14);
+  --agx-heading-gradient: linear-gradient(125deg, #ffffff 15%, #00aff0 100%);
+  --agx-brand-red: #ef2328;
+
+  --agx-success: #22c55e;
+  --agx-success-soft: rgba(34, 197, 94, 0.16);
+  --agx-warning: #facc15;
+  --agx-warning-soft: rgba(250, 204, 21, 0.16);
+  --agx-danger: #f87171;
+  --agx-danger-soft: rgba(239, 35, 40, 0.18);
+
+  --agx-shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.34);
+  --agx-shadow-md: 0 14px 32px rgba(0, 0, 0, 0.52);
+  --agx-shadow-brand: 0 6px 20px rgba(239, 35, 40, 0.34);
   color-scheme: dark;
 }
 
-/* Signature Cockpit Tools Deep Ocean Cyan-Navy Gradient Background */
+/* OnlyDEVS Carbon Obsidian Canvas with Crimson & OnlyBlue Ambient Glow */
 [data-theme="dark"] body,
 html[data-theme="dark"] body {
   background:
-    radial-gradient(circle at 12% 10%, rgba(59, 130, 246, 0.16), transparent 45%),
-    radial-gradient(circle at 90% 5%, rgba(20, 184, 166, 0.14), transparent 42%),
-    linear-gradient(180deg, #091322 0%, #101f35 55%, #0c1729 100%);
+    radial-gradient(circle at 8% 4%, rgba(239, 35, 40, 0.12), transparent 36%),
+    radial-gradient(circle at 92% 96%, rgba(0, 175, 240, 0.11), transparent 40%),
+    linear-gradient(180deg, #08090d 0%, #0d0f16 100%);
   color-scheme: dark;
 }
 
-/* === Theme Color Pack: Nord === */
+/* === Theme Pack: Nord === */
 [data-theme-color="nord"] {
   --agx-primary: #5e81ac;
   --agx-primary-hover: #81a1c1;
   --agx-primary-soft: rgba(94, 129, 172, 0.18);
   --agx-accent: #88c0d0;
-  --agx-heading-gradient: linear-gradient(135deg, #88c0d0, #81a1c1);
+  --agx-heading-gradient: linear-gradient(135deg, #eceff4, #88c0d0);
 }
 [data-theme-color="nord"][data-theme="dark"] {
   --agx-bg: #2e3440;
-  --agx-bg-elevated: rgba(59, 66, 82, 0.84);
+  --agx-bg-elevated: rgba(59, 66, 82, 0.88);
   --agx-bg-solid: #3b4252;
-  --agx-bg-subtle: rgba(46, 52, 64, 0.85);
-  --agx-sidebar-bg: rgba(41, 46, 57, 0.9);
+  --agx-bg-subtle: rgba(46, 52, 64, 0.88);
+  --agx-sidebar-bg: #272c36;
   --agx-text: #eceff4;
   --agx-text-secondary: #d8dee9;
 }
 html[data-theme-color="nord"][data-theme="dark"] body {
   background:
-    radial-gradient(circle at 14% 12%, rgba(136, 192, 208, 0.14), transparent 45%),
-    radial-gradient(circle at 88% 8%, rgba(94, 129, 172, 0.16), transparent 42%),
+    radial-gradient(circle at 12% 8%, rgba(136, 192, 208, 0.12), transparent 42%),
     linear-gradient(180deg, #242933 0%, #2e3440 100%);
 }
 
-/* === Theme Color Pack: Tokyo Night === */
+/* === Theme Pack: Tokyo Night === */
 [data-theme-color="tokyo-night"] {
   --agx-primary: #7aa2f7;
   --agx-primary-hover: #89b4fa;
   --agx-primary-soft: rgba(122, 162, 247, 0.18);
   --agx-accent: #bb9af7;
-  --agx-heading-gradient: linear-gradient(135deg, #7aa2f7, #bb9af7);
+  --agx-heading-gradient: linear-gradient(135deg, #c0caf5, #7aa2f7);
 }
 [data-theme-color="tokyo-night"][data-theme="dark"] {
   --agx-bg: #1a1b26;
-  --agx-bg-elevated: rgba(36, 40, 59, 0.82);
+  --agx-bg-elevated: rgba(36, 40, 59, 0.88);
   --agx-bg-solid: #24283b;
-  --agx-bg-subtle: rgba(26, 27, 38, 0.86);
-  --agx-sidebar-bg: rgba(22, 22, 30, 0.9);
+  --agx-bg-subtle: rgba(26, 27, 38, 0.9);
+  --agx-sidebar-bg: #16161e;
   --agx-text: #c0caf5;
   --agx-text-secondary: #a9b1d6;
 }
 html[data-theme-color="tokyo-night"][data-theme="dark"] body {
   background:
-    radial-gradient(circle at 12% 10%, rgba(122, 162, 247, 0.16), transparent 45%),
-    radial-gradient(circle at 88% 8%, rgba(187, 154, 247, 0.14), transparent 42%),
+    radial-gradient(circle at 12% 8%, rgba(122, 162, 247, 0.14), transparent 42%),
     linear-gradient(180deg, #151621 0%, #1a1b26 100%);
 }
 
-/* === Theme Color Pack: Catppuccin === */
+/* === Theme Pack: Catppuccin === */
 [data-theme-color="catppuccin"] {
-  --agx-primary: #89b4fa;
-  --agx-primary-hover: #74c7ec;
-  --agx-primary-soft: rgba(137, 180, 250, 0.18);
-  --agx-accent: #cba6f7;
-  --agx-heading-gradient: linear-gradient(135deg, #89b4fa, #cba6f7);
+  --agx-primary: #f38ba8;
+  --agx-primary-hover: #eba0ac;
+  --agx-primary-soft: rgba(243, 139, 168, 0.16);
+  --agx-accent: #89b4fa;
+  --agx-heading-gradient: linear-gradient(135deg, #cdd6f4, #89b4fa);
 }
 [data-theme-color="catppuccin"][data-theme="dark"] {
   --agx-bg: #1e1e2e;
-  --agx-bg-elevated: rgba(49, 50, 68, 0.8);
+  --agx-bg-elevated: rgba(49, 50, 68, 0.86);
   --agx-bg-solid: #313244;
-  --agx-bg-subtle: rgba(30, 30, 46, 0.85);
-  --agx-sidebar-bg: rgba(24, 24, 37, 0.9);
+  --agx-bg-subtle: rgba(30, 30, 46, 0.88);
+  --agx-sidebar-bg: #181825;
   --agx-text: #cdd6f4;
   --agx-text-secondary: #bac2de;
 }
 html[data-theme-color="catppuccin"][data-theme="dark"] body {
   background:
-    radial-gradient(circle at 12% 10%, rgba(137, 180, 250, 0.15), transparent 45%),
-    radial-gradient(circle at 88% 8%, rgba(203, 166, 247, 0.14), transparent 42%),
+    radial-gradient(circle at 12% 8%, rgba(243, 139, 168, 0.12), transparent 42%),
     linear-gradient(180deg, #181825 0%, #1e1e2e 100%);
 }
 
-/* === Theme Color Pack: Gruvbox === */
+/* === Theme Pack: Gruvbox === */
 [data-theme-color="gruvbox"] {
   --agx-primary: #d79921;
   --agx-primary-hover: #fabd2f;
   --agx-primary-soft: rgba(215, 153, 33, 0.18);
-  --agx-accent: #689d6a;
+  --agx-accent: #83a598;
   --agx-heading-gradient: linear-gradient(135deg, #fabd2f, #8ec07c);
 }
 [data-theme-color="gruvbox"][data-theme="dark"] {
   --agx-bg: #282828;
-  --agx-bg-elevated: rgba(60, 56, 54, 0.84);
+  --agx-bg-elevated: rgba(60, 56, 54, 0.88);
   --agx-bg-solid: #3c3836;
-  --agx-bg-subtle: rgba(40, 40, 40, 0.86);
-  --agx-sidebar-bg: rgba(29, 32, 33, 0.92);
+  --agx-bg-subtle: rgba(40, 40, 40, 0.88);
+  --agx-sidebar-bg: #1d2021;
   --agx-text: #ebdbb2;
   --agx-text-secondary: #d5c4a1;
 }
 html[data-theme-color="gruvbox"][data-theme="dark"] body {
-  background:
-    radial-gradient(circle at 12% 10%, rgba(215, 153, 33, 0.14), transparent 45%),
-    radial-gradient(circle at 88% 8%, rgba(104, 157, 106, 0.13), transparent 42%),
-    linear-gradient(180deg, #1d2021 0%, #282828 100%);
+  background: linear-gradient(180deg, #1d2021 0%, #282828 100%);
 }
 
-/* === Theme Color Pack: Everforest === */
+/* === Theme Pack: Everforest === */
 [data-theme-color="everforest"] {
   --agx-primary: #a7c080;
   --agx-primary-hover: #83c092;
@@ -145,71 +150,65 @@ html[data-theme-color="gruvbox"][data-theme="dark"] body {
 }
 [data-theme-color="everforest"][data-theme="dark"] {
   --agx-bg: #2d353b;
-  --agx-bg-elevated: rgba(52, 63, 68, 0.84);
+  --agx-bg-elevated: rgba(52, 63, 68, 0.88);
   --agx-bg-solid: #343f44;
-  --agx-bg-subtle: rgba(45, 53, 59, 0.86);
-  --agx-sidebar-bg: rgba(35, 42, 46, 0.92);
+  --agx-bg-subtle: rgba(45, 53, 59, 0.88);
+  --agx-sidebar-bg: #232a2e;
   --agx-text: #d3c6aa;
   --agx-text-secondary: #9da9a0;
 }
 html[data-theme-color="everforest"][data-theme="dark"] body {
-  background:
-    radial-gradient(circle at 12% 10%, rgba(167, 192, 128, 0.14), transparent 45%),
-    radial-gradient(circle at 88% 8%, rgba(127, 187, 179, 0.13), transparent 42%),
-    linear-gradient(180deg, #232a2e 0%, #2d353b 100%);
+  background: linear-gradient(180deg, #232a2e 0%, #2d353b 100%);
 }
 
-/* === Theme Color Pack: OLED Pure === */
+/* === Theme Pack: OLED Pure === */
 html[data-theme-color="oled"] {
   --agx-bg: #ffffff;
   --agx-bg-elevated: #ffffff;
   --agx-bg-solid: #ffffff;
-  --agx-bg-subtle: #f5f5f5;
+  --agx-bg-subtle: #f4f4f5;
   --agx-sidebar-bg: #ffffff;
   --agx-text: #000000;
-  --agx-text-secondary: #333333;
-  --agx-border: rgba(0, 0, 0, 0.18);
+  --agx-text-secondary: #27272a;
+  --agx-border: rgba(0, 0, 0, 0.16);
 }
 html[data-theme-color="oled"] body {
   background: #ffffff;
 }
 html[data-theme-color="oled"][data-theme="dark"] {
   --agx-bg: #000000;
-  --agx-bg-elevated: #0a0a0a;
-  --agx-bg-solid: #0a0a0a;
-  --agx-bg-subtle: #111111;
-  --agx-sidebar-bg: #050505;
+  --agx-bg-elevated: #09090b;
+  --agx-bg-solid: #09090b;
+  --agx-bg-subtle: #111114;
+  --agx-sidebar-bg: #000000;
   --agx-text: #ffffff;
   --agx-text-secondary: #d4d4d8;
-  --agx-border: rgba(255, 255, 255, 0.2);
+  --agx-border: rgba(255, 255, 255, 0.16);
 }
 html[data-theme-color="oled"][data-theme="dark"] body {
   background: #000000;
 }
 
-/* Frosted Glass Elevation & Gradient Headings (Cockpit Look) */
-.agx-sidebar,
+/* Crisp Glass Elevation */
 .ag-acc-card,
 .ag-token-strip,
-.ag-cockpit-toolbar,
+.od-toolbar,
 .ag-selection-group-bar,
 .ag-token-usage__surface,
-.ag-cockpit-subtabs,
+.od-subtabs,
 .agx-card,
 .agx-panel {
-  backdrop-filter: blur(18px);
-  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
 }
 
-.ag-cockpit-header__left h1,
+.od-header__left h1,
 .agx-page-header h1 {
-  background: var(--agx-heading-gradient);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  color: var(--agx-text);
+  letter-spacing: -0.025em;
 }
 
-/* Solid surfaces for modals so text is always ultra-crisp */
+/* Solid modals for crystal-clear legibility */
 .agx-modal {
   background: var(--agx-bg-solid) !important;
 }
@@ -219,13 +218,11 @@ html[data-theme-color="oled"][data-theme="dark"] body {
   --cx-tool-text: var(--agx-text);
   --cx-tool-muted: var(--agx-muted);
   --cx-tool-line: var(--agx-border);
+  --cx-tool-blue: var(--agx-primary);
 }
 
 [data-theme="dark"] .cx-prompts-heading h2 {
-  background: var(--agx-heading-gradient);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  color: var(--agx-text);
 }
 
 [data-theme="dark"] .cx-prompts-btn--secondary {
@@ -239,7 +236,6 @@ html[data-theme-color="oled"][data-theme="dark"] body {
 [data-theme="dark"] .cx-prompts-form-panel {
   background: var(--agx-bg-elevated);
   border-color: var(--agx-border);
-  backdrop-filter: blur(18px);
 }
 
 [data-theme="dark"] .cx-prompts-active-summary,
@@ -266,9 +262,9 @@ html[data-theme-color="oled"][data-theme="dark"] body {
 }
 
 [data-theme="dark"] .cx-prompts-mode-button--active {
-  background: rgba(22, 163, 74, 0.18);
-  border-color: rgba(22, 163, 74, 0.35);
-  color: #4ade80;
+  background: rgba(239, 35, 40, 0.16);
+  border-color: rgba(239, 35, 40, 0.4);
+  color: #ff6b6f;
 }
 
 [data-theme="dark"] .cx-prompt-category-tabs,
@@ -279,18 +275,18 @@ html[data-theme-color="oled"][data-theme="dark"] body {
 
 [data-theme="dark"] .cx-prompt-category-tab--active {
   background: var(--agx-primary-soft);
-  border-color: color-mix(in srgb, var(--agx-primary) 40%, transparent);
+  border-color: color-mix(in srgb, var(--agx-primary) 42%, transparent);
   color: var(--agx-primary);
 }
 
 [data-theme="dark"] .cx-prompts-row-icon {
-  background: rgba(139, 92, 246, 0.18);
-  color: #c4b5fd;
+  background: var(--agx-accent-soft);
+  color: var(--agx-accent);
 }
 
 [data-theme="dark"] .cx-toggle,
 [data-theme="dark"] .agx-switch-pill {
-  background: rgba(148, 163, 184, 0.22);
+  background: rgba(148, 163, 184, 0.2);
   border-color: var(--agx-border-strong);
 }
 
@@ -311,7 +307,7 @@ html[data-theme-color="oled"][data-theme="dark"] body {
 }
 
 [data-theme="dark"] .agx-target-pill {
-  background: var(--agx-primary-soft);
-  border-color: color-mix(in srgb, var(--agx-primary) 30%, transparent);
+  background: var(--agx-accent-soft);
+  border-color: color-mix(in srgb, var(--agx-accent) 30%, transparent);
   color: var(--agx-text-secondary);
 }

@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -18,7 +19,7 @@ use crate::paths;
 use crate::prompts::open_db;
 
 // ============================================================================
-// Constants (from cockpit-tools Antigravity OAuth & Cloud Code)
+// Constants (Antigravity OAuth & Cloud Code)
 // ============================================================================
 
 const CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
@@ -337,7 +338,7 @@ pub fn list_accounts_sync() -> Result<Vec<AntigravityAccount>, String> {
 }
 
 // ============================================================================
-// Windows Credential Manager & Local Antigravity Storage (from cockpit-tools)
+// Windows Credential Manager & Local Antigravity Storage
 // ============================================================================
 
 #[cfg(target_os = "windows")]
@@ -509,7 +510,7 @@ fn write_windows_antigravity_credential(_payload_json: &str) -> Result<(), Strin
 }
 
 // ============================================================================
-// Protobuf Helpers for Antigravity state.vscdb (ported from cockpit-tools)
+// Protobuf Helpers for Antigravity state.vscdb
 // ============================================================================
 
 fn encode_varint(mut value: u64) -> Vec<u8> {
@@ -892,6 +893,43 @@ async fn refresh_google_access_token(refresh_token: &str) -> Result<GoogleTokenR
     res.json::<GoogleTokenResponse>()
         .await
         .map_err(|e| format!("Parse token response: {e}"))
+}
+
+pub(crate) async fn ensure_fresh_access_token(
+    account_id: &str,
+    force_refresh: bool,
+) -> Result<AntigravityAccount, String> {
+    let mut acc = {
+        let conn = open_db()?;
+        load_account_by_id(&conn, account_id)?
+    };
+    let now = Utc::now().timestamp();
+    let needs_refresh = force_refresh
+        || acc.token.access_token.trim().is_empty()
+        || acc.token.expiry_timestamp <= now + 300;
+    if !needs_refresh {
+        return Ok(acc);
+    }
+    if acc.token.refresh_token.trim().is_empty() {
+        return Err(format!("Tài khoản {} thiếu refresh_token.", acc.email));
+    }
+    let refreshed = refresh_google_access_token(&acc.token.refresh_token).await?;
+    acc.token.access_token = refreshed.access_token;
+    if let Some(rt) = refreshed.refresh_token.filter(|s| !s.trim().is_empty()) {
+        acc.token.refresh_token = rt;
+    }
+    acc.token.expires_in = refreshed.expires_in;
+    acc.token.expiry_timestamp = now + refreshed.expires_in;
+    if acc.token.token_type.trim().is_empty() {
+        acc.token.token_type = "Bearer".to_string();
+    }
+    if let Some(it) = refreshed.id_token.filter(|s| !s.trim().is_empty()) {
+        acc.token.id_token = Some(it);
+    }
+    acc.last_used = now;
+    let conn = open_db()?;
+    save_account_to_db(&conn, &acc)?;
+    Ok(acc)
 }
 
 async fn exchange_google_code(
@@ -1504,12 +1542,216 @@ pub async fn refresh_all_account_quotas() -> Result<RefreshStats, String> {
 // 1-Click Account Switcher (Windows Credential Manager + .gemini + state.vscdb)
 // ============================================================================
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchTargetInfo {
+    pub id: String,
+    pub label: String,
+    pub available: bool,
+    pub resolved_path: Option<String>,
+}
+
+fn find_windows_antigravity_exe(rel_candidates: &[&str]) -> Option<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let p = PathBuf::from(&local);
+        roots.push(p.join("Programs"));
+        roots.push(p);
+    }
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        roots.push(PathBuf::from(pf));
+    }
+    if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
+        roots.push(PathBuf::from(pf86));
+    }
+    for root in roots {
+        for rel in rel_candidates {
+            let cand = root.join(rel);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+fn find_antigravity_cli_path() -> Option<PathBuf> {
+    for name in ["agy", "antigravity-cli", "antigravity"] {
+        if let Ok(found) = which::which(name) {
+            let lower = found.to_string_lossy().to_lowercase();
+            if !lower.ends_with("antigravity.exe") && !lower.ends_with("antigravity ide.exe") {
+                return Some(found);
+            }
+        }
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        for rel in [
+            "Programs\\antigravity\\bin\\agy.cmd",
+            "Programs\\antigravity\\bin\\antigravity.cmd",
+            "Programs\\Antigravity IDE\\bin\\agy.cmd",
+            "Programs\\Antigravity IDE\\bin\\antigravity-ide.cmd",
+        ] {
+            let cand = PathBuf::from(&local).join(rel);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        for rel in ["npm\\agy.cmd", "npm\\antigravity.cmd"] {
+            let cand = PathBuf::from(&appdata).join(rel);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+pub fn detect_antigravity_launch_targets() -> Vec<LaunchTargetInfo> {
+    let ide_path = find_windows_antigravity_exe(&[
+        "Antigravity IDE\\Antigravity IDE.exe",
+        "Antigravity IDE\\antigravity-ide.exe",
+    ]);
+    let app_path = find_windows_antigravity_exe(&[
+        "antigravity\\Antigravity.exe",
+        "Antigravity\\Antigravity.exe",
+        "antigravity\\Electron.exe",
+    ]);
+    let cli_path = find_antigravity_cli_path();
+
+    vec![
+        LaunchTargetInfo {
+            id: "antigravity_ide".into(),
+            label: "Antigravity IDE".into(),
+            available: ide_path.is_some(),
+            resolved_path: ide_path.map(|p| p.to_string_lossy().to_string()),
+        },
+        LaunchTargetInfo {
+            id: "antigravity".into(),
+            label: "Antigravity".into(),
+            available: app_path.is_some(),
+            resolved_path: app_path.map(|p| p.to_string_lossy().to_string()),
+        },
+        LaunchTargetInfo {
+            id: "cli".into(),
+            label: "Terminal CLI".into(),
+            available: cli_path.is_some(),
+            resolved_path: cli_path.map(|p| p.to_string_lossy().to_string()),
+        },
+    ]
+}
+
+fn close_antigravity_process_by_target(target: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let images: &[&str] = match target {
+            "antigravity_ide" => &["Antigravity IDE.exe", "antigravity-ide.exe"],
+            "antigravity" => &["Antigravity.exe"],
+            _ => &[],
+        };
+        for img in images {
+            let _ = Command::new("taskkill")
+                .args(["/IM", img, "/T", "/F"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        }
+        if !images.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(650));
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = target;
+    }
+}
+
+fn spawn_antigravity_target(
+    target: &str,
+    custom_path: Option<&str>,
+    working_dir: Option<&str>,
+) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+        if target == "cli" {
+            let cmd_bin = custom_path
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+                .or_else(|| find_antigravity_cli_path().map(|p| p.to_string_lossy().to_string()))
+                .unwrap_or_else(|| "agy".to_string());
+            let dir = working_dir
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+                .or_else(dirs::home_dir)
+                .unwrap_or_else(|| PathBuf::from("."));
+
+            if let Ok(wt) = which::which("wt") {
+                Command::new(wt)
+                    .args(["-d", &dir.to_string_lossy(), "powershell.exe", "-NoExit", "-Command", &format!("& '{}'", cmd_bin.replace('\'', "''"))])
+                    .creation_flags(CREATE_NEW_PROCESS_GROUP)
+                    .spawn()
+                    .map_err(|e| format!("Không thể mở Windows Terminal: {e}"))?;
+            } else {
+                Command::new("powershell.exe")
+                    .current_dir(&dir)
+                    .args(["-NoExit", "-Command", &format!("& '{}'", cmd_bin.replace('\'', "''"))])
+                    .creation_flags(CREATE_NEW_PROCESS_GROUP)
+                    .spawn()
+                    .map_err(|e| format!("Không thể mở PowerShell: {e}"))?;
+            }
+            return Ok(format!("Đã mở Terminal CLI ({cmd_bin})"));
+        }
+
+        let exe = custom_path
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.is_file())
+            .or_else(|| match target {
+                "antigravity_ide" => find_windows_antigravity_exe(&[
+                    "Antigravity IDE\\Antigravity IDE.exe",
+                    "Antigravity IDE\\antigravity-ide.exe",
+                ]),
+                _ => find_windows_antigravity_exe(&[
+                    "antigravity\\Antigravity.exe",
+                    "Antigravity\\Antigravity.exe",
+                    "antigravity\\Electron.exe",
+                ]),
+            })
+            .ok_or_else(|| format!("Không tìm thấy tệp thực thi cho {target}. Hãy chọn đường dẫn thủ công."))?;
+
+        let mut cmd = Command::new(&exe);
+        if let Some(parent) = exe.parent() {
+            cmd.current_dir(parent);
+        }
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS)
+            .spawn()
+            .map_err(|e| format!("Không thể khởi chạy {}: {e}", exe.display()))?;
+        Ok(format!("Đã khởi chạy {}", exe.file_name().and_then(|n| n.to_str()).unwrap_or(target)))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (target, custom_path, working_dir);
+        Err("Chưa hỗ trợ khởi chạy trên hệ điều hành này.".into())
+    }
+}
+
 pub async fn switch_antigravity_account(
     account_id: String,
     switch_target: Option<String>,
+    launch: Option<bool>,
+    custom_path: Option<String>,
+    working_dir: Option<String>,
 ) -> Result<AntigravityAccount, String> {
     let started = std::time::Instant::now();
-    let target = switch_target.unwrap_or_else(|| "all".into());
+    let target = switch_target.unwrap_or_else(|| "antigravity_ide".into());
+    let should_launch = launch.unwrap_or(false);
 
     let (mut acc, previous_email) = {
         let conn = open_db()?;
@@ -1541,34 +1783,45 @@ pub async fn switch_antigravity_account(
         .unwrap_or_else(Utc::now)
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
 
-    let payload_val = json!({
-        "token": {
+    let mut payload_obj = serde_json::Map::new();
+    payload_obj.insert(
+        "token".into(),
+        json!({
             "access_token": acc.token.access_token,
             "token_type": "Bearer",
             "refresh_token": acc.token.refresh_token,
             "expiry": expiry_rfc3339,
-        },
-        "auth_method": "consumer",
-        "id_token": acc.token.id_token,
-    });
-    let payload_json =
-        serde_json::to_string(&payload_val).map_err(|e| format!("Serialize credential: {e}"))?;
+        }),
+    );
+    payload_obj.insert("auth_method".into(), json!("consumer"));
+    if let Some(id_tok) = acc.token.id_token.as_ref().filter(|s| !s.trim().is_empty()) {
+        payload_obj.insert("id_token".into(), json!(id_tok));
+    }
+    let mut payload_json = serde_json::to_string(&Value::Object(payload_obj.clone()))
+        .map_err(|e| format!("Serialize credential: {e}"))?;
+    if payload_json.len() > 2560 {
+        payload_obj.remove("id_token");
+        payload_json = serde_json::to_string(&Value::Object(payload_obj))
+            .map_err(|e| format!("Serialize credential: {e}"))?;
+    }
+
+    // 0. Close running target process before writing credentials/state.vscdb when launching
+    if should_launch && (target == "antigravity_ide" || target == "antigravity") {
+        let t_close = target.clone();
+        let _ = tokio::task::spawn_blocking(move || close_antigravity_process_by_target(&t_close)).await;
+    }
 
     // 1. Write Windows Credential Manager ("gemini:antigravity")
-    if target != "cli" {
-        let _ = write_windows_antigravity_credential(&payload_json);
-    }
+    write_windows_antigravity_credential(&payload_json)?;
 
     // 2. Write ~/.gemini/jetski-standalone-oauth-token and ~/.gemini/antigravity-cli/antigravity-oauth-token
     let gemini = paths::gemini_home()?;
     fs::create_dir_all(&gemini).map_err(|e| format!("Tạo .gemini: {e}"))?;
-    if target != "cli" {
-        let fallback_path = gemini.join(DESKTOP_FALLBACK_FILE);
-        fs::write(&fallback_path, &payload_json)
-            .map_err(|e| format!("Ghi {DESKTOP_FALLBACK_FILE}: {e}"))?;
-    }
-    if target == "all" || target == "cli" {
-        let cli_dir = gemini.join("antigravity-cli");
+    let fallback_path = gemini.join(DESKTOP_FALLBACK_FILE);
+    fs::write(&fallback_path, &payload_json)
+        .map_err(|e| format!("Ghi {DESKTOP_FALLBACK_FILE}: {e}"))?;
+    let cli_dir = gemini.join("antigravity-cli");
+    if target == "cli" || cli_dir.is_dir() {
         fs::create_dir_all(&cli_dir).map_err(|e| format!("Tạo antigravity-cli: {e}"))?;
         fs::write(cli_dir.join(CLI_OAUTH_TOKEN_FILE), &payload_json)
             .map_err(|e| format!("Ghi {CLI_OAUTH_TOKEN_FILE}: {e}"))?;
@@ -1579,6 +1832,20 @@ pub async fn switch_antigravity_account(
         for db_path in antigravity_state_db_candidates() {
             let _ = inject_account_into_state_db(&db_path, &acc);
         }
+    }
+
+    // 4. Launch selected target application if requested
+    let mut switch_note = "Đã chuyển tài khoản".to_string();
+    if should_launch {
+        let t_launch = target.clone();
+        let cp = custom_path.clone();
+        let wd = working_dir.clone();
+        let launch_res = tokio::task::spawn_blocking(move || {
+            spawn_antigravity_target(&t_launch, cp.as_deref(), wd.as_deref())
+        })
+        .await
+        .map_err(|e| format!("Launch task join: {e}"))??;
+        switch_note = launch_res;
     }
 
     acc.last_used = now;
@@ -1601,7 +1868,7 @@ pub async fn switch_antigravity_account(
             previous_email,
             target,
             duration_ms as i64,
-            "Đã đồng bộ Credential Manager + .gemini + state.vscdb"
+            switch_note
         ],
     );
 
@@ -2393,7 +2660,7 @@ pub fn get_antigravity_token_usage() -> Result<TokenUsageSummary, String> {
 }
 
 // ============================================================================
-// Account Groups & Custom Sort Order (Cockpit Overview parity)
+// Account Groups & Custom Sort Order
 // ============================================================================
 
 pub fn list_account_groups() -> Result<Vec<AccountGroup>, String> {
@@ -2571,73 +2838,46 @@ pub fn save_account_custom_sort(account_ids: Vec<String>) -> Result<Vec<String>,
 }
 
 // ============================================================================
-// Import from existing Cockpit Tools storage (~/.antigravity_cockpit / AppData)
+// Import accounts from a local JSON directory
 // ============================================================================
 
-pub async fn import_accounts_from_cockpit() -> Result<Vec<AntigravityAccount>, String> {
-    let mut candidate_dirs: Vec<PathBuf> = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        candidate_dirs.push(home.join(".antigravity_cockpit").join("accounts"));
-        candidate_dirs.push(home.join(".cockpit_tools").join("accounts"));
-    }
-    if let Some(roaming) = dirs::config_dir() {
-        candidate_dirs.push(roaming.join("com.jlcodes.antigravity-cockpit").join("accounts"));
-        candidate_dirs.push(roaming.join("antigravity-cockpit").join("accounts"));
-        candidate_dirs.push(roaming.join("cockpit-tools").join("accounts"));
-    }
-    if let Some(local) = dirs::data_local_dir() {
-        candidate_dirs.push(local.join("com.jlcodes.antigravity-cockpit").join("accounts"));
-        candidate_dirs.push(local.join("cockpit-tools").join("accounts"));
+pub async fn import_accounts_from_directory(
+    dir_path: String,
+) -> Result<Vec<AntigravityAccount>, String> {
+    let dir = PathBuf::from(dir_path.trim());
+    if !dir.is_dir() {
+        return Err("Thư mục không tồn tại.".to_string());
     }
 
     let mut parsed_items: Vec<Value> = Vec::new();
-    let mut scanned_dirs = 0usize;
-    for dir in candidate_dirs {
-        if !dir.is_dir() {
+    let entries = fs::read_dir(&dir).map_err(|e| format!("Đọc thư mục thất bại: {e}"))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        scanned_dirs += 1;
-        let Ok(entries) = fs::read_dir(&dir) else {
+        let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let Ok(raw) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let clean = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-            let Ok(val) = serde_json::from_str::<Value>(clean) else {
-                continue;
-            };
-            // Skip encrypted envelopes (no plaintext refresh_token)
-            let has_token = val
-                .pointer("/token/refresh_token")
-                .or_else(|| val.pointer("/token/refreshToken"))
-                .or_else(|| val.get("refresh_token"))
-                .or_else(|| val.get("refreshToken"))
-                .and_then(Value::as_str)
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false);
-            if has_token {
-                parsed_items.push(val);
-            }
+        let clean = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+        let Ok(val) = serde_json::from_str::<Value>(clean) else {
+            continue;
+        };
+        let has_token = val
+            .pointer("/token/refresh_token")
+            .or_else(|| val.pointer("/token/refreshToken"))
+            .or_else(|| val.get("refresh_token"))
+            .or_else(|| val.get("refreshToken"))
+            .and_then(Value::as_str)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if has_token {
+            parsed_items.push(val);
         }
     }
 
     if parsed_items.is_empty() {
-        if scanned_dirs == 0 {
-            return Err(
-                "Không tìm thấy thư mục tài khoản Cockpit Tools trên máy. Hãy xuất JSON từ Cockpit Tools rồi nhập vào đây."
-                    .to_string(),
-            );
-        }
-        return Err(
-            "Tìm thấy dữ liệu Cockpit Tools nhưng các tệp tài khoản đang được mã hóa cục bộ. Hãy nhấn 'Xuất JSON' trong Cockpit Tools rồi nhập vào tab JSON ở đây."
-                .to_string(),
-        );
+        return Err("Không tìm thấy tệp JSON tài khoản hợp lệ trong thư mục.".to_string());
     }
 
     let json_array = serde_json::to_string(&parsed_items)

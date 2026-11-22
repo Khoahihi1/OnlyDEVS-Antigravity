@@ -1,4 +1,4 @@
-﻿.agx-overview-page,
+.agx-overview-page,
 .agx-overview-page * {
   box-sizing: border-box;
 }
@@ -9,7 +9,7 @@
   --agx-overview-subtle: #969ba4;
   --agx-overview-line: #e2e5e9;
   --agx-overview-panel: rgba(255, 255, 255, 0.88);
-  --agx-overview-blue: #2563eb;
+  --agx-overview-blue: var(--agx-primary);
   --agx-overview-green: #14804a;
   min-width: 0;
   display: grid;
@@ -130,7 +130,7 @@
   align-items: center;
   justify-content: center;
   gap: 7px;
-  border: 1px solid #1d4ed8;
+  border: 1px solid var(--agx-primary-hover);
   border-radius: 7px;
   padding: 0 13px;
   color: #ffffff;
@@ -143,8 +143,8 @@
 
 .agx-overview-home-control button:hover:not(:disabled),
 .agx-overview-update-strip button:hover:not(:disabled) {
-  border-color: #1e40af;
-  background: #1d4ed8;
+  border-color: var(--agx-primary-hover);
+  background: var(--agx-primary-hover);
 }
 
 .agx-overview-home-control button:focus-visible,
@@ -189,7 +189,7 @@
 
 .agx-overview-update-dot {
   margin-top: 6px;
-  background: #2563eb;
+  background: var(--agx-primary);
   box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.1);
 }
 

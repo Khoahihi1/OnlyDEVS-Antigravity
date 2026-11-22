@@ -1,4 +1,4 @@
-﻿/* Shared sizing for full-size form fields. Compact list controls use the
+/* Shared sizing for full-size form fields. Compact list controls use the
    smaller primitive explicitly; code editors keep their natural height. */
 :root[data-theme] .agx-providers-field input:not([role="combobox"]):not(:disabled),
 :root[data-theme] .agx-provider-header-field > input:not(:disabled),
@@ -35,8 +35,8 @@
 .agx-prompts-field input:focus,
 .agx-failover input:not([aria-invalid="true"]):focus {
   outline: none;
-  border-color: var(--ui-control-accent, #2563eb);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-control-accent, #2563eb) 15%, transparent);
+  border-color: var(--ui-control-accent, var(--agx-primary));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-control-accent, var(--agx-primary)) 15%, transparent);
 }
 
 .agx-failover-field-input > span {

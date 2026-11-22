@@ -1,5 +1,6 @@
 mod accounts;
 mod antigravity_token_usage;
+mod api_service;
 mod config;
 mod mcp_skills;
 mod paths;
@@ -284,7 +285,7 @@ fn save_item_note(kind: String, id: String, note: String) -> Result<(), String> 
 }
 
 // ============================================================================
-// Antigravity Account Commands (ported from cockpit-tools)
+// Antigravity Account Commands
 // ============================================================================
 
 #[tauri::command]
@@ -327,11 +328,20 @@ async fn refresh_all_quotas() -> Result<accounts::RefreshStats, String> {
 }
 
 #[tauri::command]
+fn detect_launch_targets() -> Vec<accounts::LaunchTargetInfo> {
+    accounts::detect_antigravity_launch_targets()
+}
+
+#[tauri::command]
 async fn switch_account(
     account_id: String,
     switch_target: Option<String>,
+    launch: Option<bool>,
+    custom_path: Option<String>,
+    working_dir: Option<String>,
 ) -> Result<accounts::AntigravityAccount, String> {
-    accounts::switch_antigravity_account(account_id, switch_target).await
+    accounts::switch_antigravity_account(account_id, switch_target, launch, custom_path, working_dir)
+        .await
 }
 
 #[tauri::command]
@@ -433,8 +443,10 @@ fn save_account_custom_sort(account_ids: Vec<String>) -> Result<Vec<String>, Str
 }
 
 #[tauri::command]
-async fn import_accounts_from_cockpit() -> Result<Vec<accounts::AntigravityAccount>, String> {
-    accounts::import_accounts_from_cockpit().await
+async fn import_accounts_from_directory(
+    dir_path: String,
+) -> Result<Vec<accounts::AntigravityAccount>, String> {
+    accounts::import_accounts_from_directory(dir_path).await
 }
 
 #[tauri::command]
@@ -544,10 +556,104 @@ async fn download_and_install_update(
         .await
 }
 
+#[tauri::command]
+fn api_service_get_status() -> Result<api_service::ApiServiceStatus, String> {
+    api_service::get_status()
+}
+
+#[tauri::command]
+async fn api_service_start() -> Result<api_service::ApiServiceStatus, String> {
+    api_service::start_server().await
+}
+
+#[tauri::command]
+fn api_service_stop() -> Result<api_service::ApiServiceStatus, String> {
+    api_service::stop_server()
+}
+
+#[tauri::command]
+async fn api_service_restart() -> Result<api_service::ApiServiceStatus, String> {
+    api_service::restart_server().await
+}
+
+#[tauri::command]
+fn api_service_save_config(
+    config: api_service::ApiServiceConfig,
+) -> Result<api_service::ApiServiceConfig, String> {
+    api_service::save_config(config)
+}
+
+#[tauri::command]
+fn api_service_create_key(
+    label: String,
+    allowed_models: Vec<String>,
+    pinned_account_ids: Vec<String>,
+) -> Result<api_service::ApiKeyRecord, String> {
+    api_service::create_api_key(label, allowed_models, pinned_account_ids)
+}
+
+#[tauri::command]
+fn api_service_update_key(
+    id: String,
+    label: Option<String>,
+    enabled: Option<bool>,
+    allowed_models: Option<Vec<String>>,
+    pinned_account_ids: Option<Vec<String>>,
+) -> Result<api_service::ApiKeyRecord, String> {
+    api_service::update_api_key(id, label, enabled, allowed_models, pinned_account_ids)
+}
+
+#[tauri::command]
+fn api_service_rotate_key(id: String) -> Result<api_service::ApiKeyRecord, String> {
+    api_service::rotate_api_key(id)
+}
+
+#[tauri::command]
+fn api_service_delete_key(id: String) -> Result<(), String> {
+    api_service::delete_api_key(id)
+}
+
+#[tauri::command]
+fn api_service_clear_cooldowns(account_id: Option<String>) -> Result<(), String> {
+    api_service::clear_account_cooldowns(account_id)
+}
+
+#[tauri::command]
+fn api_service_list_models() -> Result<Vec<api_service::ApiAvailableModel>, String> {
+    api_service::list_available_models()
+}
+
+#[tauri::command]
+fn api_service_list_logs(limit: Option<usize>) -> Result<Vec<api_service::ApiRequestLogItem>, String> {
+    api_service::list_request_logs(limit)
+}
+
+#[tauri::command]
+fn api_service_clear_logs() -> Result<(), String> {
+    api_service::clear_request_logs()
+}
+
+#[tauri::command]
+fn api_service_get_usage(range: Option<String>) -> Result<api_service::ApiServiceUsageSummary, String> {
+    api_service::get_usage_summary(range)
+}
+
+#[tauri::command]
+async fn api_service_test_chat(
+    model: String,
+    prompt: String,
+) -> Result<api_service::ApiTestChatResult, String> {
+    api_service::test_chat_completion(model, prompt).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .setup(|_app| {
+            api_service::spawn_auto_start_if_enabled();
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_overview_state,
             get_config_raw,
@@ -599,6 +705,7 @@ pub fn run() {
             export_accounts,
             fetch_account_quota,
             refresh_all_quotas,
+            detect_launch_targets,
             switch_account,
             update_account_metadata,
             delete_accounts,
@@ -614,7 +721,7 @@ pub fn run() {
             assign_accounts_to_group,
             get_account_custom_sort,
             save_account_custom_sort,
-            import_accounts_from_cockpit,
+            import_accounts_from_directory,
             pick_folder_dialog,
             antigravity_query_token_usage,
             antigravity_sync_token_usage,
@@ -627,6 +734,21 @@ pub fn run() {
             check_version_jump,
             check_for_updates,
             download_and_install_update,
+            api_service_get_status,
+            api_service_start,
+            api_service_stop,
+            api_service_restart,
+            api_service_save_config,
+            api_service_create_key,
+            api_service_update_key,
+            api_service_rotate_key,
+            api_service_delete_key,
+            api_service_clear_cooldowns,
+            api_service_list_models,
+            api_service_list_logs,
+            api_service_clear_logs,
+            api_service_get_usage,
+            api_service_test_chat,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
