@@ -1,11 +1,10 @@
 import { useEffect, useState } from "react";
 import {
+  AlertTriangle,
   Download,
   ExternalLink,
   Loader2,
   Rocket,
-  SkipForward,
-  X,
 } from "lucide-react";
 import type {
   AppLanguage,
@@ -17,6 +16,7 @@ import { agxInvoke, isTauri, openExternalUrl } from "../platform/invoke";
 type UpdateNotificationProps = {
   lang: AppLanguage;
   update: UpdateCheckResult | null;
+  required?: boolean;
   onClose: () => void;
   onSkipped: (version: string) => void;
 };
@@ -31,8 +31,8 @@ function formatBytes(bytes?: number | null): string {
 export function UpdateNotification({
   lang,
   update,
+  required = true,
   onClose,
-  onSkipped,
 }: UpdateNotificationProps) {
   const vi = lang === "vi";
   const [installing, setInstalling] = useState(false);
@@ -60,7 +60,22 @@ export function UpdateNotification({
     };
   }, [update]);
 
+  // Block Escape key when mandatory update gate is active
+  useEffect(() => {
+    if (!update || !required) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [update, required]);
+
   if (!update) return null;
+
+  const isMandatory = required && update.hasUpdate;
 
   const handleInstall = async () => {
     if (!update.downloadUrl) {
@@ -69,7 +84,12 @@ export function UpdateNotification({
     }
     setInstalling(true);
     setError(null);
-    setProgress({ downloaded: 0, total: update.assetSize, percent: 0, status: "downloading" });
+    setProgress({
+      downloaded: 0,
+      total: update.assetSize,
+      percent: 0,
+      status: "downloading",
+    });
     try {
       await agxInvoke<string>("download_and_install_update", {
         downloadUrl: update.downloadUrl,
@@ -82,29 +102,35 @@ export function UpdateNotification({
     }
   };
 
-  const handleSkip = async () => {
-    try {
-      await agxInvoke("patch_update_settings", {
-        skippedVersion: update.latestVersion,
-      });
-      onSkipped(update.latestVersion);
-    } finally {
-      onClose();
-    }
-  };
-
   return (
-    <div className="agx-modal-backdrop" onClick={() => !installing && onClose()}>
+    <div
+      className="agx-modal-backdrop"
+      style={{ zIndex: 9999 }}
+      onClick={() => {
+        if (!installing && !isMandatory) onClose();
+      }}
+    >
       <div className="agx-modal agx-modal--wide" onClick={(e) => e.stopPropagation()}>
         <div className="agx-modal-head">
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <Rocket size={18} style={{ color: "var(--agx-primary)" }} />
+            {isMandatory ? (
+              <AlertTriangle size={20} style={{ color: "#ef2328" }} />
+            ) : (
+              <Rocket size={18} style={{ color: "var(--agx-primary)" }} />
+            )}
             <div>
-              <h3>
-                {vi
-                  ? `Đã có phiên bản mới: v${update.latestVersion}`
-                  : `New Version Available: v${update.latestVersion}`}
-              </h3>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                <h3>
+                  {vi
+                    ? `Phiên bản mới v${update.latestVersion}`
+                    : `New Version v${update.latestVersion}`}
+                </h3>
+                {isMandatory ? (
+                  <span className="agx-badge agx-badge--brand">
+                    {vi ? "Bắt buộc cập nhật" : "Update Required"}
+                  </span>
+                ) : null}
+              </div>
               <span className="agx-muted">
                 v{update.currentVersion} → v{update.latestVersion}
                 {update.assetName ? ` · ${update.assetName}` : ""}
@@ -112,14 +138,27 @@ export function UpdateNotification({
               </span>
             </div>
           </div>
-          {!installing ? (
-            <button type="button" className="agx-icon-btn" onClick={onClose}>
-              <X size={16} />
-            </button>
-          ) : null}
         </div>
 
         <div className="agx-modal-body">
+          {isMandatory ? (
+            <div
+              style={{
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid rgba(239, 35, 40, 0.35)",
+                background: "rgba(239, 35, 40, 0.08)",
+                fontSize: 12.5,
+                fontWeight: 600,
+                marginBottom: 12,
+              }}
+            >
+              {vi
+                ? `Bạn đang dùng bản cũ (v${update.currentVersion}). Vui lòng cập nhật lên v${update.latestVersion} để tiếp tục sử dụng.`
+                : `You are running an outdated version (v${update.currentVersion}). Please update to v${update.latestVersion} to continue.`}
+            </div>
+          ) : null}
+
           {update.releaseNotes ? (
             <div className="agx-update-notes">
               <pre>{update.releaseNotes}</pre>
@@ -127,8 +166,8 @@ export function UpdateNotification({
           ) : (
             <p className="agx-muted">
               {vi
-                ? "Bản phát hành mới đã sẵn sàng trên GitHub Releases với các cải tiến và bản vá mới nhất."
-                : "A new release is ready on GitHub Releases with latest improvements and fixes."}
+                ? "Bản phát hành mới đã sẵn sàng trên GitHub Releases với các bản vá và tính năng mới nhất."
+                : "A new release is ready on GitHub Releases with the latest fixes and improvements."}
             </p>
           )}
 
@@ -141,8 +180,8 @@ export function UpdateNotification({
                       ? "Đang khởi chạy trình cài đặt Setup..."
                       : "Launching setup installer..."
                     : vi
-                      ? "Đang tải gói cài đặt..."
-                      : "Downloading installer..."}
+                      ? "Đang tải bản cập nhật..."
+                      : "Downloading update..."}
                 </span>
                 <strong>
                   {progress.total
@@ -165,54 +204,35 @@ export function UpdateNotification({
         <div className="agx-modal-foot" style={{ justifyContent: "space-between" }}>
           <button
             type="button"
-            className="agx-btn agx-btn--ghost"
+            className="agx-btn agx-btn--secondary"
             disabled={installing}
-            onClick={() => void handleSkip()}
+            onClick={() => void openExternalUrl(update.releaseUrl)}
           >
-            <SkipForward size={14} />
-            <span>{vi ? "Bỏ qua bản này" : "Skip this version"}</span>
+            <ExternalLink size={14} />
+            <span>{vi ? "Tải thủ công (GitHub)" : "Manual Download"}</span>
           </button>
 
-          <div style={{ display: "flex", gap: 8 }}>
-            <button
-              type="button"
-              className="agx-btn agx-btn--secondary"
-              disabled={installing}
-              onClick={() => void openExternalUrl(update.releaseUrl)}
-            >
-              <ExternalLink size={14} />
-              <span>GitHub Releases</span>
-            </button>
-            <button
-              type="button"
-              className="agx-btn agx-btn--secondary"
-              disabled={installing}
-              onClick={onClose}
-            >
-              {vi ? "Để sau" : "Later"}
-            </button>
-            <button
-              type="button"
-              className="agx-btn agx-btn--primary"
-              disabled={installing}
-              onClick={() => void handleInstall()}
-            >
-              {installing ? (
-                <Loader2 size={14} className="spin" />
-              ) : (
-                <Download size={14} />
-              )}
-              <span>
-                {installing
-                  ? vi
-                    ? "Đang tải..."
-                    : "Downloading..."
-                  : vi
-                    ? "Cập nhật ngay"
-                    : "Update Now"}
-              </span>
-            </button>
-          </div>
+          <button
+            type="button"
+            className="agx-btn agx-btn--primary"
+            disabled={installing}
+            onClick={() => void handleInstall()}
+          >
+            {installing ? (
+              <Loader2 size={14} className="spin" />
+            ) : (
+              <Download size={14} />
+            )}
+            <span>
+              {installing
+                ? vi
+                  ? "Đang tải & cài đặt..."
+                  : "Downloading & Installing..."
+                : vi
+                  ? `Cập nhật lên v${update.latestVersion} ngay`
+                  : `Update to v${update.latestVersion} Now`}
+            </span>
+          </button>
         </div>
       </div>
     </div>

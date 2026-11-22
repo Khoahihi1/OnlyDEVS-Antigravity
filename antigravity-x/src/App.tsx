@@ -175,9 +175,22 @@ export default function App() {
     void refreshAll();
   }, [refreshAll]);
 
-  // Startup version jump notice + silent background update check
+  // Startup version jump notice + mandatory update check on launch & every 15m
   useEffect(() => {
     let active = true;
+    const runMandatoryCheck = async () => {
+      try {
+        const res = await agxInvoke<UpdateCheckResult>("check_for_updates", {
+          force: true,
+        });
+        if (active && res.hasUpdate) {
+          setPendingUpdate(res);
+        }
+      } catch {
+        // offline or GitHub unreachable — do not block startup
+      }
+    };
+
     void (async () => {
       try {
         const jump = await agxInvoke<VersionJumpInfo | null>("check_version_jump");
@@ -189,21 +202,16 @@ export default function App() {
       } catch {
         // ignore
       }
-      try {
-        const shouldCheck = await agxInvoke<boolean>("should_check_updates");
-        if (!active || !shouldCheck) return;
-        const res = await agxInvoke<UpdateCheckResult>("check_for_updates", {
-          force: false,
-        });
-        if (active && res.hasUpdate && !res.skipped) {
-          setPendingUpdate(res);
-        }
-      } catch {
-        // silent background check
-      }
+      await runMandatoryCheck();
     })();
+
+    const timer = window.setInterval(() => {
+      void runMandatoryCheck();
+    }, 15 * 60 * 1000);
+
     return () => {
       active = false;
+      window.clearInterval(timer);
     };
   }, [showToast]);
 
