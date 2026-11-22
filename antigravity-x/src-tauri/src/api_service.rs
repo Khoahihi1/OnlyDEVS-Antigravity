@@ -83,18 +83,26 @@ pub struct ModelAliasRule {
     pub enabled: bool,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiServiceConfig {
     pub port: u16,
     /// "local" -> 127.0.0.1, "lan" -> 0.0.0.0
     pub access_scope: String,
-    /// "round_robin" | "highest_quota" | "sticky_session" | "failover"
+    /// "smart" | "highest_quota" | "round_robin" | "sticky_session" | "failover"
     pub routing_strategy: String,
     /// Account IDs in the API service pool; empty = use all active accounts
     pub member_account_ids: Vec<String>,
     /// If true and member_account_ids is empty, automatically include all non-disabled accounts
     pub use_all_accounts_when_empty: bool,
+    /// If true, prefer Classic (3.8/Claude 4.6) accounts for shared models (3.8/3-flash)
+    /// to preserve Gemini quota on Full/Next-Gen (Argon/G4/Claude 5.5) accounts
+    #[serde(default = "default_true")]
+    pub preserve_exclusive_accounts: bool,
     pub auto_start: bool,
     pub timeout_seconds: u64,
     pub max_retries: u32,
@@ -108,9 +116,10 @@ impl Default for ApiServiceConfig {
         Self {
             port: 57120,
             access_scope: "local".into(),
-            routing_strategy: "highest_quota".into(),
+            routing_strategy: "smart".into(),
             member_account_ids: Vec::new(),
             use_all_accounts_when_empty: true,
+            preserve_exclusive_accounts: true,
             auto_start: false,
             timeout_seconds: 180,
             max_retries: 2,
@@ -167,6 +176,7 @@ pub struct ApiKeyRecord {
 pub struct AccountCooldownInfo {
     pub account_id: String,
     pub email: String,
+    pub scope: String,
     pub until_ts: i64,
     pub remaining_seconds: i64,
     pub reason: String,
@@ -184,6 +194,9 @@ pub struct ApiServiceStatus {
     pub active_requests: usize,
     pub pool_total: usize,
     pub pool_healthy: usize,
+    pub pool_full_nextgen: usize,
+    pub pool_classic: usize,
+    pub pool_unknown: usize,
     pub cooldowns: Vec<AccountCooldownInfo>,
     pub config: ApiServiceConfig,
     pub keys: Vec<ApiKeyRecord>,
@@ -197,6 +210,8 @@ pub struct ApiAvailableModel {
     pub family: String,
     pub thinking: bool,
     pub source: String,
+    pub supported_account_count: usize,
+    pub pool_account_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,7 +311,9 @@ struct RunningServer {
 }
 
 struct CooldownEntry {
+    account_id: String,
     email: String,
+    scope: String,
     until_ts: i64,
     reason: String,
 }
@@ -304,15 +321,22 @@ struct CooldownEntry {
 static SERVER_STATE: OnceLock<Mutex<Option<RunningServer>>> = OnceLock::new();
 static ACTIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static RR_COUNTER: AtomicUsize = AtomicUsize::new(0);
-static COOLDOWNS: OnceLock<Mutex<HashMap<String, CooldownEntry>>> = OnceLock::new();
+/// Keyed by "(account_id, scope)" where scope is "all" | "gemini" | "claude" | "argon" | "carbon"
+static COOLDOWNS: OnceLock<Mutex<HashMap<(String, String), CooldownEntry>>> = OnceLock::new();
+/// Runtime-learned model incompatibilities: (account_id, lower_model_id) -> expires_at_ts
+static UNSUPPORTED_MODELS: OnceLock<Mutex<HashMap<(String, String), i64>>> = OnceLock::new();
 static STICKY_MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 fn server_lock() -> &'static Mutex<Option<RunningServer>> {
     SERVER_STATE.get_or_init(|| Mutex::new(None))
 }
 
-fn cooldown_lock() -> &'static Mutex<HashMap<String, CooldownEntry>> {
+fn cooldown_lock() -> &'static Mutex<HashMap<(String, String), CooldownEntry>> {
     COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn unsupported_models_lock() -> &'static Mutex<HashMap<(String, String), i64>> {
+    UNSUPPORTED_MODELS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn sticky_lock() -> &'static Mutex<HashMap<String, String>> {
@@ -644,8 +668,128 @@ fn record_api_log(item: &ApiRequestLogItem) {
 }
 
 // ============================================================================
-// Cooldown & Pool Management
+// Cooldown, Model-Compatibility & Smart Pool Management
 // ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountProfile {
+    /// Next-Gen / Full model accounts (Gemini 4 Argon / Neon / Hydrogen, Claude 5.5)
+    FullNextgen,
+    /// Classic accounts (Gemini 3.8 + Claude 4.6, no Argon / G4 / Claude 5.5)
+    Classic,
+    /// Quota not yet fetched (no model inventory known)
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ModelSupport {
+    /// Quota fetched & does NOT list this model (or runtime 404 cached for this account+model)
+    Unsupported = 0,
+    /// Quota not fetched yet -> fallback only when no Exact account is available
+    Unknown = 1,
+    /// Quota fetched & explicitly lists this model
+    Exact = 2,
+}
+
+fn is_real_model_entry(name: &str) -> bool {
+    let n = name.trim();
+    if n.is_empty() {
+        return false;
+    }
+    let lower = n.to_ascii_lowercase();
+    !(lower.contains(':')
+        || lower.ends_with("-5h")
+        || lower.ends_with("-weekly")
+        || lower.starts_with("tab_")
+        || lower.starts_with("chat_")
+        || lower.contains("wtu"))
+}
+
+fn model_quota_scope(model: &str) -> &'static str {
+    let lower = model.trim().to_ascii_lowercase();
+    if lower.contains("argon") {
+        "argon"
+    } else if lower.contains("carbon") {
+        "carbon"
+    } else if lower.contains("claude") {
+        "claude"
+    } else {
+        "gemini"
+    }
+}
+
+fn classify_account_profile(acc: &AntigravityAccount) -> AccountProfile {
+    let Some(q) = acc.quota.as_ref() else {
+        return AccountProfile::Unknown;
+    };
+    let mut has_any_real_model = false;
+    for m in &q.models {
+        let lower = m.name.trim().to_ascii_lowercase();
+        if lower == "gemini-argon-wtu-weekly"
+            || lower == "argon:weekly"
+            || lower.starts_with("gemini-4-argon")
+            || lower.starts_with("gemini-4-neon")
+            || lower.starts_with("claude-sonnet-5-5")
+            || lower.starts_with("claude-opus-5-5")
+            || (lower.starts_with("gemini-4-hydrogen") && !lower.ends_with("sonar"))
+        {
+            return AccountProfile::FullNextgen;
+        }
+        if is_real_model_entry(&m.name) {
+            has_any_real_model = true;
+        }
+    }
+    if has_any_real_model {
+        AccountProfile::Classic
+    } else {
+        AccountProfile::Unknown
+    }
+}
+
+fn is_runtime_unsupported(account_id: &str, model: &str) -> bool {
+    let now = Utc::now().timestamp();
+    let key = (account_id.to_string(), model.trim().to_ascii_lowercase());
+    let Ok(map) = unsupported_models_lock().lock() else {
+        return false;
+    };
+    map.get(&key).is_some_and(|&until| until > now)
+}
+
+fn mark_runtime_unsupported(account_id: &str, model: &str, ttl_secs: i64) {
+    let until = Utc::now().timestamp() + ttl_secs.max(60);
+    let key = (account_id.to_string(), model.trim().to_ascii_lowercase());
+    if let Ok(mut map) = unsupported_models_lock().lock() {
+        map.insert(key, until);
+    }
+}
+
+fn account_model_support(acc: &AntigravityAccount, model: &str) -> ModelSupport {
+    let target = model.trim().to_ascii_lowercase();
+    if is_runtime_unsupported(&acc.id, &target) {
+        return ModelSupport::Unsupported;
+    }
+    let Some(q) = acc.quota.as_ref() else {
+        return ModelSupport::Unknown;
+    };
+    if q.is_forbidden {
+        return ModelSupport::Unsupported;
+    }
+    let mut has_any_real_model = false;
+    for m in &q.models {
+        if !is_real_model_entry(&m.name) {
+            continue;
+        }
+        has_any_real_model = true;
+        if m.name.trim().eq_ignore_ascii_case(&target) {
+            return ModelSupport::Exact;
+        }
+    }
+    if !has_any_real_model {
+        ModelSupport::Unknown
+    } else {
+        ModelSupport::Unsupported
+    }
+}
 
 fn active_cooldowns() -> Vec<AccountCooldownInfo> {
     let now = Utc::now().timestamp();
@@ -653,10 +797,11 @@ fn active_cooldowns() -> Vec<AccountCooldownInfo> {
         return Vec::new();
     };
     map.retain(|_, v| v.until_ts > now);
-    map.iter()
-        .map(|(id, e)| AccountCooldownInfo {
-            account_id: id.clone(),
+    map.values()
+        .map(|e| AccountCooldownInfo {
+            account_id: e.account_id.clone(),
             email: e.email.clone(),
+            scope: e.scope.clone(),
             until_ts: e.until_ts,
             remaining_seconds: (e.until_ts - now).max(0),
             reason: e.reason.clone(),
@@ -664,13 +809,22 @@ fn active_cooldowns() -> Vec<AccountCooldownInfo> {
         .collect()
 }
 
-fn mark_account_cooldown(account_id: &str, email: &str, seconds: u64, reason: String) {
+fn mark_account_cooldown(
+    account_id: &str,
+    email: &str,
+    scope: &str,
+    seconds: u64,
+    reason: String,
+) {
     let until_ts = Utc::now().timestamp() + (seconds.max(5) as i64);
+    let scope_clean = if scope.trim().is_empty() { "all" } else { scope.trim() };
     if let Ok(mut map) = cooldown_lock().lock() {
         map.insert(
-            account_id.to_string(),
+            (account_id.to_string(), scope_clean.to_string()),
             CooldownEntry {
+                account_id: account_id.to_string(),
                 email: email.to_string(),
+                scope: scope_clean.to_string(),
                 until_ts,
                 reason,
             },
@@ -680,21 +834,42 @@ fn mark_account_cooldown(account_id: &str, email: &str, seconds: u64, reason: St
 
 pub fn clear_account_cooldowns(account_id: Option<String>) -> Result<(), String> {
     if let Ok(mut map) = cooldown_lock().lock() {
-        if let Some(id) = account_id.filter(|s| !s.trim().is_empty()) {
-            map.remove(&id);
+        if let Some(id) = account_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            map.retain(|(acc_id, _), _| acc_id != id);
         } else {
             map.clear();
+        }
+    }
+    if let Ok(mut umap) = unsupported_models_lock().lock() {
+        if let Some(id) = account_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            umap.retain(|(acc_id, _), _| acc_id != id);
+        } else {
+            umap.clear();
         }
     }
     Ok(())
 }
 
-fn is_on_cooldown(account_id: &str) -> bool {
+fn is_on_cooldown_for_model(account_id: &str, model: &str) -> bool {
+    let now = Utc::now().timestamp();
+    let scope = model_quota_scope(model);
+    let Ok(map) = cooldown_lock().lock() else {
+        return false;
+    };
+    map.get(&(account_id.to_string(), "all".to_string()))
+        .is_some_and(|e| e.until_ts > now)
+        || map
+            .get(&(account_id.to_string(), scope.to_string()))
+            .is_some_and(|e| e.until_ts > now)
+}
+
+fn is_fully_cooled_down(account_id: &str) -> bool {
     let now = Utc::now().timestamp();
     let Ok(map) = cooldown_lock().lock() else {
         return false;
     };
-    map.get(account_id).is_some_and(|e| e.until_ts > now)
+    map.get(&(account_id.to_string(), "all".to_string()))
+        .is_some_and(|e| e.until_ts > now)
 }
 
 fn parse_retry_seconds_from_body(body: &str, default_secs: u64) -> u64 {
@@ -720,29 +895,275 @@ fn account_quota_score(acc: &AntigravityAccount, model: &str) -> i32 {
     if q.is_forbidden {
         return -100;
     }
-    let lower = model.to_ascii_lowercase();
-    let preferred_bucket = if lower.contains("claude") {
-        "claude:5h"
-    } else if lower.contains("argon") {
-        "argon:weekly"
-    } else if lower.contains("carbon") {
-        "carbon:weekly"
-    } else {
-        "gemini:5h"
-    };
+    let lower = model.trim().to_ascii_lowercase();
+    let scope = model_quota_scope(&lower);
+
+    let mut exact_pct: Option<i32> = None;
+    let mut bucket_5h: Option<i32> = None;
+    let mut bucket_weekly: Option<i32> = None;
+    let mut bucket_exhausted = false;
+
     for m in &q.models {
-        if m.name == preferred_bucket
-            || (preferred_bucket == "claude:5h" && m.name == "3p-5h")
-            || (preferred_bucket == "gemini:5h" && m.name == "gemini-5h")
-        {
-            return m.percentage;
+        let name = m.name.trim().to_ascii_lowercase();
+        if name == lower {
+            exact_pct = Some(m.percentage);
+            if m.summary_exhausted == Some(true) {
+                bucket_exhausted = true;
+            }
+        }
+        match scope {
+            "argon" => {
+                if name == "gemini-argon-wtu-weekly" || name == "argon:weekly" {
+                    bucket_weekly = Some(m.percentage);
+                    if m.summary_exhausted == Some(true) {
+                        bucket_exhausted = true;
+                    }
+                }
+            }
+            "carbon" => {
+                if name == "gemini-carbon-wtu-weekly" || name == "carbon:weekly" {
+                    bucket_weekly = Some(m.percentage);
+                    if m.summary_exhausted == Some(true) {
+                        bucket_exhausted = true;
+                    }
+                }
+            }
+            "claude" => {
+                if name == "3p-5h" || name == "claude:5h" {
+                    bucket_5h = Some(m.percentage);
+                    if m.summary_exhausted == Some(true) {
+                        bucket_exhausted = true;
+                    }
+                } else if name == "3p-weekly" || name == "claude:weekly" {
+                    bucket_weekly = Some(m.percentage);
+                    if m.summary_exhausted == Some(true) {
+                        bucket_exhausted = true;
+                    }
+                }
+            }
+            _ => {
+                if name == "gemini-5h" || name == "gemini:5h" {
+                    bucket_5h = Some(m.percentage);
+                    if m.summary_exhausted == Some(true) {
+                        bucket_exhausted = true;
+                    }
+                } else if name == "gemini-weekly" || name == "gemini:weekly" {
+                    bucket_weekly = Some(m.percentage);
+                    if m.summary_exhausted == Some(true) {
+                        bucket_exhausted = true;
+                    }
+                }
+            }
         }
     }
+
+    if bucket_exhausted {
+        return 0;
+    }
+
+    // Effective remaining quota is the bottleneck across exact model, 5h, and weekly limits
+    let mut candidates: Vec<i32> = Vec::with_capacity(3);
+    if let Some(p) = exact_pct {
+        candidates.push(p);
+    }
+    if let Some(p) = bucket_5h {
+        candidates.push(p);
+    }
+    if let Some(p) = bucket_weekly {
+        candidates.push(p);
+    }
+    if let Some(min_pct) = candidates.into_iter().min() {
+        return min_pct.clamp(0, 100);
+    }
+
     if q.models.is_empty() {
         return 50;
     }
     let sum: i32 = q.models.iter().map(|m| m.percentage).sum();
-    sum / (q.models.len() as i32)
+    (sum / (q.models.len() as i32)).clamp(0, 100)
+}
+
+fn select_pool_members(
+    all: Vec<AntigravityAccount>,
+    cfg: &ApiServiceConfig,
+    key: Option<&ApiKeyRecord>,
+) -> Vec<AntigravityAccount> {
+    all.into_iter()
+        .filter(|a| {
+            if a.disabled || a.token.refresh_token.trim().is_empty() {
+                return false;
+            }
+            if let Some(k) = key {
+                if !k.pinned_account_ids.is_empty() {
+                    return k.pinned_account_ids.contains(&a.id);
+                }
+            }
+            if !cfg.member_account_ids.is_empty() {
+                return cfg.member_account_ids.contains(&a.id);
+            }
+            cfg.use_all_accounts_when_empty
+        })
+        .collect()
+}
+
+fn rank_pool_candidates(
+    all_members: Vec<AntigravityAccount>,
+    cfg: &ApiServiceConfig,
+    key_id: &str,
+    model: &str,
+    excluded: &HashSet<String>,
+) -> Vec<AntigravityAccount> {
+    let base: Vec<AntigravityAccount> = all_members
+        .into_iter()
+        .filter(|a| !excluded.contains(&a.id))
+        .collect();
+
+    if base.is_empty() {
+        return Vec::new();
+    }
+
+    // 1. STRICT MODEL COMPATIBILITY FILTER:
+    //    - Exact accounts (verified to have `model`) are always preferred.
+    //    - Unknown accounts (quota never fetched yet) serve only as fallback.
+    //    - Unsupported accounts (quota fetched & missing `model`, or runtime 404) are NEVER routed!
+    let mut exact_accs: Vec<AntigravityAccount> = Vec::new();
+    let mut unknown_accs: Vec<AntigravityAccount> = Vec::new();
+
+    for acc in base {
+        match account_model_support(&acc, model) {
+            ModelSupport::Exact => exact_accs.push(acc),
+            ModelSupport::Unknown => unknown_accs.push(acc),
+            ModelSupport::Unsupported => {}
+        }
+    }
+
+    // Detect if this model is a SHARED model present on both Classic and Full/Next-Gen accounts
+    let has_classic_exact = exact_accs
+        .iter()
+        .any(|a| classify_account_profile(a) == AccountProfile::Classic);
+    let has_full_exact = exact_accs
+        .iter()
+        .any(|a| classify_account_profile(a) == AccountProfile::FullNextgen);
+    let is_shared_across_profiles = has_classic_exact && has_full_exact;
+    let should_preserve_full = cfg.preserve_exclusive_accounts
+        && is_shared_across_profiles
+        && matches!(cfg.routing_strategy.as_str(), "smart" | "highest_quota");
+
+    let order_group = |mut group: Vec<AntigravityAccount>| -> Vec<AntigravityAccount> {
+        if group.is_empty() {
+            return group;
+        }
+        // Prefer accounts NOT cooling down for this model's bucket; fall back to cooled-down only if all are cooling down
+        let (healthy, cooled): (Vec<_>, Vec<_>) = group
+            .into_iter()
+            .partition(|a| !is_on_cooldown_for_model(&a.id, model));
+        group = if !healthy.is_empty() { healthy } else { cooled };
+
+        match cfg.routing_strategy.as_str() {
+            "smart" => {
+                // Tier 1: has remaining quota > 0 vs exhausted (0)
+                // Tier 2: if shared model & preserve_exclusive_accounts -> prefer Classic accounts
+                //         with healthy quota (> 15%) so Full/Argon accounts save quota for G4/Argon/C5.5!
+                // Tier 3: highest effective quota score for this exact model & bucket
+                group.sort_by(|a, b| {
+                    let score_a = account_quota_score(a, model);
+                    let score_b = account_quota_score(b, model);
+                    let alive_a = score_a > 0;
+                    let alive_b = score_b > 0;
+                    let pref_a = should_preserve_full
+                        && classify_account_profile(a) == AccountProfile::Classic
+                        && score_a > 15;
+                    let pref_b = should_preserve_full
+                        && classify_account_profile(b) == AccountProfile::Classic
+                        && score_b > 15;
+
+                    alive_b
+                        .cmp(&alive_a)
+                        .then_with(|| pref_b.cmp(&pref_a))
+                        .then_with(|| score_b.cmp(&score_a))
+                        .then_with(|| a.email.cmp(&b.email))
+                });
+            }
+            "highest_quota" => {
+                group.sort_by(|a, b| {
+                    let score_a = account_quota_score(a, model);
+                    let score_b = account_quota_score(b, model);
+                    let pref_a = should_preserve_full
+                        && classify_account_profile(a) == AccountProfile::Classic
+                        && score_a > 15;
+                    let pref_b = should_preserve_full
+                        && classify_account_profile(b) == AccountProfile::Classic
+                        && score_b > 15;
+                    (score_b > 0)
+                        .cmp(&(score_a > 0))
+                        .then_with(|| pref_b.cmp(&pref_a))
+                        .then_with(|| score_b.cmp(&score_a))
+                        .then_with(|| a.email.cmp(&b.email))
+                });
+            }
+            "round_robin" => {
+                // Keep >0 quota accounts ahead of 0% exhausted ones, then rotate
+                let (mut alive, exhausted): (Vec<_>, Vec<_>) = group
+                    .into_iter()
+                    .partition(|a| account_quota_score(a, model) > 0);
+                if !alive.is_empty() {
+                    let idx = RR_COUNTER.fetch_add(1, Ordering::Relaxed) % alive.len();
+                    alive.rotate_left(idx);
+                    alive.extend(exhausted);
+                    group = alive;
+                } else {
+                    group = exhausted;
+                }
+            }
+            "sticky_session" => {
+                let sticky_key = format!("{key_id}:{model}");
+                // Sort by quota first, then move sticky account to front if it's alive
+                group.sort_by(|a, b| {
+                    account_quota_score(b, model)
+                        .cmp(&account_quota_score(a, model))
+                        .then_with(|| a.email.cmp(&b.email))
+                });
+                if let Ok(map) = sticky_lock().lock() {
+                    if let Some(pinned_id) = map.get(&sticky_key) {
+                        if let Some(pos) = group
+                            .iter()
+                            .position(|a| &a.id == pinned_id && account_quota_score(a, model) > 0)
+                        {
+                            let chosen = group.remove(pos);
+                            group.insert(0, chosen);
+                        }
+                    }
+                }
+            }
+            _ => {
+                // failover: preserve member_account_ids order, keeping >0 quota first
+                if !cfg.member_account_ids.is_empty() {
+                    group.sort_by(|a, b| {
+                        let alive_a = account_quota_score(a, model) > 0;
+                        let alive_b = account_quota_score(b, model) > 0;
+                        let pos_a = cfg
+                            .member_account_ids
+                            .iter()
+                            .position(|id| id == &a.id)
+                            .unwrap_or(usize::MAX);
+                        let pos_b = cfg
+                            .member_account_ids
+                            .iter()
+                            .position(|id| id == &b.id)
+                            .unwrap_or(usize::MAX);
+                        alive_b.cmp(&alive_a).then_with(|| pos_a.cmp(&pos_b))
+                    });
+                }
+            }
+        }
+        group
+    };
+
+    let mut ordered = order_group(exact_accs);
+    if !unknown_accs.is_empty() {
+        ordered.extend(order_group(unknown_accs));
+    }
+    ordered
 }
 
 fn resolve_pool_accounts(
@@ -752,74 +1173,8 @@ fn resolve_pool_accounts(
     excluded: &HashSet<String>,
 ) -> Vec<AntigravityAccount> {
     let all = accounts::list_accounts_sync().unwrap_or_default();
-    let mut pool: Vec<AntigravityAccount> = all
-        .into_iter()
-        .filter(|a| {
-            if a.disabled || a.token.refresh_token.trim().is_empty() {
-                return false;
-            }
-            if excluded.contains(&a.id) {
-                return false;
-            }
-            if !key.pinned_account_ids.is_empty() {
-                return key.pinned_account_ids.contains(&a.id);
-            }
-            if !cfg.member_account_ids.is_empty() {
-                return cfg.member_account_ids.contains(&a.id);
-            }
-            cfg.use_all_accounts_when_empty
-        })
-        .collect();
-
-    // Filter out accounts currently on cooldown unless ALL are cooling down
-    let healthy: Vec<AntigravityAccount> = pool
-        .iter()
-        .filter(|a| !is_on_cooldown(&a.id))
-        .cloned()
-        .collect();
-    if !healthy.is_empty() {
-        pool = healthy;
-    }
-
-    match cfg.routing_strategy.as_str() {
-        "highest_quota" => {
-            pool.sort_by(|a, b| {
-                account_quota_score(b, model)
-                    .cmp(&account_quota_score(a, model))
-                    .then_with(|| a.email.cmp(&b.email))
-            });
-        }
-        "round_robin" => {
-            if !pool.is_empty() {
-                let idx = RR_COUNTER.fetch_add(1, Ordering::Relaxed) % pool.len();
-                pool.rotate_left(idx);
-            }
-        }
-        "sticky_session" => {
-            let sticky_key = format!("{}:{model}", key.id);
-            if let Ok(map) = sticky_lock().lock() {
-                if let Some(pinned_id) = map.get(&sticky_key) {
-                    if let Some(pos) = pool.iter().position(|a| &a.id == pinned_id) {
-                        let chosen = pool.remove(pos);
-                        pool.insert(0, chosen);
-                    }
-                }
-            }
-        }
-        _ => {
-            // failover: preserve member_account_ids order or current-first order
-            if !cfg.member_account_ids.is_empty() {
-                pool.sort_by_key(|a| {
-                    cfg.member_account_ids
-                        .iter()
-                        .position(|id| id == &a.id)
-                        .unwrap_or(usize::MAX)
-                });
-            }
-        }
-    }
-
-    pool
+    let members = select_pool_members(all, cfg, Some(key));
+    rank_pool_candidates(members, cfg, &key.id, model, excluded)
 }
 
 // ============================================================================
@@ -859,6 +1214,17 @@ fn resolve_model_alias(cfg: &ApiServiceConfig, requested: &str) -> String {
 pub fn list_available_models() -> Result<Vec<ApiAvailableModel>, String> {
     let mut seen = HashSet::new();
     let mut models = Vec::new();
+    let cfg = load_config().unwrap_or_default();
+    let all_accs = accounts::list_accounts_sync().unwrap_or_default();
+    let pool_accs = select_pool_members(all_accs.clone(), &cfg, None);
+    let pool_count = pool_accs.len();
+
+    let count_supporting = |target_model: &str| -> usize {
+        pool_accs
+            .iter()
+            .filter(|a| account_model_support(a, target_model) == ModelSupport::Exact)
+            .count()
+    };
 
     for (id, display, family, thinking) in BUILTIN_MODELS {
         seen.insert((*id).to_string());
@@ -868,66 +1234,60 @@ pub fn list_available_models() -> Result<Vec<ApiAvailableModel>, String> {
             family: (*family).to_string(),
             thinking: *thinking,
             source: "builtin".into(),
+            supported_account_count: count_supporting(id),
+            pool_account_count: pool_count,
         });
     }
 
     // Add live discovered models from user's fetched Antigravity accounts
-    if let Ok(accs) = accounts::list_accounts_sync() {
-        for acc in accs {
-            if let Some(q) = acc.quota {
-                for m in q.models {
-                    let n = m.name.trim();
-                    if n.is_empty()
-                        || n.contains(':')
-                        || n.ends_with("-5h")
-                        || n.ends_with("-weekly")
-                        || n.starts_with("tab_")
-                        || n.starts_with("chat_")
-                        || n.contains("wtu")
-                        || seen.contains(n)
-                    {
-                        continue;
-                    }
-                    seen.insert(n.to_string());
-                    let lower = n.to_ascii_lowercase();
-                    let family = if lower.contains("claude") {
-                        "claude"
-                    } else if lower.contains("image") {
-                        "image"
-                    } else if lower.contains("gpt") {
-                        "openai"
-                    } else {
-                        "gemini"
-                    };
-                    models.push(ApiAvailableModel {
-                        id: n.to_string(),
-                        display_name: m.display_name.unwrap_or_else(|| n.to_string()),
-                        family: family.into(),
-                        thinking: lower.contains("thinking")
-                            || lower.contains("pro")
-                            || lower.contains("argon")
-                            || lower.contains("carbon")
-                            || lower.contains("high"),
-                        source: "account-live".into(),
-                    });
+    for acc in all_accs {
+        if let Some(q) = acc.quota {
+            for m in q.models {
+                let n = m.name.trim();
+                if !is_real_model_entry(n) || seen.contains(n) {
+                    continue;
                 }
+                seen.insert(n.to_string());
+                let lower = n.to_ascii_lowercase();
+                let family = if lower.contains("claude") {
+                    "claude"
+                } else if lower.contains("image") {
+                    "image"
+                } else if lower.contains("gpt") {
+                    "openai"
+                } else {
+                    "gemini"
+                };
+                models.push(ApiAvailableModel {
+                    id: n.to_string(),
+                    display_name: m.display_name.unwrap_or_else(|| n.to_string()),
+                    family: family.into(),
+                    thinking: lower.contains("thinking")
+                        || lower.contains("pro")
+                        || lower.contains("argon")
+                        || lower.contains("carbon")
+                        || lower.contains("high"),
+                    source: "account-live".into(),
+                    supported_account_count: count_supporting(n),
+                    pool_account_count: pool_count,
+                });
             }
         }
     }
 
     // Add enabled custom aliases so clients see them in /v1/models too
-    if let Ok(cfg) = load_config() {
-        for rule in cfg.model_rules {
-            if rule.enabled && !rule.pattern.contains('*') && !seen.contains(&rule.pattern) {
-                seen.insert(rule.pattern.clone());
-                models.push(ApiAvailableModel {
-                    id: rule.pattern.clone(),
-                    display_name: format!("{} → {}", rule.pattern, rule.target_model),
-                    family: "alias".into(),
-                    thinking: true,
-                    source: "alias".into(),
-                });
-            }
+    for rule in cfg.model_rules {
+        if rule.enabled && !rule.pattern.contains('*') && !seen.contains(&rule.pattern) {
+            seen.insert(rule.pattern.clone());
+            models.push(ApiAvailableModel {
+                id: rule.pattern.clone(),
+                display_name: format!("{} → {}", rule.pattern, rule.target_model),
+                family: "alias".into(),
+                thinking: true,
+                source: "alias".into(),
+                supported_account_count: count_supporting(&rule.target_model),
+                pool_account_count: pool_count,
+            });
         }
     }
 
@@ -1631,22 +1991,75 @@ async fn send_upstream_with_failover(
 ) -> Result<(reqwest::Response, AntigravityAccount, String), (u16, String, String, String)> {
     let client = build_upstream_client(cfg)
         .map_err(|e| (500u16, e, String::new(), String::new()))?;
-    let mut tried = HashSet::new();
-    let max_attempts = (cfg.max_retries as usize) + 1;
-    let mut last_err = (503u16, "Không có tài khoản Antigravity khả dụng trong pool.".to_string(), String::new(), String::new());
+    let all_members = select_pool_members(
+        accounts::list_accounts_sync().unwrap_or_default(),
+        cfg,
+        Some(key),
+    );
+    let total_members = all_members.len();
+    if total_members == 0 {
+        return Err((
+            503u16,
+            "Không có tài khoản Antigravity khả dụng trong Pool.".to_string(),
+            String::new(),
+            String::new(),
+        ));
+    }
 
-    for _ in 0..max_attempts {
+    let initial_compatible = rank_pool_candidates(
+        all_members,
+        cfg,
+        &key.id,
+        resolved_model,
+        &HashSet::new(),
+    );
+    if initial_compatible.is_empty() {
+        return Err((
+            404u16,
+            format!(
+                "Không có tài khoản nào trong Pool (0/{total_members}) hỗ trợ model '{resolved_model}'. Hãy thêm/bật tài khoản có model này (vd: nhóm Full/Argon cho Gemini 4 & Claude 5.5, hoặc nhóm Classic cho Claude 4.6) và làm mới quota."
+            ),
+            String::new(),
+            String::new(),
+        ));
+    }
+
+    let scope = model_quota_scope(resolved_model);
+    let mut tried = HashSet::new();
+    // Allow trying up to max_retries+1 real upstream failures, while 404 model-mismatch
+    // failovers do NOT consume a retry slot (bounded by total compatible accounts).
+    let max_real_attempts = (cfg.max_retries as usize) + 1;
+    let mut real_attempts = 0usize;
+    let mut total_hops = 0usize;
+    let max_total_hops = initial_compatible.len().max(max_real_attempts).min(32);
+
+    let mut last_err = (
+        503u16,
+        format!("Không có tài khoản Antigravity khả dụng cho model '{resolved_model}'."),
+        String::new(),
+        String::new(),
+    );
+
+    while real_attempts < max_real_attempts && total_hops < max_total_hops {
         let candidates = resolve_pool_accounts(cfg, key, resolved_model, &tried);
         let Some(candidate) = candidates.into_iter().next() else {
             break;
         };
         tried.insert(candidate.id.clone());
+        total_hops += 1;
 
         let acc = match accounts::ensure_fresh_access_token(&candidate.id, false).await {
             Ok(a) => a,
             Err(e) => {
-                mark_account_cooldown(&candidate.id, &candidate.email, cfg.cooldown_seconds, e.clone());
+                mark_account_cooldown(
+                    &candidate.id,
+                    &candidate.email,
+                    "all",
+                    cfg.cooldown_seconds,
+                    e.clone(),
+                );
                 last_err = (401, e, candidate.id.clone(), candidate.email.clone());
+                real_attempts += 1;
                 continue;
             }
         };
@@ -1669,6 +2082,8 @@ async fn send_upstream_with_failover(
         };
 
         let mut succeeded = None;
+        let mut saw_model_not_found = false;
+        let mut saw_non_404_error = false;
         for base_url in ANTIGRAVITY_BASE_URLS {
             let url = format!("{base_url}/v1internal:{action}");
             let send_res = client
@@ -1714,26 +2129,36 @@ async fn send_upstream_with_failover(
                         }
                     }
                     if status == 429 || status == 503 || status == 500 || status == 502 {
+                        saw_non_404_error = true;
                         let cool = parse_retry_seconds_from_body(&err_body, cfg.cooldown_seconds);
                         mark_account_cooldown(
                             &acc.id,
                             &acc.email,
+                            scope,
                             cool,
                             format!("HTTP {status}"),
                         );
                         last_err = (status, err_body, acc.id.clone(), acc.email.clone());
                         continue;
                     }
-                    // 400 / 403 / 404: preserve more specific primary error if secondary fallback returns 404
-                    if !(status == 404 && matches!(last_err.0, 429 | 403 | 500 | 502 | 503)) {
-                        last_err = (status, err_body, acc.id.clone(), acc.email.clone());
+                    if status == 404 {
+                        saw_model_not_found = true;
+                        // Preserve more specific primary error if secondary fallback returns 404
+                        if !(matches!(last_err.0, 429 | 403 | 500 | 502 | 503) && saw_non_404_error)
+                        {
+                            last_err = (status, err_body, acc.id.clone(), acc.email.clone());
+                        }
+                        continue;
                     }
+                    saw_non_404_error = true;
+                    last_err = (status, err_body, acc.id.clone(), acc.email.clone());
                     if status == 403 {
-                        mark_account_cooldown(&acc.id, &acc.email, 300, "HTTP 403".into());
+                        mark_account_cooldown(&acc.id, &acc.email, "all", 300, "HTTP 403".into());
                         break;
                     }
                 }
                 Err(e) => {
+                    saw_non_404_error = true;
                     last_err = (502, e.to_string(), acc.id.clone(), acc.email.clone());
                 }
             }
@@ -1741,6 +2166,14 @@ async fn send_upstream_with_failover(
 
         if let Some(ok) = succeeded {
             return Ok(ok);
+        }
+
+        if saw_model_not_found && !saw_non_404_error {
+            // Runtime-learn that this account doesn't support `resolved_model` (30 min TTL)
+            // and failover immediately without burning a retry slot or cooling down the account!
+            mark_runtime_unsupported(&acc.id, resolved_model, 1800);
+        } else {
+            real_attempts += 1;
         }
     }
 
@@ -2899,21 +3332,22 @@ pub fn get_status() -> Result<ApiServiceStatus, String> {
     let cfg = load_config()?;
     let keys = list_api_keys()?;
     let all_accs = accounts::list_accounts_sync().unwrap_or_default();
-    let pool_accs: Vec<AntigravityAccount> = all_accs
-        .into_iter()
-        .filter(|a| {
-            if a.disabled || a.token.refresh_token.trim().is_empty() {
-                return false;
-            }
-            if !cfg.member_account_ids.is_empty() {
-                cfg.member_account_ids.contains(&a.id)
-            } else {
-                cfg.use_all_accounts_when_empty
-            }
-        })
-        .collect();
+    let pool_accs = select_pool_members(all_accs, &cfg, None);
     let pool_total = pool_accs.len();
-    let pool_healthy = pool_accs.iter().filter(|a| !is_on_cooldown(&a.id)).count();
+    let pool_healthy = pool_accs
+        .iter()
+        .filter(|a| !is_fully_cooled_down(&a.id))
+        .count();
+    let mut pool_full_nextgen = 0usize;
+    let mut pool_classic = 0usize;
+    let mut pool_unknown = 0usize;
+    for a in &pool_accs {
+        match classify_account_profile(a) {
+            AccountProfile::FullNextgen => pool_full_nextgen += 1,
+            AccountProfile::Classic => pool_classic += 1,
+            AccountProfile::Unknown => pool_unknown += 1,
+        }
+    }
     let cooldowns = active_cooldowns();
 
     let (running, host, port, started_at) = {
@@ -2950,6 +3384,9 @@ pub fn get_status() -> Result<ApiServiceStatus, String> {
         active_requests: ACTIVE_REQUESTS.load(Ordering::Relaxed),
         pool_total,
         pool_healthy,
+        pool_full_nextgen,
+        pool_classic,
+        pool_unknown,
         cooldowns,
         config: cfg,
         keys,
@@ -3310,5 +3747,166 @@ pub fn spawn_auto_start_if_enabled() {
                 let _ = start_server().await;
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accounts::{ModelQuota, QuotaData, TokenData};
+
+    fn make_acc(id: &str, email: &str, models: Vec<(&str, i32)>) -> AntigravityAccount {
+        AntigravityAccount {
+            id: id.into(),
+            email: email.into(),
+            name: None,
+            picture: None,
+            tags: vec![],
+            notes: None,
+            two_factor_secret: None,
+            account_password: None,
+            phone_number: None,
+            mail_url: None,
+            aux_email: None,
+            pending_oauth: false,
+            disabled: false,
+            disabled_reason: None,
+            token: TokenData {
+                access_token: "tok".into(),
+                refresh_token: "ref".into(),
+                expires_in: 3600,
+                expiry_timestamp: 9999999999,
+                token_type: "Bearer".into(),
+                email: Some(email.into()),
+                project_id: None,
+                is_gcp_tos: None,
+                id_token: None,
+            },
+            quota: Some(QuotaData {
+                models: models
+                    .into_iter()
+                    .map(|(n, pct)| ModelQuota {
+                        name: n.into(),
+                        display_name: Some(n.into()),
+                        percentage: pct,
+                        reset_time: String::new(),
+                        summary_exhausted: Some(pct == 0),
+                    })
+                    .collect(),
+                last_updated: 1,
+                is_forbidden: false,
+                subscription_tier: Some("g1-pro-tier".into()),
+                credits: vec![],
+                is_gcp_tos: None,
+                project_id: None,
+                quota_summary_stale: false,
+                quota_summary_updated_at: None,
+            }),
+            quota_error: None,
+            created_at: 1,
+            last_used: 1,
+            last_switched_at: None,
+            is_current: false,
+        }
+    }
+
+    fn full_acc(id: &str, email: &str, g_pct: i32, c_pct: i32, argon_pct: i32) -> AntigravityAccount {
+        make_acc(
+            id,
+            email,
+            vec![
+                ("gemini-5h", g_pct),
+                ("gemini-weekly", g_pct),
+                ("3p-5h", c_pct),
+                ("3p-weekly", c_pct),
+                ("gemini-argon-wtu-weekly", argon_pct),
+                ("gemini-4-argon-high", argon_pct),
+                ("gemini-4-neon-medium", g_pct),
+                ("gemini-3.8-flash-high", g_pct),
+                ("claude-sonnet-5-5-medium", c_pct),
+            ],
+        )
+    }
+
+    fn classic_acc(id: &str, email: &str, g_pct: i32, c_pct: i32) -> AntigravityAccount {
+        make_acc(
+            id,
+            email,
+            vec![
+                ("gemini-5h", g_pct),
+                ("gemini-weekly", g_pct),
+                ("3p-5h", c_pct),
+                ("3p-weekly", c_pct),
+                ("gemini-3.8-flash-high", g_pct),
+                ("claude-sonnet-4-6", c_pct),
+                ("claude-opus-4-6-thinking", c_pct),
+            ],
+        )
+    }
+
+    #[test]
+    fn smart_routing_separates_argon_and_claude_46_and_preserves_full_on_shared() {
+        let cfg = ApiServiceConfig::default(); // smart + preserve_exclusive_accounts = true
+        let members = vec![
+            full_acc("f_low_argon", "full-low@test.com", 100, 100, 5),
+            full_acc("f_high_argon", "full-high@test.com", 90, 80, 95),
+            classic_acc("c_high", "classic-high@test.com", 70, 90),
+            classic_acc("c_low", "classic-low@test.com", 10, 20),
+        ];
+
+        // 1. Argon request -> ONLY Full accounts, highest Argon weekly first (95 > 5), NEVER Classic
+        let argon_ranked = rank_pool_candidates(
+            members.clone(),
+            &cfg,
+            "k1",
+            "gemini-4-argon-high",
+            &HashSet::new(),
+        );
+        let argon_ids: Vec<&str> = argon_ranked.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(argon_ids, vec!["f_high_argon", "f_low_argon"]);
+
+        // 2. Claude 4.6 request -> ONLY Classic accounts, highest Claude quota first (90 > 20), NEVER Full
+        let c46_ranked = rank_pool_candidates(
+            members.clone(),
+            &cfg,
+            "k1",
+            "claude-sonnet-4-6",
+            &HashSet::new(),
+        );
+        let c46_ids: Vec<&str> = c46_ranked.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(c46_ids, vec!["c_high", "c_low"]);
+
+        // 3. Shared model (gemini-3.8-flash-high) -> prefers healthy Classic (>15%) first to preserve Full/Argon quota!
+        let shared_ranked = rank_pool_candidates(
+            members.clone(),
+            &cfg,
+            "k1",
+            "gemini-3.8-flash-high",
+            &HashSet::new(),
+        );
+        assert_eq!(shared_ranked[0].id, "c_high");
+        assert_eq!(shared_ranked[1].id, "f_low_argon"); // 100% > 90%
+        assert_eq!(shared_ranked[2].id, "f_high_argon");
+        assert_eq!(shared_ranked[3].id, "c_low"); // <= 15% overflows after healthy Full
+
+        // 4. Scoped cooldown: cooling down Claude on c_high must NOT block c_high for Gemini 3.8!
+        mark_account_cooldown("c_high", "classic-high@test.com", "claude", 120, "HTTP 429".into());
+        let c46_after_cd = rank_pool_candidates(
+            members.clone(),
+            &cfg,
+            "k1",
+            "claude-sonnet-4-6",
+            &HashSet::new(),
+        );
+        assert_eq!(c46_after_cd[0].id, "c_low");
+        let g38_after_cd = rank_pool_candidates(
+            members,
+            &cfg,
+            "k1",
+            "gemini-3.8-flash-high",
+            &HashSet::new(),
+        );
+        assert_eq!(g38_after_cd[0].id, "c_high");
+        let _ = clear_account_cooldowns(None);
     }
 }

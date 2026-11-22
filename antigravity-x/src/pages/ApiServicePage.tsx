@@ -77,6 +77,69 @@ function maskKey(key: string, visible: boolean): string {
   return `${key.slice(0, 14)}••••••••••••${key.slice(-4)}`;
 }
 
+type AccountModelProfileKind = "full_nextgen" | "classic" | "unknown";
+
+function classifyAccountModelProfile(acc: AntigravityAccount): {
+  kind: AccountModelProfileKind;
+  summary: string;
+} {
+  const models = acc.quota?.models ?? [];
+  if (models.length === 0) {
+    return { kind: "unknown", summary: "" };
+  }
+  let isNextgen = false;
+  let hasReal = false;
+  let g5h: number | null = null;
+  let c5h: number | null = null;
+  let cWk: number | null = null;
+  let argonWk: number | null = null;
+
+  for (const m of models) {
+    const n = m.name.trim().toLowerCase();
+    if (
+      n === "gemini-argon-wtu-weekly" ||
+      n === "argon:weekly" ||
+      n.startsWith("gemini-4-argon") ||
+      n.startsWith("gemini-4-neon") ||
+      n.startsWith("claude-sonnet-5-5") ||
+      n.startsWith("claude-opus-5-5") ||
+      (n.startsWith("gemini-4-hydrogen") && !n.endsWith("sonar"))
+    ) {
+      isNextgen = true;
+    }
+    if (
+      !n.includes(":") &&
+      !n.endsWith("-5h") &&
+      !n.endsWith("-weekly") &&
+      !n.startsWith("tab_") &&
+      !n.startsWith("chat_") &&
+      !n.includes("wtu")
+    ) {
+      hasReal = true;
+    }
+    if (n === "gemini-5h" || n === "gemini:5h") g5h = m.percentage;
+    if (n === "3p-5h" || n === "claude:5h") c5h = m.percentage;
+    if (n === "3p-weekly" || n === "claude:weekly") cWk = m.percentage;
+    if (n === "gemini-argon-wtu-weekly" || n === "argon:weekly") argonWk = m.percentage;
+  }
+
+  const cEff = c5h != null && cWk != null ? Math.min(c5h, cWk) : (c5h ?? cWk);
+  if (isNextgen) {
+    const parts: string[] = [];
+    if (g5h != null) parts.push(`G4 ${g5h}%`);
+    if (cEff != null) parts.push(`C5.5 ${cEff}%`);
+    if (argonWk != null) parts.push(`Argon ${argonWk}%`);
+    return { kind: "full_nextgen", summary: parts.join(" · ") };
+  }
+  if (hasReal) {
+    const parts: string[] = [];
+    if (g5h != null) parts.push(`G3.8 ${g5h}%`);
+    if (cEff != null) parts.push(`C4.6 ${cEff}%`);
+    return { kind: "classic", summary: parts.join(" · ") };
+  }
+  return { kind: "unknown", summary: "" };
+}
+
 export function ApiServicePage({
   lang,
   accounts,
@@ -210,9 +273,15 @@ export function ApiServicePage({
   }, [accounts, status]);
 
   const cooldownMap = useMemo(() => {
-    const m = new Map<string, { remainingSeconds: number; reason: string }>();
+    const m = new Map<string, { scope: string; remainingSeconds: number; reason: string }[]>();
     for (const c of status?.cooldowns ?? []) {
-      m.set(c.accountId, { remainingSeconds: c.remainingSeconds, reason: c.reason });
+      const list = m.get(c.accountId) ?? [];
+      list.push({
+        scope: c.scope || "all",
+        remainingSeconds: c.remainingSeconds,
+        reason: c.reason,
+      });
+      m.set(c.accountId, list);
     }
     return m;
   }, [status]);
@@ -660,6 +729,19 @@ print(resp.choices[0].message.content)`;
                       ? ` · ${status.cooldowns.length} cooldown`
                       : ""}
                   </span>
+                  <div className="ag-api-pool-split">
+                    <span className="ag-api-profile-pill is-full">
+                      Full · G4/Argon/C5.5: {status.poolFullNextgen}
+                    </span>
+                    <span className="ag-api-profile-pill is-classic">
+                      Classic · 3.8/C4.6: {status.poolClassic}
+                    </span>
+                    {status.poolUnknown > 0 ? (
+                      <span className="ag-api-profile-pill is-unknown">
+                        {vi ? "Chưa quét" : "Unscanned"}: {status.poolUnknown}
+                      </span>
+                    ) : null}
+                  </div>
                 </div>
                 <div style={{ display: "flex", gap: 6 }}>
                   <button
@@ -691,21 +773,50 @@ print(resp.choices[0].message.content)`;
                 <div className="ag-api-pool-list">
                   {poolAccounts.map((acc) => {
                     const score = getAntigravityOverallScore(acc);
-                    const cd = cooldownMap.get(acc.id);
+                    const profile = classifyAccountModelProfile(acc);
+                    const cds = cooldownMap.get(acc.id) ?? [];
                     return (
                       <div key={acc.id} className="ag-api-pool-member">
                         <div className="ag-api-pool-member__info">
-                          <strong>{acc.email}</strong>
+                          <div className="ag-api-pool-member__top">
+                            <strong>{acc.email}</strong>
+                            <span
+                              className={`ag-api-profile-pill ${
+                                profile.kind === "full_nextgen"
+                                  ? "is-full"
+                                  : profile.kind === "classic"
+                                    ? "is-classic"
+                                    : "is-unknown"
+                              }`}
+                            >
+                              {profile.kind === "full_nextgen"
+                                ? "Full · Argon/G4"
+                                : profile.kind === "classic"
+                                  ? "Classic · 3.8/C4.6"
+                                  : vi
+                                    ? "Chưa quét"
+                                    : "Unscanned"}
+                            </span>
+                          </div>
                           <span>
-                            {score >= 0 ? `Quota TB: ${score}%` : "Chưa có quota"}
+                            {profile.summary
+                              ? profile.summary
+                              : score >= 0
+                                ? `Quota TB: ${score}%`
+                                : vi
+                                  ? "Chưa có quota"
+                                  : "No quota"}
                           </span>
                         </div>
                         <div className="ag-api-pool-member__right">
-                          {cd ? (
+                          {cds.length > 0 ? (
                             <>
-                              <span className="ag-badge-warn">
-                                Cooldown {cd.remainingSeconds}s ({cd.reason})
-                              </span>
+                              {cds.map((cd) => (
+                                <span key={cd.scope} className="ag-badge-warn">
+                                  {cd.scope !== "all" ? `${cd.scope} ` : ""}
+                                  {cd.remainingSeconds}s ({cd.reason})
+                                </span>
+                              ))}
                               <button
                                 type="button"
                                 className="agx-btn agx-btn--ghost agx-btn--sm"
@@ -806,6 +917,11 @@ print(resp.choices[0].message.content)`;
                     setCfgDraft({ ...cfgDraft, routingStrategy: e.target.value })
                   }
                 >
+                  <option value="smart">
+                    {vi
+                      ? "Thông minh theo Model & Quota (Khuyên dùng)"
+                      : "Smart Model-Aware (Recommended)"}
+                  </option>
                   <option value="highest_quota">
                     {vi ? "Ưu tiên Quota cao nhất" : "Highest Quota First"}
                   </option>
@@ -890,6 +1006,24 @@ print(resp.choices[0].message.content)`;
                   {vi
                     ? "Tự động khởi chạy API Router khi mở OnlyDEVS"
                     : "Auto-start API Router on app launch"}
+                </span>
+              </label>
+
+              <label className="ag-select-all-label">
+                <input
+                  type="checkbox"
+                  checked={cfgDraft.preserveExclusiveAccounts ?? true}
+                  onChange={(e) =>
+                    setCfgDraft({
+                      ...cfgDraft,
+                      preserveExclusiveAccounts: e.target.checked,
+                    })
+                  }
+                />
+                <span>
+                  {vi
+                    ? "Giữ quota acc Full/Argon: ưu tiên acc Classic (3.8) cho model dùng chung (3.8 / 3-Flash)"
+                    : "Preserve Full/Argon accounts: prefer Classic (3.8) accounts for shared models"}
                 </span>
               </label>
 
@@ -1095,9 +1229,23 @@ print(resp.choices[0].message.content)`;
                   </div>
                   <code className="ag-api-model-id">{m.id}</code>
                   <div className="ag-api-model-tile__foot">
-                    <span className="agx-muted">
-                      {m.thinking ? "Thinking" : "Standard"} · {m.source}
-                    </span>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                      <span
+                        className={`ag-api-model-support ${
+                          m.supportedAccountCount > 0 ? "is-ok" : "is-none"
+                        }`}
+                        title={
+                          vi
+                            ? `${m.supportedAccountCount}/${m.poolAccountCount} tài khoản trong Pool hỗ trợ model này`
+                            : `${m.supportedAccountCount}/${m.poolAccountCount} pool accounts support this model`
+                        }
+                      >
+                        {m.supportedAccountCount}/{m.poolAccountCount} acc
+                      </span>
+                      <span className="agx-muted">
+                        {m.thinking ? "Thinking" : "Standard"} · {m.source}
+                      </span>
+                    </div>
                     <div style={{ display: "flex", gap: 4 }}>
                       <button
                         type="button"
@@ -1285,7 +1433,7 @@ print(resp.choices[0].message.content)`;
               >
                 {models.map((m) => (
                   <option key={m.id} value={m.id}>
-                    {m.id} — {m.displayName}
+                    {m.id} — {m.displayName} [{m.supportedAccountCount}/{m.poolAccountCount} acc]
                   </option>
                 ))}
               </select>
@@ -1736,23 +1884,45 @@ print(resp.choices[0].message.content)`;
               </label>
 
               <div className="ag-group-member-list">
-                {accounts.map((acc) => (
-                  <label key={acc.id} className="ag-group-member-item">
-                    <input
-                      type="checkbox"
-                      checked={memberDraftIds.has(acc.id)}
-                      onChange={() => {
-                        setMemberDraftIds((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(acc.id)) next.delete(acc.id);
-                          else next.add(acc.id);
-                          return next;
-                        });
-                      }}
-                    />
-                    <span>{acc.email}</span>
-                  </label>
-                ))}
+                {accounts.map((acc) => {
+                  const prof = classifyAccountModelProfile(acc);
+                  return (
+                    <label key={acc.id} className="ag-group-member-item">
+                      <input
+                        type="checkbox"
+                        checked={memberDraftIds.has(acc.id)}
+                        onChange={() => {
+                          setMemberDraftIds((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(acc.id)) next.delete(acc.id);
+                            else next.add(acc.id);
+                            return next;
+                          });
+                        }}
+                      />
+                      <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {acc.email}
+                      </span>
+                      <span
+                        className={`ag-api-profile-pill ${
+                          prof.kind === "full_nextgen"
+                            ? "is-full"
+                            : prof.kind === "classic"
+                              ? "is-classic"
+                              : "is-unknown"
+                        }`}
+                      >
+                        {prof.kind === "full_nextgen"
+                          ? "Full · Argon"
+                          : prof.kind === "classic"
+                            ? "Classic · C4.6"
+                            : vi
+                              ? "Chưa quét"
+                              : "Unscanned"}
+                      </span>
+                    </label>
+                  );
+                })}
               </div>
             </div>
             <div className="agx-modal-foot">

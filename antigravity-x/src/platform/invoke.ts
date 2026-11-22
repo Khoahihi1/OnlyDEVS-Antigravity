@@ -284,9 +284,10 @@ let mockApiRunning = false;
 let mockApiConfig: ApiServiceConfig = {
   port: 57120,
   accessScope: "local",
-  routingStrategy: "highest_quota",
+  routingStrategy: "smart",
   memberAccountIds: [],
   useAllAccountsWhenEmpty: true,
+  preserveExclusiveAccounts: true,
   autoStart: false,
   timeoutSeconds: 180,
   maxRetries: 3,
@@ -331,6 +332,9 @@ function buildMockApiStatus(): ApiServiceStatus {
     activeRequests: 0,
     poolTotal: mockAccounts.length,
     poolHealthy: mockAccounts.length,
+    poolFullNextgen: 1,
+    poolClassic: Math.max(0, mockAccounts.length - 1),
+    poolUnknown: 0,
     cooldowns: [],
     config: mockApiConfig,
     keys: mockApiKeys,
@@ -691,11 +695,13 @@ export async function agxInvoke<T>(command: string, args?: Record<string, unknow
     case "api_service_list_models": {
       const list: ApiAvailableModel[] = [
         {
-          id: "gemini-3.1-pro-high",
-          displayName: "Gemini 3.1 Pro High",
+          id: "gemini-4-argon-high",
+          displayName: "Gemini 4 Argon (High)",
           family: "gemini",
           thinking: true,
           source: "builtin",
+          supportedAccountCount: 1,
+          poolAccountCount: mockAccounts.length,
         },
         {
           id: "claude-sonnet-4-6",
@@ -703,6 +709,8 @@ export async function agxInvoke<T>(command: string, args?: Record<string, unknow
           family: "claude",
           thinking: true,
           source: "builtin",
+          supportedAccountCount: 1,
+          poolAccountCount: mockAccounts.length,
         },
         {
           id: "claude-opus-4-6-thinking",
@@ -710,6 +718,8 @@ export async function agxInvoke<T>(command: string, args?: Record<string, unknow
           family: "claude",
           thinking: true,
           source: "builtin",
+          supportedAccountCount: 1,
+          poolAccountCount: mockAccounts.length,
         },
       ];
       return list as T;

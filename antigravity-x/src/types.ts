@@ -625,9 +625,16 @@ export type ModelAliasRule = {
 export type ApiServiceConfig = {
   port: number;
   accessScope: "local" | "lan" | string;
-  routingStrategy: "round_robin" | "highest_quota" | "sticky_session" | "failover" | string;
+  routingStrategy:
+    | "smart"
+    | "round_robin"
+    | "highest_quota"
+    | "sticky_session"
+    | "failover"
+    | string;
   memberAccountIds: string[];
   useAllAccountsWhenEmpty: boolean;
+  preserveExclusiveAccounts: boolean;
   autoStart: boolean;
   timeoutSeconds: number;
   maxRetries: number;
@@ -653,6 +660,7 @@ export type ApiKeyRecord = {
 export type AccountCooldownInfo = {
   accountId: string;
   email: string;
+  scope: string;
   untilTs: number;
   remainingSeconds: number;
   reason: string;
@@ -668,6 +676,9 @@ export type ApiServiceStatus = {
   activeRequests: number;
   poolTotal: number;
   poolHealthy: number;
+  poolFullNextgen: number;
+  poolClassic: number;
+  poolUnknown: number;
   cooldowns: AccountCooldownInfo[];
   config: ApiServiceConfig;
   keys: ApiKeyRecord[];
@@ -679,6 +690,8 @@ export type ApiAvailableModel = {
   family: string;
   thinking: boolean;
   source: string;
+  supportedAccountCount: number;
+  poolAccountCount: number;
 };
 
 export type ApiRequestLogItem = {
