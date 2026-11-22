@@ -4,10 +4,13 @@ import {
   Copy,
   Download,
   ExternalLink,
+  FolderOpen,
+  Github,
   Globe,
   Loader2,
   MessageSquare,
   Rocket,
+  ShieldCheck,
 } from "lucide-react";
 import type {
   AppLanguage,
@@ -84,138 +87,148 @@ export function AboutPage({
   const copyText = (key: string, value: string) => {
     void navigator.clipboard?.writeText(value);
     setCopiedKey(key);
-    window.setTimeout(() => setCopiedKey(null), 1800);
+    window.setTimeout(() => setCopiedKey(null), 1600);
   };
+
+  const pathItems = [
+    { key: "gemini", label: "GEMINI_HOME", value: overview?.geminiHome ?? "~/.gemini" },
+    { key: "agents", label: "AGENTS.md", value: overview?.agentsPath ?? "~/.gemini/config/AGENTS.md" },
+    { key: "config", label: "config.json", value: overview?.configPath ?? "~/.gemini/config/config.json" },
+    { key: "mcp", label: "mcp_config.json", value: overview?.mcpConfigPath ?? "~/.gemini/config/mcp_config.json" },
+    ...(overview?.pythonPath
+      ? [{ key: "python", label: "Python", value: overview.pythonPath }]
+      : []),
+  ];
 
   return (
     <section className="agx-page">
-      <header className="agx-page-header">
-        <div className="agx-page-heading">
-          <h2>OnlyDEVS</h2>
-        </div>
-      </header>
-
-      {/* Brand Hero & Official Links Card */}
-      <article className="agx-about-hero-card">
-        <div className="agx-about-hero-brand">
-          <img src={logoUrl} alt="OnlyDEVS Logo" className="agx-about-hero-logo" />
-          <div>
-            <div className="agx-about-hero-title-row">
-              <h3>OnlyDEVS — Antigravity</h3>
+      {/* Compact Brand Hero Banner */}
+      <article className="od-about-banner">
+        <div className="od-about-banner__left">
+          <div className="od-about-logo-ring">
+            <img src={logoUrl} alt="OnlyDEVS Logo" className="od-about-logo-img" />
+          </div>
+          <div className="od-about-banner__meta">
+            <div className="od-about-banner__title-row">
+              <h2>OnlyDEVS — Antigravity</h2>
               <span className="agx-badge agx-badge--brand">v{appVersion}</span>
             </div>
+            <p className="od-about-banner__sub">
+              {vi
+                ? "Bộ công cụ điều khiển & Local API Router thuần Antigravity"
+                : "All-in-One Control Suite & Pure Antigravity Local API Router"}
+            </p>
           </div>
         </div>
 
-        <div className="agx-about-links-grid">
-          <div className="agx-about-link-card">
-            <div className="agx-about-link-icon agx-about-link-icon--web">
-              <Globe size={20} />
-            </div>
-            <div className="agx-about-link-copy">
-              <small>MY WEBSITE</small>
-              <strong>{WEBSITE_URL}</strong>
-            </div>
-            <div className="agx-about-link-actions">
-              <button
-                type="button"
-                className="agx-icon-btn agx-icon-btn--bordered"
-                title="Copy URL"
-                onClick={() => copyText("web", WEBSITE_URL)}
-              >
-                {copiedKey === "web" ? <Check size={14} /> : <Copy size={14} />}
-              </button>
-              <button
-                type="button"
-                className="agx-btn agx-btn--primary"
-                onClick={() => void openExternalUrl(WEBSITE_URL)}
-              >
-                <ExternalLink size={14} />
-                <span>{vi ? "Mở Website" : "Open Website"}</span>
-              </button>
-            </div>
+        <div className="od-about-banner__links">
+          <div className="od-about-link-pill">
+            <button
+              type="button"
+              className="od-about-link-pill__main"
+              onClick={() => void openExternalUrl(WEBSITE_URL)}
+            >
+              <Globe size={14} className="od-about-ico--blue" />
+              <span>onlydevs.online</span>
+              <ExternalLink size={12} />
+            </button>
+            <button
+              type="button"
+              className="od-about-link-pill__copy"
+              title="Copy"
+              onClick={() => copyText("web", WEBSITE_URL)}
+            >
+              {copiedKey === "web" ? <Check size={12} /> : <Copy size={12} />}
+            </button>
           </div>
 
-          <div className="agx-about-link-card">
-            <div className="agx-about-link-icon agx-about-link-icon--discord">
-              <MessageSquare size={20} />
-            </div>
-            <div className="agx-about-link-copy">
-              <small>MY SERVER (DISCORD)</small>
-              <strong>{DISCORD_URL}</strong>
-            </div>
-            <div className="agx-about-link-actions">
-              <button
-                type="button"
-                className="agx-icon-btn agx-icon-btn--bordered"
-                title="Copy Discord invite"
-                onClick={() => copyText("discord", DISCORD_URL)}
-              >
-                {copiedKey === "discord" ? <Check size={14} /> : <Copy size={14} />}
-              </button>
-              <button
-                type="button"
-                className="agx-btn agx-btn--primary"
-                onClick={() => void openExternalUrl(DISCORD_URL)}
-              >
-                <ExternalLink size={14} />
-                <span>{vi ? "Tham gia Discord" : "Join Discord"}</span>
-              </button>
-            </div>
+          <div className="od-about-link-pill">
+            <button
+              type="button"
+              className="od-about-link-pill__main"
+              onClick={() => void openExternalUrl(DISCORD_URL)}
+            >
+              <MessageSquare size={14} className="od-about-ico--red" />
+              <span>Discord</span>
+              <ExternalLink size={12} />
+            </button>
+            <button
+              type="button"
+              className="od-about-link-pill__copy"
+              title="Copy"
+              onClick={() => copyText("discord", DISCORD_URL)}
+            >
+              {copiedKey === "discord" ? <Check size={12} /> : <Copy size={12} />}
+            </button>
+          </div>
+
+          <div className="od-about-link-pill">
+            <button
+              type="button"
+              className="od-about-link-pill__main"
+              onClick={() => void openExternalUrl(GITHUB_REPO_URL)}
+            >
+              <Github size={14} />
+              <span>GitHub</span>
+              <ExternalLink size={12} />
+            </button>
+            <button
+              type="button"
+              className="od-about-link-pill__copy"
+              title="Copy"
+              onClick={() => copyText("github", GITHUB_REPO_URL)}
+            >
+              {copiedKey === "github" ? <Check size={12} /> : <Copy size={12} />}
+            </button>
           </div>
         </div>
       </article>
 
-      {/* GitHub Auto-Update Card */}
-      <article className="agx-panel-card">
-        <div className="agx-panel-head">
-          <h3>{vi ? "Cập nhật tự động" : "Auto Update"}</h3>
-          {updateResult?.hasUpdate ? (
-            <span className="agx-badge agx-badge--brand">
-              v{updateResult.latestVersion} {vi ? "khả dụng" : "available"}
-            </span>
-          ) : (
-            <span className="agx-badge agx-badge--success">
-              {vi ? `Bản hiện tại v${appVersion}` : `Up to date · v${appVersion}`}
-            </span>
-          )}
-        </div>
-
-        <div className="agx-about-kv-list">
-          <KvRow label="GitHub Repository" value={GITHUB_REPO_URL} mono />
-          <KvRow
-            label={vi ? "Phiên bản hiện tại" : "Current Version"}
-            value={`v${appVersion}`}
-          />
-          <KvRow
-            label={vi ? "Phiên bản mới nhất" : "Latest Release"}
-            value={
-              updateResult
-                ? `v${updateResult.latestVersion}${updateResult.hasUpdate ? (vi ? " (Có bản cập nhật mới!)" : " (Update available!)") : vi ? " (Mới nhất)" : " (Up to date)"}`
-                : vi
-                  ? "Nhấn Kiểm tra cập nhật"
-                  : "Click Check for updates"
-            }
-          />
-        </div>
-
-        {updateError ? (
-          <div className="ag-token-usage__error" style={{ marginTop: 10 }}>
-            {updateError}
+      {/* Balanced 2-Column Content Grid */}
+      <div className="od-about-grid">
+        {/* Left: Auto-Update Card */}
+        <article className="od-about-card">
+          <div className="od-about-card__head">
+            <div className="od-about-card__title">
+              <Rocket size={16} className="od-about-ico--red" />
+              <h3>{vi ? "Cập nhật tự động" : "Auto Update"}</h3>
+            </div>
+            {updateResult?.hasUpdate ? (
+              <span className="agx-badge agx-badge--brand">
+                v{updateResult.latestVersion} {vi ? "mới" : "new"}
+              </span>
+            ) : (
+              <span className="agx-badge agx-badge--success">
+                <ShieldCheck size={11} style={{ marginRight: 3 }} />
+                v{appVersion}
+              </span>
+            )}
           </div>
-        ) : null}
 
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            flexWrap: "wrap",
-            gap: 10,
-            marginTop: 14,
-          }}
-        >
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <div className="od-about-version-strip">
+            <div className="od-about-version-box">
+              <span>{vi ? "Hiện tại" : "Installed"}</span>
+              <strong>v{appVersion}</strong>
+            </div>
+            <div className="od-about-version-box">
+              <span>{vi ? "Phiên bản mới nhất" : "Latest Release"}</span>
+              <strong>
+                {updateResult
+                  ? `v${updateResult.latestVersion}`
+                  : vi
+                    ? "Chưa kiểm tra"
+                    : "Not checked"}
+              </strong>
+            </div>
+          </div>
+
+          {updateError ? (
+            <div className="ag-token-usage__error" style={{ marginTop: 10 }}>
+              {updateError}
+            </div>
+          ) : null}
+
+          <div className="od-about-card__actions">
             <button
               type="button"
               className="agx-btn agx-btn--primary"
@@ -234,7 +247,7 @@ export function AboutPage({
                     : "Checking..."
                   : vi
                     ? "Kiểm tra cập nhật"
-                    : "Check for updates"}
+                    : "Check Updates"}
               </span>
             </button>
 
@@ -247,7 +260,7 @@ export function AboutPage({
                 <Download size={14} />
                 <span>
                   {vi
-                    ? `Cài đặt v${updateResult.latestVersion}`
+                    ? `Cài v${updateResult.latestVersion}`
                     : `Install v${updateResult.latestVersion}`}
                 </span>
               </button>
@@ -259,58 +272,56 @@ export function AboutPage({
               onClick={() => void openExternalUrl(GITHUB_RELEASES_URL)}
             >
               <ExternalLink size={14} />
-              <span>{vi ? "Mở trang Releases" : "Open Releases"}</span>
+              <span>Releases</span>
             </button>
           </div>
 
-          <label className="ag-select-all-label">
+          <label className="od-about-toggle-row">
+            <span>
+              {vi
+                ? "Tự động kiểm tra cập nhật khi mở app"
+                : "Auto-check updates on startup"}
+            </span>
             <input
               type="checkbox"
               checked={updateSettings?.autoCheck ?? true}
               onChange={() => void handleToggleAutoCheck()}
             />
-            <span>
-              {vi
-                ? "Tự động kiểm tra bản mới khi mở ứng dụng"
-                : "Automatically check for updates on startup"}
-            </span>
           </label>
-        </div>
-      </article>
+        </article>
 
-      {/* System Info Card */}
-      <article className="agx-panel-card">
-        <div className="agx-panel-head">
-          <h3>{vi ? "Hệ thống & Đường dẫn" : "System & Paths"}</h3>
-        </div>
+        {/* Right: Clean Environment & Paths Card (zero duplicates) */}
+        <article className="od-about-card">
+          <div className="od-about-card__head">
+            <div className="od-about-card__title">
+              <FolderOpen size={16} className="od-about-ico--blue" />
+              <h3>{vi ? "Đường dẫn cấu hình" : "Config Paths"}</h3>
+            </div>
+            <span className="agx-badge">
+              {overview?.pluginsEnabled ?? 0}/{overview?.pluginCount ?? 0} Plugin
+            </span>
+          </div>
 
-        <div className="agx-about-kv-list">
-          <KvRow label="Application" value={`OnlyDEVS v${appVersion}`} />
-          <KvRow label="Website" value={WEBSITE_URL} mono />
-          <KvRow label="Discord" value={DISCORD_URL} mono />
-          <KvRow label="GEMINI_HOME" value={overview?.geminiHome ?? "~/.gemini"} mono />
-          <KvRow label="AGENTS.md" value={overview?.agentsPath ?? "~/.gemini/config/AGENTS.md"} mono />
-          <KvRow label="config.json" value={overview?.configPath ?? "~/.gemini/config/config.json"} mono />
-          <KvRow
-            label="mcp_config.json"
-            value={overview?.mcpConfigPath ?? "~/.gemini/config/mcp_config.json"}
-            mono
-          />
-        </div>
-      </article>
+          <div className="od-about-paths-list">
+            {pathItems.map((item) => (
+              <div key={item.key} className="od-about-path-row">
+                <span className="od-about-path-label">{item.label}</span>
+                <code className="od-about-path-code" title={item.value}>
+                  {item.value}
+                </code>
+                <button
+                  type="button"
+                  className="agx-icon-btn"
+                  title="Copy path"
+                  onClick={() => copyText(item.key, item.value)}
+                >
+                  {copiedKey === item.key ? <Check size={13} /> : <Copy size={13} />}
+                </button>
+              </div>
+            ))}
+          </div>
+        </article>
+      </div>
     </section>
-  );
-}
-
-function KvRow({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
-  return (
-    <div className="agx-about-kv-row">
-      <span className="agx-about-kv-label">{label}</span>
-      {mono ? (
-        <code className="agx-about-kv-code">{value}</code>
-      ) : (
-        <strong className="agx-about-kv-value">{value}</strong>
-      )}
-    </div>
   );
 }

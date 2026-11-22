@@ -292,7 +292,7 @@ struct RunningServer {
     host: String,
     port: u16,
     started_at: i64,
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    shutdown_txs: Vec<oneshot::Sender<()>>,
 }
 
 struct CooldownEntry {
@@ -1305,6 +1305,108 @@ fn openai_body_to_antigravity_envelope(
     (envelope, preview)
 }
 
+fn responses_body_to_openai_body(body: &Value) -> Value {
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(instr) = body.get("instructions").and_then(Value::as_str) {
+        if !instr.trim().is_empty() {
+            messages.push(json!({ "role": "system", "content": instr }));
+        }
+    }
+    if let Some(input) = body.get("input") {
+        match input {
+            Value::String(s) => {
+                messages.push(json!({ "role": "user", "content": s }));
+            }
+            Value::Array(items) => {
+                for item in items {
+                    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                    if item_type == "function_call" {
+                        let call_id = item
+                            .get("call_id")
+                            .or_else(|| item.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+                        let args = item
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}");
+                        messages.push(json!({
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "id": call_id,
+                                "type": "function",
+                                "function": { "name": name, "arguments": args }
+                            }]
+                        }));
+                        continue;
+                    }
+                    if item_type == "function_call_output" {
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let output_txt = extract_text_from_value(
+                            item.get("output").unwrap_or(&Value::Null),
+                        );
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": output_txt
+                        }));
+                        continue;
+                    }
+                    let role = item
+                        .get("role")
+                        .and_then(Value::as_str)
+                        .unwrap_or("user");
+                    let mapped_role = if role == "developer" { "system" } else { role };
+                    let content = item.get("content").unwrap_or(&Value::Null);
+                    let txt = extract_text_from_value(content);
+                    if !txt.trim().is_empty() {
+                        messages.push(json!({ "role": mapped_role, "content": txt }));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if messages.is_empty() {
+        if let Some(existing) = body.get("messages").and_then(Value::as_array) {
+            messages = existing.clone();
+        }
+    }
+
+    let mut out = Map::new();
+    out.insert(
+        "model".into(),
+        body.get("model")
+            .cloned()
+            .unwrap_or_else(|| json!("gemini-4-neon-medium")),
+    );
+    out.insert("messages".into(), Value::Array(messages));
+    if let Some(m) = body
+        .get("max_output_tokens")
+        .or_else(|| body.get("max_tokens"))
+    {
+        out.insert("max_tokens".into(), m.clone());
+    }
+    if let Some(t) = body.get("temperature") {
+        out.insert("temperature".into(), t.clone());
+    }
+    if let Some(p) = body.get("top_p") {
+        out.insert("top_p".into(), p.clone());
+    }
+    if let Some(s) = body.get("stream") {
+        out.insert("stream".into(), s.clone());
+    }
+    if let Some(tools) = body.get("tools") {
+        out.insert("tools".into(), tools.clone());
+    }
+    Value::Object(out)
+}
+
 fn anthropic_body_to_openai_body(body: &Value) -> Value {
     let mut messages: Vec<Value> = Vec::new();
     if let Some(sys) = body.get("system") {
@@ -1698,26 +1800,86 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String
         }
     }
 
-    let content_length: usize = headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    if content_length > 20 * 1024 * 1024 {
-        return Err("Payload too large".into());
+    let is_chunked = headers
+        .get("transfer-encoding")
+        .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+    if headers
+        .get("expect")
+        .is_some_and(|v| v.to_ascii_lowercase().contains("100-continue"))
+    {
+        let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+        let _ = stream.flush().await;
     }
 
-    let mut body = buf[header_end..].to_vec();
-    while body.len() < content_length {
-        let n = stream
-            .read(&mut temp)
-            .await
-            .map_err(|e| format!("Read body: {e}"))?;
-        if n == 0 {
-            break;
+    let mut body = Vec::new();
+    if is_chunked {
+        let mut raw = buf[header_end..].to_vec();
+        let mut pos = 0usize;
+        loop {
+            while raw[pos..].windows(2).position(|w| w == b"\r\n").is_none() {
+                let n = stream
+                    .read(&mut temp)
+                    .await
+                    .map_err(|e| format!("Read chunked size: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&temp[..n]);
+                if raw.len() > 24 * 1024 * 1024 {
+                    return Err("Chunked payload too large".into());
+                }
+            }
+            let Some(rel_crlf) = raw[pos..].windows(2).position(|w| w == b"\r\n") else {
+                break;
+            };
+            let size_line = String::from_utf8_lossy(&raw[pos..pos + rel_crlf]);
+            let hex_part = size_line.split(';').next().unwrap_or("").trim();
+            let chunk_size = usize::from_str_radix(hex_part, 16).unwrap_or(0);
+            pos += rel_crlf + 2;
+            if chunk_size == 0 {
+                break;
+            }
+            while raw.len() < pos + chunk_size + 2 {
+                let n = stream
+                    .read(&mut temp)
+                    .await
+                    .map_err(|e| format!("Read chunked data: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&temp[..n]);
+                if raw.len() > 24 * 1024 * 1024 {
+                    return Err("Chunked payload too large".into());
+                }
+            }
+            let end = (pos + chunk_size).min(raw.len());
+            body.extend_from_slice(&raw[pos..end]);
+            pos = (pos + chunk_size + 2).min(raw.len());
+            if body.len() > 20 * 1024 * 1024 {
+                return Err("Payload too large".into());
+            }
         }
-        body.extend_from_slice(&temp[..n]);
+    } else {
+        let content_length: usize = headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if content_length > 20 * 1024 * 1024 {
+            return Err("Payload too large".into());
+        }
+        body = buf[header_end..].to_vec();
+        while body.len() < content_length {
+            let n = stream
+                .read(&mut temp)
+                .await
+                .map_err(|e| format!("Read body: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&temp[..n]);
+        }
+        body.truncate(content_length);
     }
-    body.truncate(content_length);
 
     Ok(HttpRequest {
         method,
@@ -1818,7 +1980,10 @@ async fn handle_connection(mut stream: TcpStream) {
         return;
     }
 
-    if req.path == "/health" || req.path == "/v1/health" {
+    let norm_path = req.path.trim_end_matches('/');
+    let norm_path = if norm_path.is_empty() { "/" } else { norm_path };
+
+    if norm_path == "/health" || norm_path == "/v1/health" {
         let status = get_status().ok();
         write_json_response(
             &mut stream,
@@ -1837,6 +2002,30 @@ async fn handle_connection(mut stream: TcpStream) {
     // Authenticate API Key
     let token = extract_api_token(&req).unwrap_or_default();
     let Some(api_key) = find_valid_api_key(&token) else {
+        if norm_path != "/" && norm_path != "/favicon.ico" {
+            record_api_log(&ApiRequestLogItem {
+                id: Uuid::new_v4().to_string(),
+                timestamp: Utc::now().timestamp(),
+                api_key_id: "invalid".into(),
+                api_key_label: "Unauthorized".into(),
+                account_id: String::new(),
+                account_email: String::new(),
+                protocol: "http".into(),
+                request_model: format!("{} {}", req.method, norm_path),
+                resolved_model: "-".into(),
+                stream: false,
+                status_code: 401,
+                latency_ms: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                thinking_tokens: 0,
+                cache_read_tokens: 0,
+                total_tokens: 0,
+                error_message: Some("Invalid or disabled API key".into()),
+                request_preview: String::new(),
+                response_preview: String::new(),
+            });
+        }
         write_json_response(
             &mut stream,
             401,
@@ -1851,7 +2040,7 @@ async fn handle_connection(mut stream: TcpStream) {
         return;
     };
 
-    if req.method == "GET" && (req.path == "/v1/models" || req.path == "/models") {
+    if req.method == "GET" && (norm_path == "/v1/models" || norm_path == "/models") {
         let models = list_available_models().unwrap_or_default();
         let data: Vec<Value> = models
             .into_iter()
@@ -1874,17 +2063,45 @@ async fn handle_connection(mut stream: TcpStream) {
     }
 
     let is_openai = req.method == "POST"
-        && (req.path == "/v1/chat/completions" || req.path == "/chat/completions");
+        && (norm_path == "/v1/chat/completions" || norm_path == "/chat/completions");
+    let is_responses =
+        req.method == "POST" && (norm_path == "/v1/responses" || norm_path == "/responses");
     let is_anthropic =
-        req.method == "POST" && (req.path == "/v1/messages" || req.path == "/messages");
+        req.method == "POST" && (norm_path == "/v1/messages" || norm_path == "/messages");
 
-    if !is_openai && !is_anthropic {
+    if !is_openai && !is_responses && !is_anthropic {
+        let err_msg = format!(
+            "Unsupported endpoint: {} {}. Use /v1/models, /v1/chat/completions, /v1/responses, or /v1/messages.",
+            req.method, norm_path
+        );
+        record_api_log(&ApiRequestLogItem {
+            id: Uuid::new_v4().to_string(),
+            timestamp: Utc::now().timestamp(),
+            api_key_id: api_key.id.clone(),
+            api_key_label: api_key.label.clone(),
+            account_id: String::new(),
+            account_email: String::new(),
+            protocol: "http".into(),
+            request_model: format!("{} {}", req.method, norm_path),
+            resolved_model: "-".into(),
+            stream: false,
+            status_code: 404,
+            latency_ms: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            thinking_tokens: 0,
+            cache_read_tokens: 0,
+            total_tokens: 0,
+            error_message: Some(err_msg.clone()),
+            request_preview: String::new(),
+            response_preview: String::new(),
+        });
         write_json_response(
             &mut stream,
             404,
             &json!({
                 "error": {
-                    "message": format!("Unsupported endpoint: {} {}. Use /v1/models, /v1/chat/completions, or /v1/messages.", req.method, req.path),
+                    "message": err_msg,
                     "type": "not_found_error"
                 }
             }),
@@ -1896,10 +2113,33 @@ async fn handle_connection(mut stream: TcpStream) {
     let raw_body: Value = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
         Err(e) => {
+            let err_msg = format!("Invalid JSON body ({} bytes): {e}", req.body.len());
+            record_api_log(&ApiRequestLogItem {
+                id: Uuid::new_v4().to_string(),
+                timestamp: Utc::now().timestamp(),
+                api_key_id: api_key.id.clone(),
+                api_key_label: api_key.label.clone(),
+                account_id: String::new(),
+                account_email: String::new(),
+                protocol: if is_anthropic { "anthropic" } else if is_responses { "responses" } else { "openai" }.into(),
+                request_model: format!("{} {}", req.method, norm_path),
+                resolved_model: "-".into(),
+                stream: false,
+                status_code: 400,
+                latency_ms: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                thinking_tokens: 0,
+                cache_read_tokens: 0,
+                total_tokens: 0,
+                error_message: Some(err_msg.clone()),
+                request_preview: String::from_utf8_lossy(&req.body).chars().take(200).collect(),
+                response_preview: String::new(),
+            });
             write_json_response(
                 &mut stream,
                 400,
-                &json!({ "error": { "message": format!("Invalid JSON body: {e}"), "type": "invalid_request_error" } }),
+                &json!({ "error": { "message": err_msg, "type": "invalid_request_error" } }),
             )
             .await;
             return;
@@ -1907,9 +2147,17 @@ async fn handle_connection(mut stream: TcpStream) {
     };
 
     let cfg = load_config().unwrap_or_default();
-    let protocol = if is_anthropic { "anthropic" } else { "openai" };
+    let protocol = if is_anthropic {
+        "anthropic"
+    } else if is_responses {
+        "responses"
+    } else {
+        "openai"
+    };
     let openai_body = if is_anthropic {
         anthropic_body_to_openai_body(&raw_body)
+    } else if is_responses {
+        responses_body_to_openai_body(&raw_body)
     } else {
         raw_body.clone()
     };
@@ -1917,7 +2165,7 @@ async fn handle_connection(mut stream: TcpStream) {
     let request_model = openai_body
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or("gemini-3-flash-agent")
+        .unwrap_or("gemini-4-neon-medium")
         .to_string();
     let resolved_model = resolve_model_alias(&cfg, &request_model);
     let is_stream = openai_body
@@ -1931,12 +2179,38 @@ async fn handle_connection(mut stream: TcpStream) {
             .iter()
             .any(|p| glob_match(p, &request_model) || glob_match(p, &resolved_model))
     {
+        let err_msg = format!(
+            "API key '{}' is not allowed to call model '{}'",
+            api_key.label, request_model
+        );
+        record_api_log(&ApiRequestLogItem {
+            id: Uuid::new_v4().to_string(),
+            timestamp: Utc::now().timestamp(),
+            api_key_id: api_key.id.clone(),
+            api_key_label: api_key.label.clone(),
+            account_id: String::new(),
+            account_email: String::new(),
+            protocol: protocol.into(),
+            request_model: request_model.clone(),
+            resolved_model: resolved_model.clone(),
+            stream: is_stream,
+            status_code: 403,
+            latency_ms: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            thinking_tokens: 0,
+            cache_read_tokens: 0,
+            total_tokens: 0,
+            error_message: Some(err_msg.clone()),
+            request_preview: String::new(),
+            response_preview: String::new(),
+        });
         write_json_response(
             &mut stream,
             403,
             &json!({
                 "error": {
-                    "message": format!("API key '{}' is not allowed to call model '{}'", api_key.label, request_model),
+                    "message": err_msg,
                     "type": "permission_error"
                 }
             }),
@@ -2089,6 +2363,58 @@ async fn handle_connection(mut stream: TcpStream) {
                                     let _ = stream.write_all(msg.as_bytes()).await;
                                     let _ = stream.flush().await;
                                 }
+                            } else if is_responses {
+                                // OpenAI Responses API SSE stream
+                                let resp_id = format!("resp_{}", &completion_id[9..]);
+                                let item_id = format!("msg_{}", &completion_id[9..]);
+                                if !anthropic_started {
+                                    anthropic_started = true;
+                                    let ev_created = json!({
+                                        "type": "response.created",
+                                        "response": {
+                                            "id": resp_id,
+                                            "object": "response",
+                                            "created_at": created_ts,
+                                            "status": "in_progress",
+                                            "model": request_model,
+                                            "output": []
+                                        }
+                                    });
+                                    let ev_item = json!({
+                                        "type": "response.output_item.added",
+                                        "output_index": 0,
+                                        "item": {
+                                            "id": item_id,
+                                            "type": "message",
+                                            "status": "in_progress",
+                                            "role": "assistant",
+                                            "content": []
+                                        }
+                                    });
+                                    let _ = stream.write_all(
+                                        format!("event: response.created\ndata: {ev_created}\n\nevent: response.output_item.added\ndata: {ev_item}\n\n").as_bytes()
+                                    ).await;
+                                }
+                                if !parsed.thinking.is_empty() {
+                                    collected_think.push_str(&parsed.thinking);
+                                }
+                                if !parsed.text.is_empty() {
+                                    collected_text.push_str(&parsed.text);
+                                    let ev_delta = json!({
+                                        "type": "response.output_text.delta",
+                                        "item_id": item_id,
+                                        "output_index": 0,
+                                        "content_index": 0,
+                                        "delta": parsed.text
+                                    });
+                                    let _ = stream
+                                        .write_all(format!("event: response.output_text.delta\ndata: {ev_delta}\n\n").as_bytes())
+                                        .await;
+                                    let _ = stream.flush().await;
+                                }
+                                for (id, name, args) in parsed.tool_calls {
+                                    collected_tools.push((id, name, args));
+                                }
                             } else {
                                 // Anthropic SSE stream
                                 if !anthropic_started {
@@ -2201,6 +2527,56 @@ async fn handle_connection(mut stream: TcpStream) {
                         let _ = stream
                             .write_all(format!("data: {done_frame}\n\ndata: [DONE]\n\n").as_bytes())
                             .await;
+                    } else if is_responses {
+                        let resp_id = format!("resp_{}", &completion_id[9..]);
+                        let item_id = format!("msg_{}", &completion_id[9..]);
+                        let mut output_items: Vec<Value> = Vec::new();
+                        if !collected_text.is_empty() {
+                            output_items.push(json!({
+                                "id": item_id,
+                                "type": "message",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [{ "type": "output_text", "text": collected_text, "annotations": [] }]
+                            }));
+                        }
+                        for (id, name, args) in &collected_tools {
+                            output_items.push(json!({
+                                "id": id,
+                                "call_id": id,
+                                "type": "function_call",
+                                "status": "completed",
+                                "name": name,
+                                "arguments": serde_json::to_string(args).unwrap_or_else(|_| "{}".into())
+                            }));
+                        }
+                        let ev_text_done = json!({
+                            "type": "response.output_text.done",
+                            "item_id": item_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "text": collected_text
+                        });
+                        let ev_done = json!({
+                            "type": "response.completed",
+                            "response": {
+                                "id": resp_id,
+                                "object": "response",
+                                "created_at": created_ts,
+                                "status": "completed",
+                                "model": request_model,
+                                "output": output_items,
+                                "output_text": collected_text,
+                                "usage": {
+                                    "input_tokens": total_in,
+                                    "output_tokens": total_out + total_think,
+                                    "total_tokens": total_in + total_out + total_think
+                                }
+                            }
+                        });
+                        let _ = stream.write_all(
+                            format!("event: response.output_text.done\ndata: {ev_text_done}\n\nevent: response.completed\ndata: {ev_done}\n\n").as_bytes()
+                        ).await;
                     } else {
                         if anthropic_in_thinking || anthropic_in_text {
                             let ev = json!({ "type": "content_block_stop", "index": anthropic_block_idx });
@@ -2288,6 +2664,44 @@ async fn handle_connection(mut stream: TcpStream) {
                         "usage": {
                             "prompt_tokens": total_in,
                             "completion_tokens": total_out + total_think,
+                            "total_tokens": total_in + total_out + total_think
+                        }
+                    });
+                    write_json_response(&mut stream, 200, &out_json).await;
+                } else if is_responses {
+                    let resp_id = format!("resp_{}", &completion_id[9..]);
+                    let item_id = format!("msg_{}", &completion_id[9..]);
+                    let mut output_items: Vec<Value> = Vec::new();
+                    if !collected_text.is_empty() {
+                        output_items.push(json!({
+                            "id": item_id,
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{ "type": "output_text", "text": collected_text, "annotations": [] }]
+                        }));
+                    }
+                    for (id, name, args) in &collected_tools {
+                        output_items.push(json!({
+                            "id": id,
+                            "call_id": id,
+                            "type": "function_call",
+                            "status": "completed",
+                            "name": name,
+                            "arguments": serde_json::to_string(args).unwrap_or_else(|_| "{}".into())
+                        }));
+                    }
+                    let out_json = json!({
+                        "id": resp_id,
+                        "object": "response",
+                        "created_at": created_ts,
+                        "status": "completed",
+                        "model": request_model,
+                        "output": output_items,
+                        "output_text": collected_text,
+                        "usage": {
+                            "input_tokens": total_in,
+                            "output_tokens": total_out + total_think,
                             "total_tokens": total_in + total_out + total_think
                         }
                     });
@@ -2396,13 +2810,15 @@ pub async fn start_server() -> Result<ApiServiceStatus, String> {
         .await
         .map_err(|e| format!("Không thể mở cổng {addr}: {e}"))?;
 
-    let (tx, mut rx) = oneshot::channel::<()>();
+    let mut shutdown_txs = Vec::new();
+    let (tx4, mut rx4) = oneshot::channel::<()>();
+    shutdown_txs.push(tx4);
     let started_at = Utc::now().timestamp();
 
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = &mut rx => {
+                _ = &mut rx4 => {
                     break;
                 }
                 accepted = listener.accept() => {
@@ -2419,13 +2835,43 @@ pub async fn start_server() -> Result<ApiServiceStatus, String> {
         }
     });
 
+    // Also bind IPv6 loopback/wildcard so `http://localhost:<port>/v1` resolves immediately on Windows 11
+    let v6_addr = if cfg.access_scope == "lan" {
+        format!("[::]:{}", cfg.port)
+    } else {
+        format!("[::1]:{}", cfg.port)
+    };
+    if let Ok(listener_v6) = TcpListener::bind(&v6_addr).await {
+        let (tx6, mut rx6) = oneshot::channel::<()>();
+        shutdown_txs.push(tx6);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut rx6 => {
+                        break;
+                    }
+                    accepted = listener_v6.accept() => {
+                        match accepted {
+                            Ok((stream, _peer)) => {
+                                tokio::spawn(handle_connection(stream));
+                            }
+                            Err(_) => {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     {
         let mut guard = server_lock().lock().map_err(|_| "Lock poisoned")?;
         *guard = Some(RunningServer {
             host: bind_host.to_string(),
             port: cfg.port,
             started_at,
-            shutdown_tx: Some(tx),
+            shutdown_txs,
         });
     }
 
@@ -2435,7 +2881,7 @@ pub async fn start_server() -> Result<ApiServiceStatus, String> {
 pub fn stop_server() -> Result<ApiServiceStatus, String> {
     if let Ok(mut guard) = server_lock().lock() {
         if let Some(mut running) = guard.take() {
-            if let Some(tx) = running.shutdown_tx.take() {
+            for tx in running.shutdown_txs.drain(..) {
                 let _ = tx.send(());
             }
         }
