@@ -26,12 +26,13 @@ use crate::prompts::open_db;
 // ============================================================================
 
 const ANTIGRAVITY_BASE_URLS: &[&str] = &[
-    "https://cloudcode-pa.googleapis.com",
     "https://daily-cloudcode-pa.googleapis.com",
+    "https://cloudcode-pa.googleapis.com",
 ];
 
-// Official Antigravity IDE fingerprint
-const ANTIGRAVITY_IDE_USER_AGENT: &str = "antigravity/ide/2.1.1 darwin/arm64";
+// Official Antigravity 2.25.0 aidev_client fingerprint (required for Gemini 4 / Claude 5.5 models)
+const ANTIGRAVITY_IDE_USER_AGENT: &str =
+    "antigravity/2.25.0 (aidev_client; os_type=windows; arch=amd64; cl=1003475615)";
 const MAX_ANTIGRAVITY_OUTPUT_TOKENS: u64 = 64_000;
 
 // Default thinking signature for Gemini 3+ functionCall backfill
@@ -49,21 +50,22 @@ const BLACKLISTED_FIELDS: &[&str] = &[
 
 // Built-in Antigravity model catalog
 const BUILTIN_MODELS: &[(&str, &str, &str, bool)] = &[
-    ("gemini-3-flash-agent", "Gemini 3.5 Flash (High)", "gemini", true),
-    ("gemini-3.5-flash-low", "Gemini 3.5 Flash (Medium)", "gemini", true),
-    ("gemini-3.5-flash-extra-low", "Gemini 3.5 Flash (Low)", "gemini", true),
-    ("gemini-pro-agent", "Gemini 3.1 Pro (High)", "gemini", true),
-    ("gemini-3.1-pro-low", "Gemini 3.1 Pro (Low)", "gemini", true),
-    ("gemini-3-flash", "Gemini 3 Flash", "gemini", false),
+    ("gemini-4-neon-medium", "Gemini 4 Neon (Medium)", "gemini", true),
+    ("gemini-4-neon-high", "Gemini 4 Neon (High)", "gemini", true),
+    ("gemini-4-neon-low", "Gemini 4 Neon (Low)", "gemini", true),
+    ("gemini-4-hydrogen-medium", "Gemini 4 Hydrogen (Medium)", "gemini", true),
+    ("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)", "gemini", true),
     ("gemini-4-argon-high", "Gemini 4 Argon (High)", "gemini", true),
     ("gemini-4-argon-medium", "Gemini 4 Argon (Medium)", "gemini", true),
-    ("gemini-4-carbon-high", "Gemini 4 Carbon (High)", "gemini", true),
-    ("gemini-4-carbon-medium", "Gemini 4 Carbon (Medium)", "gemini", true),
-    ("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)", "gemini", true),
+    ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)", "gemini", true),
+    ("gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)", "gemini", true),
+    ("gemini-3-flash-agent", "Gemini 3.5 Flash (High)", "gemini", true),
+    ("gemini-3-flash", "Gemini 3 Flash", "gemini", false),
+    ("claude-sonnet-5-5-medium", "Claude Sonnet 5.5 (Medium)", "claude", true),
+    ("claude-sonnet-5-5-high", "Claude Sonnet 5.5 (High)", "claude", true),
+    ("claude-opus-5-5-high", "Claude Opus 5.5 (High)", "claude", true),
     ("claude-sonnet-4-6", "Claude Sonnet 4.6 (Thinking)", "claude", true),
     ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)", "claude", true),
-    ("claude-sonnet-4-5-thinking", "Claude Sonnet 4.5 (Thinking)", "claude", true),
-    ("claude-opus-4-5-thinking", "Claude Opus 4.5 (Thinking)", "claude", true),
     ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)", "openai", true),
     ("gemini-3.1-flash-image", "Gemini 3.1 Flash (Image)", "image", false),
 ];
@@ -879,6 +881,9 @@ pub fn list_available_models() -> Result<Vec<ApiAvailableModel>, String> {
                         || n.contains(':')
                         || n.ends_with("-5h")
                         || n.ends_with("-weekly")
+                        || n.starts_with("tab_")
+                        || n.starts_with("chat_")
+                        || n.contains("wtu")
                         || seen.contains(n)
                     {
                         continue;
@@ -1428,7 +1433,21 @@ fn parse_antigravity_response_payload(val: &Value) -> ParsedUpstreamChunk {
             .get("candidatesTokenCount")
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        out.output_tokens = candidates_tokens.saturating_sub(out.thinking_tokens);
+        let total_tokens = usage
+            .get("totalTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        // Antigravity 2.25+ reports candidatesTokenCount separately from thoughtsTokenCount
+        // (prompt + candidates + thoughts == total). Only subtract if thoughts are folded in.
+        out.output_tokens = if out.thinking_tokens > 0
+            && candidates_tokens >= out.thinking_tokens
+            && total_tokens > 0
+            && out.input_tokens.saturating_add(candidates_tokens) == total_tokens
+        {
+            candidates_tokens.saturating_sub(out.thinking_tokens)
+        } else {
+            candidates_tokens
+        };
         out.cache_read_tokens = usage
             .get("cachedContentTokenCount")
             .and_then(Value::as_u64)
@@ -1603,8 +1622,10 @@ async fn send_upstream_with_failover(
                         last_err = (status, err_body, acc.id.clone(), acc.email.clone());
                         continue;
                     }
-                    // 400 / 403 / 404: return directly or try fallback endpoint once
-                    last_err = (status, err_body, acc.id.clone(), acc.email.clone());
+                    // 400 / 403 / 404: preserve more specific primary error if secondary fallback returns 404
+                    if !(status == 404 && matches!(last_err.0, 429 | 403 | 500 | 502 | 503)) {
+                        last_err = (status, err_body, acc.id.clone(), acc.email.clone());
+                    }
                     if status == 403 {
                         mark_account_cooldown(&acc.id, &acc.email, 300, "HTTP 403".into());
                         break;

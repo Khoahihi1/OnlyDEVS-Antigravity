@@ -231,16 +231,16 @@
 
 .agx-footer-pickers {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 6px;
+  grid-template-columns: 1fr;
+  gap: 5px;
 }
 
 .agx-footer-select-wrap {
   display: flex;
   align-items: center;
-  gap: 5px;
-  padding: 0 7px;
-  height: 30px;
+  gap: 6px;
+  padding: 0 8px;
+  height: 28px;
   border-radius: 8px;
   border: 1px solid var(--agx-border);
   background: var(--agx-bg-subtle);
