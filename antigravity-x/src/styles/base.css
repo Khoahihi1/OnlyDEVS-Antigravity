@@ -1,0 +1,88 @@
+﻿/* ============================================================================
+   OnlyDEVS — Antigravity Design System (Cockpit Tools Theme Parity)
+   ============================================================================ */
+
+:root {
+  --agx-bg: #f6f5f2;
+  --agx-bg-elevated: rgba(255, 255, 255, 0.82);
+  --agx-bg-solid: #ffffff;
+  --agx-bg-subtle: rgba(238, 242, 247, 0.82);
+  --agx-sidebar-bg: rgba(255, 255, 255, 0.78);
+  --agx-text: #0f172a;
+  --agx-text-secondary: #475569;
+  --agx-muted: #64748b;
+  --agx-subtle: #94a3b8;
+  --agx-border: rgba(15, 23, 42, 0.12);
+  --agx-border-strong: rgba(15, 23, 42, 0.24);
+  --agx-primary: #1d4ed8;
+  --agx-primary-hover: #1e40af;
+  --agx-primary-soft: rgba(29, 78, 216, 0.12);
+  --agx-accent: #0ea5a5;
+  --agx-heading-gradient: linear-gradient(135deg, #1d4ed8, #0ea5a5);
+  --agx-brand-red: #e11d48;
+  --agx-success: #16a34a;
+  --agx-success-soft: rgba(22, 163, 74, 0.14);
+  --agx-warning: #d97706;
+  --agx-warning-soft: rgba(217, 119, 6, 0.14);
+  --agx-danger: #dc2626;
+  --agx-danger-soft: rgba(220, 38, 38, 0.12);
+  --agx-shadow-sm: 0 2px 6px rgba(15, 23, 42, 0.08);
+  --agx-shadow-md: 0 12px 24px rgba(15, 23, 42, 0.12);
+  --agx-shadow-brand: 0 6px 18px rgba(29, 78, 216, 0.24);
+  font-family: "Inter", "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, sans-serif;
+  color: var(--agx-text);
+  color-scheme: light;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Cockpit Tools Light Soft Gradient Canvas */
+body {
+  background:
+    radial-gradient(circle at 12% 10%, rgba(29, 78, 216, 0.12), transparent 45%),
+    radial-gradient(circle at 90% 5%, rgba(14, 165, 165, 0.12), transparent 40%),
+    linear-gradient(180deg, #f8f7f4 0%, #eef1f6 100%);
+  color: var(--agx-text);
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
+select option {
+  background: var(--agx-bg-solid);
+  color: var(--agx-text);
+}
+
+code,
+pre {
+  font-family: "JetBrains Mono", "Cascadia Code", "Cascadia Mono", "Consolas", monospace;
+}
+
+.spin {
+  animation: agx-spin 0.85s linear infinite;
+}
+
+@keyframes agx-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

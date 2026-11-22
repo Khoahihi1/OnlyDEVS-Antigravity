@@ -1,0 +1,42 @@
+[package]
+name = "onlydevs-antigravity"
+version = "1.0.0"
+description = "OnlyDEVS — Antigravity IDE/CLI Control Suite"
+authors = ["KhoaHihi"]
+edition = "2024"
+default-run = "OnlyDEVS-Antigravity"
+
+[[bin]]
+name = "OnlyDEVS-Antigravity"
+path = "src/main.rs"
+
+[lib]
+name = "antigravity_x_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+walkdir = "2"
+which = "7"
+base64 = "0.23"
+regex = "1"
+url = "2"
+reqwest = { version = "0.13", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

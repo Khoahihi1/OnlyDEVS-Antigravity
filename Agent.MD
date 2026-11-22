@@ -1,0 +1,4 @@
+- Luôn ghi nhớ và cập nhật skill & rule trước khi hành động.
+- Chưa có thì tạo md mới trong `skills/` hoặc `rules/`.
+- Toàn bộ dự án là local do người dùng phát triển; mục đích học tập.
+- Không nhắc điều thừa thãi.

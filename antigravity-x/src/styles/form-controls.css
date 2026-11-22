@@ -1,0 +1,53 @@
+﻿/* Shared sizing for full-size form fields. Compact list controls use the
+   smaller primitive explicitly; code editors keep their natural height. */
+:root[data-theme] .agx-providers-field input:not([role="combobox"]):not(:disabled),
+:root[data-theme] .agx-provider-header-field > input:not(:disabled),
+:root[data-theme] .agx-provider-mapping-field > input:not(:disabled),
+:root[data-theme] .agx-overview-home-control input:not(:disabled),
+:root[data-theme] .agx-startup-path-control input:not(:disabled),
+:root[data-theme] .agx-prompts-field input:not(:disabled),
+:root[data-theme] .agx-failover input:not(:disabled) {
+  color: var(--ui-control-text, var(--ui-text));
+  background: var(--ui-control-bg, var(--ui-surface));
+}
+
+.agx-provider-header-field > label { font-size: 12px; line-height: 18px; }
+
+.agx-overview-home-control input,
+.agx-startup-path-control input,
+.agx-prompts-field input,
+.agx-failover input {
+  height: var(--ui-control-height, 40px);
+  min-height: var(--ui-control-height, 40px);
+  border-radius: var(--ui-control-radius, 8px);
+  padding-block: 0;
+  transition: border-color 140ms ease, box-shadow 140ms ease, background-color 140ms ease;
+}
+
+.agx-overview-home-control button,
+.agx-startup-path-control .ui-button {
+  min-height: var(--ui-control-height, 40px);
+  border-radius: var(--ui-control-radius, 8px);
+}
+
+.agx-overview-home-control input:focus,
+.agx-startup-path-control input:focus,
+.agx-prompts-field input:focus,
+.agx-failover input:not([aria-invalid="true"]):focus {
+  outline: none;
+  border-color: var(--ui-control-accent, #2563eb);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-control-accent, #2563eb) 15%, transparent);
+}
+
+.agx-failover-field-input > span {
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agx-overview-home-control input,
+  .agx-startup-path-control input,
+  .agx-prompts-field input,
+  .agx-failover input { transition: none; }
+}
+

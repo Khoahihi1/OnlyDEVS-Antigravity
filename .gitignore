@@ -9,7 +9,11 @@ __pycache__/
 dist/
 build/
 out/
+target/
 *.egg-info/
+*.exe
+*.msi
+*.nsis
 
 # Environment & secrets
 .env
@@ -27,3 +31,5 @@ Thumbs.db
 
 # Local tooling
 .cursor/
+9router-*/
+

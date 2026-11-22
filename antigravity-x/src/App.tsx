@@ -1,0 +1,585 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { AppShell } from "./components/AppShell";
+import { UpdateNotification } from "./components/UpdateNotification";
+import { AccountsPage } from "./pages/AccountsPage";
+import { PluginsPage } from "./pages/PluginsPage";
+import { PromptsPage, type PromptDraft } from "./pages/PromptsPage";
+import { SessionsPage } from "./pages/SessionsPage";
+import { McpSkillsPage } from "./pages/McpSkillsPage";
+import { AboutPage } from "./pages/AboutPage";
+import { agxInvoke } from "./platform/invoke";
+import type {
+  AntigravityAccount,
+  AppLanguage,
+  AppTab,
+  AppTheme,
+  AppThemeColor,
+  InstructionMode,
+  McpSkillsState,
+  OAuthPrepareResult,
+  OverviewState,
+  PluginEntry,
+  PromptCategory,
+  RefreshStats,
+  SavedPrompt,
+  SessionScanResult,
+  SessionStepItem,
+  SwitchHistoryItem,
+  TokenUsageSummary,
+  TotpCodeResult,
+  UpdateCheckResult,
+  VersionJumpInfo,
+} from "./types";
+
+const APP_VERSION = "1.0.0";
+
+const VALID_LANGS: AppLanguage[] = ["vi", "en", "zh-CN", "zh-TW", "ja", "ko", "ru", "de"];
+const VALID_THEME_COLORS: AppThemeColor[] = [
+  "default",
+  "nord",
+  "tokyo-night",
+  "catppuccin",
+  "gruvbox",
+  "everforest",
+  "oled",
+];
+
+function readSavedLang(): AppLanguage {
+  try {
+    const raw = window.localStorage.getItem("onlydevs.lang") as AppLanguage | null;
+    if (raw && VALID_LANGS.includes(raw)) return raw;
+  } catch {
+    // ignore
+  }
+  return "vi";
+}
+
+function readSavedTheme(): AppTheme {
+  try {
+    const raw = window.localStorage.getItem("onlydevs.theme");
+    if (raw === "light" || raw === "dark") return raw;
+  } catch {
+    // ignore
+  }
+  return "dark";
+}
+
+function readSavedThemeColor(): AppThemeColor {
+  try {
+    const raw = window.localStorage.getItem("onlydevs.themeColor") as AppThemeColor | null;
+    if (raw && VALID_THEME_COLORS.includes(raw)) return raw;
+  } catch {
+    // ignore
+  }
+  return "default";
+}
+
+export default function App() {
+  const [tab, setTab] = useState<AppTab>("accounts");
+  const [lang, setLang] = useState<AppLanguage>(readSavedLang);
+  const [theme, setTheme] = useState<AppTheme>(readSavedTheme);
+  const [themeColor, setThemeColor] = useState<AppThemeColor>(readSavedThemeColor);
+  const [loading, setLoading] = useState(false);
+
+  const [overview, setOverview] = useState<OverviewState | null>(null);
+  const [accounts, setAccounts] = useState<AntigravityAccount[]>([]);
+  const [tokenUsage, setTokenUsage] = useState<TokenUsageSummary | null>(null);
+  const [switchHistory, setSwitchHistory] = useState<SwitchHistoryItem[]>([]);
+  const [plugins, setPlugins] = useState<PluginEntry[]>([]);
+  const [prompts, setPrompts] = useState<SavedPrompt[]>([]);
+  const [categories, setCategories] = useState<PromptCategory[]>([]);
+  const [configRaw, setConfigRaw] = useState("{}");
+  const [agentsMd, setAgentsMd] = useState("");
+  const [instructionMode, setInstructionMode] = useState<InstructionMode>("replace");
+  const [sessionScan, setSessionScan] = useState<SessionScanResult | null>(null);
+  const [mcpSkills, setMcpSkills] = useState<McpSkillsState | null>(null);
+
+  const [toast, setToast] = useState<string | null>(null);
+  const [pendingUpdate, setPendingUpdate] = useState<UpdateCheckResult | null>(null);
+
+  const showToast = useCallback((message: string) => {
+    setToast(message);
+    window.setTimeout(() => setToast(null), 3400);
+  }, []);
+
+  const refreshAll = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [ov, accs, usage, hist, plug, pr, cats, cfg, agents, mode, sess, ms] =
+        await Promise.all([
+          agxInvoke<OverviewState>("get_overview_state"),
+          agxInvoke<AntigravityAccount[]>("list_accounts"),
+          agxInvoke<TokenUsageSummary>("get_antigravity_token_usage"),
+          agxInvoke<SwitchHistoryItem[]>("get_switch_history"),
+          agxInvoke<PluginEntry[]>("list_plugins"),
+          agxInvoke<SavedPrompt[]>("list_prompts"),
+          agxInvoke<PromptCategory[]>("list_prompt_categories"),
+          agxInvoke<string>("get_config_raw"),
+          agxInvoke<string>("get_agents_md"),
+          agxInvoke<string>("get_instruction_mode"),
+          agxInvoke<SessionScanResult>("list_sessions"),
+          agxInvoke<McpSkillsState>("list_mcp_and_skills"),
+        ]);
+      setOverview(ov);
+      setAccounts(accs);
+      setTokenUsage(usage);
+      setSwitchHistory(hist);
+      setPlugins(plug);
+      setPrompts(pr);
+      setCategories(cats);
+      setConfigRaw(cfg);
+      setAgentsMd(agents);
+      setInstructionMode(mode === "append" ? "append" : "replace");
+      setSessionScan(sess);
+      setMcpSkills(ms);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLoading(false);
+    }
+  }, [showToast]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try {
+      window.localStorage.setItem("onlydevs.theme", theme);
+    } catch {
+      // ignore
+    }
+  }, [theme]);
+
+  useEffect(() => {
+    document.documentElement.dataset.themeColor = themeColor;
+    try {
+      window.localStorage.setItem("onlydevs.themeColor", themeColor);
+    } catch {
+      // ignore
+    }
+  }, [themeColor]);
+
+  useEffect(() => {
+    document.documentElement.lang = lang;
+    try {
+      window.localStorage.setItem("onlydevs.lang", lang);
+    } catch {
+      // ignore
+    }
+  }, [lang]);
+
+  useEffect(() => {
+    void refreshAll();
+  }, [refreshAll]);
+
+  // Cockpit-style startup version jump notice + silent background update check
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      try {
+        const jump = await agxInvoke<VersionJumpInfo | null>("check_version_jump");
+        if (active && jump) {
+          showToast(
+            `Đã cập nhật OnlyDEVS từ v${jump.previousVersion} → v${jump.currentVersion}`,
+          );
+        }
+      } catch {
+        // ignore
+      }
+      try {
+        const shouldCheck = await agxInvoke<boolean>("should_check_updates");
+        if (!active || !shouldCheck) return;
+        const res = await agxInvoke<UpdateCheckResult>("check_for_updates", {
+          force: false,
+        });
+        if (active && res.hasUpdate && !res.skipped) {
+          setPendingUpdate(res);
+        }
+      } catch {
+        // silent background check
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [showToast]);
+
+  const runtimeLabel = useMemo(() => {
+    if (!overview) return "Detecting...";
+    if (overview.cliVersion) return `CLI v${overview.cliVersion} · Linked`;
+    return overview.configExists ? "CLI / IDE Linked" : "Config Missing";
+  }, [overview]);
+
+  const navBadges = useMemo(() => {
+    const enabledPlugs = plugins.filter((p) => p.enabled).length;
+    const enabledPrompts = prompts.filter((p) => p.enabled).length;
+    const totalSess = sessionScan?.totalSessions ?? 0;
+    const totalMcpSkills =
+      (mcpSkills?.mcpServers.filter((m) => m.enabled).length ?? 0) +
+      (mcpSkills?.skills.filter((s) => s.enabled).length ?? 0);
+
+    return {
+      accounts: accounts.length,
+      plugins: `${enabledPlugs}/${plugins.length}`,
+      prompts: enabledPrompts > 0 ? "ON" : prompts.length,
+      sessions: totalSess,
+      "mcp-skills": totalMcpSkills,
+    };
+  }, [accounts, plugins, prompts, sessionScan, mcpSkills]);
+
+  const page = (() => {
+    switch (tab) {
+      case "accounts":
+        return (
+          <AccountsPage
+            lang={lang}
+            accounts={accounts}
+            tokenUsage={tokenUsage}
+            switchHistory={switchHistory}
+            loading={loading}
+            runtimeLabel={runtimeLabel}
+            onRefreshAllData={refreshAll}
+            onImportLocalAccount={async () => {
+              const acc = await agxInvoke<AntigravityAccount>("import_local_account");
+              showToast(`Đã đồng bộ tài khoản: ${acc.email}`);
+              await refreshAll();
+            }}
+            onAddByToken={async (refreshTokenInput) => {
+              const added = await agxInvoke<AntigravityAccount[]>("add_accounts_by_token", {
+                refreshTokenInput,
+              });
+              showToast(`Đã thêm ${added.length} tài khoản`);
+              await refreshAll();
+            }}
+            onImportContent={async (content) => {
+              const added = await agxInvoke<AntigravityAccount[]>("import_accounts_content", {
+                content,
+              });
+              showToast(`Đã import ${added.length} tài khoản`);
+              await refreshAll();
+            }}
+            onExportAccounts={(accountIds, includeSensitive) =>
+              agxInvoke<string>("export_accounts", { accountIds, includeSensitive })
+            }
+            onFetchQuota={async (accountId) => {
+              const acc = await agxInvoke<AntigravityAccount>("fetch_account_quota", {
+                accountId,
+              });
+              showToast(`Đã cập nhật Quota: ${acc.email}`);
+              await refreshAll();
+            }}
+            onRefreshAllQuotas={async () => {
+              const stats = await agxInvoke<RefreshStats>("refresh_all_quotas");
+              showToast(
+                `Quota: ${stats.success}/${stats.total} thành công${
+                  stats.failed > 0 ? ` (${stats.failed} lỗi)` : ""
+                }`,
+              );
+              await refreshAll();
+              return stats;
+            }}
+            onSwitchAccount={async (accountId, switchTarget) => {
+              const acc = await agxInvoke<AntigravityAccount>("switch_account", {
+                accountId,
+                switchTarget,
+              });
+              showToast(`Đã chuyển sang tài khoản: ${acc.email}`);
+              await refreshAll();
+            }}
+            onUpdateMetadata={async (payload) => {
+              await agxInvoke("update_account_metadata", payload);
+              showToast("Đã lưu thông tin Vault & Tag");
+              await refreshAll();
+            }}
+            onDeleteAccounts={async (accountIds) => {
+              const count = await agxInvoke<number>("delete_accounts", { accountIds });
+              showToast(`Đã xóa ${count} tài khoản`);
+              await refreshAll();
+            }}
+            onPrepareOAuth={() => agxInvoke<OAuthPrepareResult>("prepare_oauth_session")}
+            onSubmitOAuthCallback={async (callbackUrl) => {
+              const acc = await agxInvoke<AntigravityAccount>("submit_oauth_callback_url", {
+                callbackUrl,
+              });
+              showToast(`OAuth thành công: ${acc.email}`);
+              await refreshAll();
+            }}
+            onGenerateTotp={(secret) =>
+              agxInvoke<TotpCodeResult>("generate_totp_code", { secret })
+            }
+            onClearSwitchHistory={async () => {
+              await agxInvoke("clear_switch_history");
+              showToast("Đã xóa lịch sử chuyển đổi");
+              await refreshAll();
+            }}
+          />
+        );
+
+      case "plugins":
+        return (
+          <PluginsPage
+            lang={lang}
+            plugins={plugins}
+            overview={overview}
+            configRaw={configRaw}
+            loading={loading}
+            onRefresh={refreshAll}
+            onInstallBundled={async (customPath) => {
+              const msg = await agxInvoke<string>("install_filter_bypass_plugin", {
+                sourcePath: customPath ?? null,
+              });
+              showToast(msg);
+              await refreshAll();
+            }}
+            onInstallFromFolder={async (sourcePath, pluginId) => {
+              const msg = await agxInvoke<string>("install_plugin_from_folder", {
+                sourcePath,
+                pluginId: pluginId ?? null,
+              });
+              showToast(msg);
+              await refreshAll();
+            }}
+            onInstallFromZip={async (payload) => {
+              const msg = await agxInvoke<string>("install_plugin_from_zip", payload);
+              showToast(msg);
+              await refreshAll();
+            }}
+            onInstallFromGit={async (repoUrl, pluginId) => {
+              const msg = await agxInvoke<string>("install_plugin_from_git", {
+                repoUrl,
+                pluginId: pluginId ?? null,
+              });
+              showToast(msg);
+              await refreshAll();
+            }}
+            onCreateCustomPlugin={async (payload) => {
+              const msg = await agxInvoke<string>("create_custom_plugin", payload);
+              showToast(msg);
+              await refreshAll();
+            }}
+            onUninstallPlugin={async (pluginId) => {
+              const msg = await agxInvoke<string>("uninstall_plugin", { pluginId });
+              showToast(msg);
+              await refreshAll();
+            }}
+            onToggle={async (id, enabled) => {
+              await agxInvoke("set_plugin_enabled", { pluginId: id, enabled });
+              showToast(`${id}: ${enabled ? "Enabled" : "Disabled"}`);
+              await refreshAll();
+            }}
+            onRunSelfTest={async () => {
+              const res = await agxInvoke<string>("run_filter_bypass_test");
+              showToast("Self-test PASSED");
+              return res;
+            }}
+            onGetHooksRaw={(pluginId) =>
+              agxInvoke<string>("get_plugin_hooks_raw", { pluginId })
+            }
+            onSaveHooksRaw={async (pluginId, raw) => {
+              await agxInvoke("save_plugin_hooks_raw", { pluginId, raw });
+              showToast("Đã lưu hooks.json");
+              await refreshAll();
+            }}
+            onSaveConfigRaw={async (raw) => {
+              await agxInvoke("save_config_raw", { raw });
+              showToast("Đã lưu config.json");
+              await refreshAll();
+            }}
+          />
+        );
+
+      case "prompts":
+        return (
+          <PromptsPage
+            lang={lang}
+            prompts={prompts}
+            categories={categories}
+            instructionMode={instructionMode}
+            agentsPreview={agentsMd}
+            loading={loading}
+            onRefresh={refreshAll}
+            onSyncSeedPrompts={async () => {
+              const added = await agxInvoke<number>("sync_seed_prompts");
+              showToast(
+                added > 0
+                  ? `Đã đồng bộ thêm ${added} prompt từ thư mục Prompt`
+                  : "Đã đồng bộ nội dung mới nhất từ thư mục Prompt",
+              );
+            }}
+            onSavePrompt={async (draft: PromptDraft) => {
+              await agxInvoke("upsert_prompt", {
+                id: draft.id ?? null,
+                category: draft.category,
+                title: draft.title,
+                filename: draft.filename,
+                description: draft.description,
+                content: draft.content,
+                enabled: draft.enabled,
+              });
+              showToast(
+                draft.enabled
+                  ? `Đã lưu & ghi "${draft.title}" vào ~/.gemini/config/AGENTS.md`
+                  : `Đã lưu prompt "${draft.title}"`,
+              );
+              await refreshAll();
+            }}
+            onDelete={async (id) => {
+              await agxInvoke("delete_prompt", { id });
+              showToast("Đã xóa prompt");
+              await refreshAll();
+            }}
+            onToggle={async (id, enabled) => {
+              await agxInvoke("set_prompt_enabled", { id, enabled });
+              const target = prompts.find((p) => p.id === id);
+              showToast(
+                enabled
+                  ? `Đã áp dụng "${target?.title ?? id}" vào ~/.gemini/config/AGENTS.md`
+                  : `Đã tắt "${target?.title ?? id}"`,
+              );
+              await refreshAll();
+            }}
+            onSaveAgents={async (content) => {
+              await agxInvoke("save_agents_md", { content });
+              showToast("Đã lưu ~/.gemini/config/AGENTS.md");
+              await refreshAll();
+            }}
+            onModeChange={async (mode) => {
+              await agxInvoke("set_instruction_mode", { mode });
+              setInstructionMode(mode);
+              showToast(
+                mode === "replace"
+                  ? "Chế độ: Thay thế trực tiếp vào ~/.gemini/config/AGENTS.md"
+                  : "Chế độ: Giữ rule gốc + nối thêm vào AGENTS.md",
+              );
+              await refreshAll();
+            }}
+            onCreateCategory={async (name) => {
+              await agxInvoke("create_prompt_category", { name });
+              await refreshAll();
+            }}
+            onDeleteCategory={async (name) => {
+              await agxInvoke("delete_prompt_category", { name });
+              await refreshAll();
+            }}
+          />
+        );
+
+      case "sessions":
+        return (
+          <SessionsPage
+            lang={lang}
+            scan={sessionScan}
+            loading={loading}
+            onRefresh={refreshAll}
+            onSyncSessions={async () => {
+              const msg = await agxInvoke<string>("sync_sessions");
+              showToast(msg);
+              await refreshAll();
+            }}
+            onDeleteSessions={async (ids) => {
+              const msg = await agxInvoke<string>("delete_sessions", { ids });
+              showToast(msg);
+              await refreshAll();
+            }}
+            onExportSessions={async (ids) => {
+              const outPath = await agxInvoke<string>("export_sessions_markdown", { ids });
+              showToast(`Đã xuất Markdown: ${outPath}`);
+            }}
+            onGetTranscript={(sessionId) =>
+              agxInvoke<SessionStepItem[]>("get_session_transcript", { sessionId })
+            }
+          />
+        );
+
+      case "mcp-skills":
+        return (
+          <McpSkillsPage
+            lang={lang}
+            state={mcpSkills}
+            loading={loading}
+            onRefresh={refreshAll}
+            onToggleMcp={async (id, enabled) => {
+              await agxInvoke("set_mcp_enabled", { id, enabled });
+              showToast(`MCP ${id}: ${enabled ? "Enabled" : "Disabled"}`);
+              await refreshAll();
+            }}
+            onUpsertMcp={async (payload) => {
+              await agxInvoke("upsert_mcp_server", payload);
+              showToast(`Đã lưu MCP server ${payload.id}`);
+              await refreshAll();
+            }}
+            onDeleteMcp={async (id) => {
+              await agxInvoke("delete_mcp_server", { id });
+              showToast(`Đã xóa MCP server ${id}`);
+              await refreshAll();
+            }}
+            onGetMcpConfigRaw={() => agxInvoke<string>("get_mcp_config_raw")}
+            onSaveMcpConfigRaw={async (raw) => {
+              await agxInvoke("save_mcp_config_raw", { raw });
+              showToast("Đã lưu mcp_config.json");
+              await refreshAll();
+            }}
+            onToggleSkill={async (id, enabled) => {
+              await agxInvoke("set_skill_enabled", { id, enabled });
+              showToast(`Skill ${id}: ${enabled ? "Enabled" : "Disabled"}`);
+              await refreshAll();
+            }}
+            onGetSkillContent={(id, source) =>
+              agxInvoke<string>("get_skill_content", { id, source })
+            }
+            onUpsertSkill={async (payload) => {
+              await agxInvoke("upsert_skill", payload);
+              showToast(`Đã lưu Skill ${payload.id}`);
+              await refreshAll();
+            }}
+            onDeleteSkill={async (id) => {
+              await agxInvoke("delete_skill", { id });
+              showToast(`Đã xóa Skill ${id}`);
+              await refreshAll();
+            }}
+            onSaveNote={async (kind, id, note) => {
+              await agxInvoke("save_item_note", { kind, id, note });
+              showToast("Đã lưu ghi chú");
+              await refreshAll();
+            }}
+          />
+        );
+
+      case "about":
+        return (
+          <AboutPage
+            lang={lang}
+            overview={overview}
+            appVersion={APP_VERSION}
+            onRefresh={refreshAll}
+            onOpenUpdateModal={(res) => setPendingUpdate(res)}
+          />
+        );
+    }
+  })();
+
+  return (
+    <>
+      <AppShell
+        activeTab={tab}
+        onTabChange={setTab}
+        lang={lang}
+        onLangChange={setLang}
+        theme={theme}
+        onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+        themeColor={themeColor}
+        onThemeColorChange={setThemeColor}
+        appVersion={APP_VERSION}
+        runtimeLabel={runtimeLabel}
+        badges={navBadges}
+      >
+        {page}
+      </AppShell>
+      <UpdateNotification
+        lang={lang}
+        update={pendingUpdate}
+        onClose={() => setPendingUpdate(null)}
+        onSkipped={(ver) => showToast(`Đã bỏ qua phiên bản v${ver}`)}
+      />
+      {toast && <div className="agx-toast">{toast}</div>}
+    </>
+  );
+}
