@@ -11,6 +11,12 @@ mod updater;
 
 use prompts::InstructionMode;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Emitter, Manager, WindowEvent};
+
+static ALLOW_APP_EXIT: AtomicBool = AtomicBool::new(false);
 
 #[tauri::command]
 fn get_overview_state() -> Result<config::OverviewState, String> {
@@ -605,23 +611,51 @@ fn api_service_save_config(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn api_service_create_key(
     label: String,
     allowed_models: Vec<String>,
     pinned_account_ids: Vec<String>,
+    allowed_profile: Option<String>,
+    rate_limit_rpm: Option<u32>,
+    daily_token_limit: Option<u64>,
+    expires_at: Option<i64>,
 ) -> Result<api_service::ApiKeyRecord, String> {
-    api_service::create_api_key(label, allowed_models, pinned_account_ids)
+    api_service::create_api_key(
+        label,
+        allowed_models,
+        pinned_account_ids,
+        allowed_profile,
+        rate_limit_rpm,
+        daily_token_limit,
+        expires_at,
+    )
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn api_service_update_key(
     id: String,
     label: Option<String>,
     enabled: Option<bool>,
     allowed_models: Option<Vec<String>>,
     pinned_account_ids: Option<Vec<String>>,
+    allowed_profile: Option<String>,
+    rate_limit_rpm: Option<u32>,
+    daily_token_limit: Option<u64>,
+    expires_at: Option<Option<i64>>,
 ) -> Result<api_service::ApiKeyRecord, String> {
-    api_service::update_api_key(id, label, enabled, allowed_models, pinned_account_ids)
+    api_service::update_api_key(
+        id,
+        label,
+        enabled,
+        allowed_models,
+        pinned_account_ids,
+        allowed_profile,
+        rate_limit_rpm,
+        daily_token_limit,
+        expires_at,
+    )
 }
 
 #[tauri::command]
@@ -688,10 +722,114 @@ async fn api_service_open_lan_firewall(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.unminimize();
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
-        .setup(|_app| {
+        .setup(|app| {
             api_service::spawn_auto_start_if_enabled();
+            api_service::spawn_background_quota_worker(app.handle().clone());
+
+            // Native System Tray so API Router keeps running when closing the window
+            if let Ok(item_show) = MenuItem::with_id(
+                app,
+                "tray_show",
+                "Mở OnlyDEVS Antigravity",
+                true,
+                None::<&str>,
+            ) {
+                if let (Ok(item_toggle), Ok(sep), Ok(item_quit)) = (
+                    MenuItem::with_id(
+                        app,
+                        "tray_toggle_api",
+                        "Bật / Tắt API Router",
+                        true,
+                        None::<&str>,
+                    ),
+                    PredefinedMenuItem::separator(app),
+                    MenuItem::with_id(
+                        app,
+                        "tray_quit",
+                        "Thoát hẳn (Dừng API)",
+                        true,
+                        None::<&str>,
+                    ),
+                ) {
+                    if let Ok(menu) =
+                        Menu::with_items(app, &[&item_show, &item_toggle, &sep, &item_quit])
+                    {
+                        let mut builder = TrayIconBuilder::with_id("onlydevs-tray")
+                            .tooltip("OnlyDEVS — Antigravity API Router")
+                            .menu(&menu)
+                            .show_menu_on_left_click(false)
+                            .on_menu_event(|app_handle, event| match event.id().as_ref() {
+                                "tray_show" => {
+                                    if let Some(win) = app_handle.get_webview_window("main") {
+                                        let _ = win.unminimize();
+                                        let _ = win.show();
+                                        let _ = win.set_focus();
+                                    }
+                                }
+                                "tray_toggle_api" => {
+                                    let handle = app_handle.clone();
+                                    tauri::async_runtime::spawn(async move {
+                                        let res = if api_service::is_server_running() {
+                                            api_service::stop_server().await
+                                        } else {
+                                            api_service::start_server().await
+                                        };
+                                        if let Ok(status) = res {
+                                            let _ = handle.emit("api-service-status-changed", status);
+                                        }
+                                    });
+                                }
+                                "tray_quit" => {
+                                    ALLOW_APP_EXIT.store(true, Ordering::SeqCst);
+                                    api_service::stop_server_sync();
+                                    app_handle.exit(0);
+                                }
+                                _ => {}
+                            })
+                            .on_tray_icon_event(|tray, event| {
+                                if let TrayIconEvent::Click {
+                                    button: MouseButton::Left,
+                                    button_state: MouseButtonState::Up,
+                                    ..
+                                } = event
+                                {
+                                    if let Some(win) = tray.app_handle().get_webview_window("main") {
+                                        let _ = win.unminimize();
+                                        let _ = win.show();
+                                        let _ = win.set_focus();
+                                    }
+                                }
+                            });
+                        if let Some(icon) = app.default_window_icon() {
+                            builder = builder.icon(icon.clone());
+                        }
+                        let _ = builder.build(app);
+                    }
+                }
+            }
+
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if !ALLOW_APP_EXIT.load(Ordering::SeqCst) {
+                    let minimize = api_service::load_config()
+                        .map(|c| c.minimize_to_tray)
+                        .unwrap_or(true);
+                    if minimize {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_overview_state,

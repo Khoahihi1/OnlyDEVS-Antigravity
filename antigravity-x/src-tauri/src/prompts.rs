@@ -3,6 +3,8 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
+use std::sync::OnceLock;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::paths;
@@ -95,76 +97,88 @@ pub fn strip_md_ext(name: &str) -> String {
     }
 }
 
+static BASE_DB_READY: OnceLock<()> = OnceLock::new();
+
 pub(crate) fn open_db() -> Result<Connection, String> {
     let app_home = paths::app_home()?;
-    fs::create_dir_all(&app_home).map_err(|e| format!("Tạo app home: {e}"))?;
+    if BASE_DB_READY.get().is_none() {
+        fs::create_dir_all(&app_home).map_err(|e| format!("Tạo app home: {e}"))?;
+    }
     let db_path = paths::db_path()?;
     let conn = Connection::open(db_path).map_err(|e| format!("Mở DB: {e}"))?;
-    conn.execute_batch(
-        "
-        CREATE TABLE IF NOT EXISTS prompts (
-            id TEXT PRIMARY KEY,
-            category TEXT NOT NULL,
-            title TEXT NOT NULL,
-            filename TEXT NOT NULL,
-            content TEXT NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT NOT NULL,
-            description TEXT NOT NULL DEFAULT ''
-        );
-        CREATE TABLE IF NOT EXISTS prompt_categories (
-            name TEXT PRIMARY KEY,
-            sort_order INTEGER NOT NULL DEFAULT 100
-        );
-        CREATE TABLE IF NOT EXISTS app_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS mcp_stash (
-            id TEXT PRIMARY KEY,
-            config_json TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS item_notes (
-            kind TEXT NOT NULL,
-            id TEXT NOT NULL,
-            note TEXT NOT NULL,
-            PRIMARY KEY (kind, id)
-        );
-        ",
-    )
-    .map_err(|e| format!("Init schema: {e}"))?;
+    let _ = conn.busy_timeout(Duration::from_millis(5000));
+    let _ = conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA temp_store = MEMORY;");
 
-    let _ = conn.execute(
-        "ALTER TABLE prompts ADD COLUMN description TEXT NOT NULL DEFAULT ''",
-        [],
-    );
+    if BASE_DB_READY.get().is_none() {
+        let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS prompts (
+                id TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                title TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                content TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS prompt_categories (
+                name TEXT PRIMARY KEY,
+                sort_order INTEGER NOT NULL DEFAULT 100
+            );
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS mcp_stash (
+                id TEXT PRIMARY KEY,
+                config_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS item_notes (
+                kind TEXT NOT NULL,
+                id TEXT NOT NULL,
+                note TEXT NOT NULL,
+                PRIMARY KEY (kind, id)
+            );
+            ",
+        )
+        .map_err(|e| format!("Init schema: {e}"))?;
 
-    let _ = conn.execute(
-        "UPDATE prompts SET title = substr(title, 1, length(title) - 3) WHERE lower(title) LIKE '%.md'",
-        [],
-    );
-
-    // Purge legacy Codex-X gpt-* example prompts if they were seeded earlier
-    for legacy_file in LEGACY_CODEX_FILENAMES {
         let _ = conn.execute(
-            "DELETE FROM prompts WHERE lower(filename) = lower(?1)",
-            params![legacy_file],
+            "ALTER TABLE prompts ADD COLUMN description TEXT NOT NULL DEFAULT ''",
+            [],
         );
-    }
 
-    for (idx, cat) in [
-        "Security / reverse",
-        "Software development",
-        "Writing",
-    ]
-    .iter()
-    .enumerate()
-    {
         let _ = conn.execute(
-            "INSERT OR IGNORE INTO prompt_categories (name, sort_order) VALUES (?1, ?2)",
-            params![cat, (idx as i64) * 10],
+            "UPDATE prompts SET title = substr(title, 1, length(title) - 3) WHERE lower(title) LIKE '%.md'",
+            [],
         );
+
+        // Purge legacy Codex-X gpt-* example prompts if they were seeded earlier
+        for legacy_file in LEGACY_CODEX_FILENAMES {
+            let _ = conn.execute(
+                "DELETE FROM prompts WHERE lower(filename) = lower(?1)",
+                params![legacy_file],
+            );
+        }
+
+        for (idx, cat) in [
+            "Security / reverse",
+            "Software development",
+            "Writing",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO prompt_categories (name, sort_order) VALUES (?1, ?2)",
+                params![cat, (idx as i64) * 10],
+            );
+        }
+
+        let _ = BASE_DB_READY.set(());
     }
 
     Ok(conn)

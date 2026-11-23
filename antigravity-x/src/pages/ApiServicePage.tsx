@@ -184,6 +184,10 @@ export function ApiServicePage({
   const [keyModalOpen, setKeyModalOpen] = useState(false);
   const [newKeyLabel, setNewKeyLabel] = useState("");
   const [newKeyModels, setNewKeyModels] = useState("");
+  const [newKeyProfile, setNewKeyProfile] = useState<"all" | "classic" | "full_nextgen">("all");
+  const [newKeyRpm, setNewKeyRpm] = useState("0");
+  const [newKeyDailyTokens, setNewKeyDailyTokens] = useState("0");
+  const [newKeyExpireDays, setNewKeyExpireDays] = useState("0");
   const [newKeyPinned, setNewKeyPinned] = useState<Set<string>>(new Set());
 
   const [addRulePattern, setAddRulePattern] = useState("");
@@ -597,13 +601,26 @@ export function ApiServicePage({
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean);
+      const rpmNum = Math.max(0, Math.floor(Number(newKeyRpm) || 0));
+      const dailyCapNum = Math.max(0, Math.floor(Number(newKeyDailyTokens) || 0));
+      const expDays = Math.max(0, Number(newKeyExpireDays) || 0);
+      const expiresAt =
+        expDays > 0 ? Math.floor(Date.now() / 1000 + expDays * 86400) : null;
       await agxInvoke("api_service_create_key", {
         label: newKeyLabel.trim(),
         allowedModels: allowed,
         pinnedAccountIds: Array.from(newKeyPinned),
+        allowedProfile: newKeyProfile,
+        rateLimitRpm: rpmNum,
+        dailyTokenLimit: dailyCapNum,
+        expiresAt,
       });
       setNewKeyLabel("");
       setNewKeyModels("");
+      setNewKeyProfile("all");
+      setNewKeyRpm("0");
+      setNewKeyDailyTokens("0");
+      setNewKeyExpireDays("0");
       setNewKeyPinned(new Set());
       setKeyModalOpen(false);
       await loadAll();
@@ -665,7 +682,7 @@ export function ApiServicePage({
       if (logStatusFilter === "ok" && (l.statusCode < 200 || l.statusCode >= 300)) return false;
       if (logStatusFilter === "err" && l.statusCode >= 200 && l.statusCode < 300) return false;
       if (q) {
-        const hay = `${l.requestModel} ${l.resolvedModel} ${l.accountEmail} ${l.apiKeyLabel} ${l.errorMessage ?? ""}`.toLowerCase();
+        const hay = `${l.requestModel} ${l.resolvedModel} ${l.accountEmail} ${l.apiKeyLabel} ${l.clientIp ?? ""} ${l.errorMessage ?? ""}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -1446,6 +1463,27 @@ print(resp.choices[0].message.content)`;
                   placeholder="http://127.0.0.1:7890"
                 />
               </label>
+
+              <label className="agx-field">
+                <span>
+                  {vi
+                    ? "Tự quét Quota nền (phút, 0 = tắt)"
+                    : "Background Quota Refresh (min, 0 = off)"}
+                </span>
+                <input
+                  type="number"
+                  min={0}
+                  max={1440}
+                  className="agx-input"
+                  value={cfgDraft.autoRefreshQuotaMinutes ?? 10}
+                  onChange={(e) =>
+                    setCfgDraft({
+                      ...cfgDraft,
+                      autoRefreshQuotaMinutes: Math.max(0, Math.min(1440, Number(e.target.value) || 0)),
+                    })
+                  }
+                />
+              </label>
             </div>
 
             <div className="ag-api-switches">
@@ -1461,6 +1499,21 @@ print(resp.choices[0].message.content)`;
                   {vi
                     ? "Tự động khởi chạy API Router khi mở OnlyDEVS"
                     : "Auto-start API Router on app launch"}
+                </span>
+              </label>
+
+              <label className="ag-select-all-label">
+                <input
+                  type="checkbox"
+                  checked={cfgDraft.minimizeToTray ?? true}
+                  onChange={(e) =>
+                    setCfgDraft({ ...cfgDraft, minimizeToTray: e.target.checked })
+                  }
+                />
+                <span>
+                  {vi
+                    ? "Thu nhỏ xuống khay hệ thống (System Tray) khi bấm đóng cửa sổ — giữ API chạy nền"
+                    : "Minimize to System Tray on close — keep API Router running in background"}
                 </span>
               </label>
 
@@ -1544,7 +1597,7 @@ print(resp.choices[0].message.content)`;
                   <tr>
                     <th>{vi ? "Nhãn" : "Label"}</th>
                     <th>Key</th>
-                    <th>{vi ? "Phạm vi Model" : "Model Scope"}</th>
+                    <th>{vi ? "Nhóm Pro & Giới hạn" : "Pool Tier & Limits"}</th>
                     <th className="is-num">{vi ? "Lượt gọi" : "Requests"}</th>
                     <th className="is-num">Tokens</th>
                     <th>{vi ? "Trạng thái" : "Status"}</th>
@@ -1552,7 +1605,12 @@ print(resp.choices[0].message.content)`;
                   </tr>
                 </thead>
                 <tbody>
-                  {status.keys.map((k) => (
+                  {status.keys.map((k) => {
+                    const isExpired =
+                      Boolean(k.expiresAt) &&
+                      (k.expiresAt ?? 0) > 0 &&
+                      Math.floor(Date.now() / 1000) >= (k.expiresAt ?? 0);
+                    return (
                     <tr key={k.id}>
                       <td>
                         <strong>{k.label}</strong>
@@ -1566,17 +1624,65 @@ print(resp.choices[0].message.content)`;
                         <code>{maskKey(k.key, revealMasterKey)}</code>
                       </td>
                       <td>
-                        {k.allowedModels.length > 0
-                          ? k.allowedModels.join(", ")
-                          : vi
-                            ? "Tất cả mô hình"
-                            : "All models"}
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 4, alignItems: "center" }}>
+                          {k.allowedProfile === "classic" ? (
+                            <span className="ag-api-profile-pill is-classic">
+                              Chỉ Classic (3.8/C4.6)
+                            </span>
+                          ) : k.allowedProfile === "full_nextgen" ? (
+                            <span className="ag-api-profile-pill is-full">
+                              Chỉ Full (Argon/G4/C5.5)
+                            </span>
+                          ) : (
+                            <span className="agx-muted" style={{ fontSize: 12 }}>
+                              {vi ? "Tất cả Pro" : "All tiers"}
+                            </span>
+                          )}
+                          {k.rateLimitRpm > 0 ? (
+                            <span className="ag-api-protocol-pill">
+                              {k.rateLimitRpm} RPM
+                            </span>
+                          ) : null}
+                          {k.dailyTokenLimit > 0 ? (
+                            <span className="ag-api-protocol-pill">
+                              {formatTokensShort(k.dailyTokenLimit, 1)}/ngày
+                            </span>
+                          ) : null}
+                          {k.expiresAt ? (
+                            <span className={isExpired ? "ag-badge-err" : "ag-badge-warn"}>
+                              {isExpired
+                                ? vi
+                                  ? "Đã hết hạn"
+                                  : "Expired"
+                                : `HSD ${formatTime(k.expiresAt)}`}
+                            </span>
+                          ) : null}
+                          {k.allowedModels.length > 0 ? (
+                            <span className="ag-token-cell-sub">
+                              Model: {k.allowedModels.join(", ")}
+                            </span>
+                          ) : null}
+                        </div>
                       </td>
                       <td className="is-num">{formatExactNumber(k.totalRequests)}</td>
                       <td className="is-num">{formatTokensShort(k.totalTokens, 2)}</td>
                       <td>
-                        <span className={k.enabled ? "ag-badge-current" : "ag-badge-err"}>
-                          {k.enabled ? (vi ? "Bật" : "Active") : vi ? "Tắt" : "Disabled"}
+                        <span
+                          className={
+                            k.enabled && !isExpired ? "ag-badge-current" : "ag-badge-err"
+                          }
+                        >
+                          {isExpired
+                            ? vi
+                              ? "Hết hạn"
+                              : "Expired"
+                            : k.enabled
+                              ? vi
+                                ? "Bật"
+                                : "Active"
+                              : vi
+                                ? "Tắt"
+                                : "Disabled"}
                         </span>
                       </td>
                       <td className="is-num">
@@ -1630,7 +1736,8 @@ print(resp.choices[0].message.content)`;
                         </div>
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -2032,6 +2139,7 @@ print(resp.choices[0].message.content)`;
               <thead>
                 <tr>
                   <th>{vi ? "Thời gian" : "Time"}</th>
+                  <th>Client IP</th>
                   <th>Status</th>
                   <th>Protocol</th>
                   <th>Model</th>
@@ -2046,7 +2154,7 @@ print(resp.choices[0].message.content)`;
               <tbody>
                 {filteredLogs.length === 0 ? (
                   <tr>
-                    <td colSpan={10} style={{ textAlign: "center", padding: 28 }}>
+                    <td colSpan={11} style={{ textAlign: "center", padding: 28 }}>
                       {vi
                         ? "Chưa có lượt gọi API nào — thử gửi request ở tab Hướng dẫn & Test!"
                         : "No API requests logged yet."}
@@ -2062,6 +2170,9 @@ print(resp.choices[0].message.content)`;
                       <td>
                         <Clock size={11} style={{ marginRight: 4, opacity: 0.6 }} />
                         {formatTime(l.timestamp)}
+                      </td>
+                      <td>
+                        <code style={{ fontSize: 11.5 }}>{l.clientIp || "—"}</code>
                       </td>
                       <td>
                         <span
@@ -2444,6 +2555,80 @@ print(resp.choices[0].message.content)`;
                 <label className="agx-field">
                   <span>
                     {vi
+                      ? "Khóa theo nhóm Pro (bảo vệ quota Argon / G4)"
+                      : "Pro Pool Tier Lock"}
+                  </span>
+                  <select
+                    className="agx-input"
+                    value={newKeyProfile}
+                    onChange={(e) =>
+                      setNewKeyProfile(e.target.value as "all" | "classic" | "full_nextgen")
+                    }
+                  >
+                    <option value="all">
+                      {vi ? "Tất cả nhóm Pro (Mặc định)" : "All Pro tiers (Default)"}
+                    </option>
+                    <option value="classic">
+                      {vi
+                        ? "Chỉ Pro · Classic (G3.8 / Claude 4.6 — giữ nguyên Argon/G4)"
+                        : "Pro · Classic only (G3.8 / Claude 4.6)"}
+                    </option>
+                    <option value="full_nextgen">
+                      {vi
+                        ? "Chỉ Pro · Full Next-Gen (Argon / G4 / Claude 5.5)"
+                        : "Pro · Full Next-Gen only (Argon / G4 / C5.5)"}
+                    </option>
+                  </select>
+                </label>
+
+                <div className="ag-vault-grid">
+                  <label className="agx-field">
+                    <span>
+                      {vi ? "Giới hạn tốc độ (Req/phút, 0 = không)" : "Rate Limit (RPM, 0 = none)"}
+                    </span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={600}
+                      className="agx-input"
+                      value={newKeyRpm}
+                      onChange={(e) => setNewKeyRpm(e.target.value)}
+                      placeholder="0"
+                    />
+                  </label>
+                  <label className="agx-field">
+                    <span>
+                      {vi ? "Hạn mức Token/ngày (0 = không)" : "Daily Token Cap (0 = none)"}
+                    </span>
+                    <input
+                      type="number"
+                      min={0}
+                      step={50000}
+                      className="agx-input"
+                      value={newKeyDailyTokens}
+                      onChange={(e) => setNewKeyDailyTokens(e.target.value)}
+                      placeholder="0"
+                    />
+                  </label>
+                  <label className="agx-field">
+                    <span>
+                      {vi ? "Hết hạn sau (ngày, 0 = vĩnh viễn)" : "Expires in (days, 0 = never)"}
+                    </span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={365}
+                      className="agx-input"
+                      value={newKeyExpireDays}
+                      onChange={(e) => setNewKeyExpireDays(e.target.value)}
+                      placeholder="0"
+                    />
+                  </label>
+                </div>
+
+                <label className="agx-field">
+                  <span>
+                    {vi
                       ? "Giới hạn Model (phân tách dấu phẩy, để trống = tất cả)"
                       : "Allowed Models (comma-separated, empty = all)"}
                   </span>
@@ -2518,8 +2703,10 @@ print(resp.choices[0].message.content)`;
                   {inspectLog.resolvedModel}
                 </h3>
                 <span className="agx-muted">
-                  {formatTime(inspectLog.timestamp)} · {inspectLog.accountEmail || "—"} ·{" "}
-                  {inspectLog.apiKeyLabel} · {inspectLog.latencyMs}ms
+                  {formatTime(inspectLog.timestamp)}
+                  {inspectLog.clientIp ? ` · IP ${inspectLog.clientIp}` : ""} ·{" "}
+                  {inspectLog.accountEmail || "—"} · {inspectLog.apiKeyLabel} ·{" "}
+                  {inspectLog.latencyMs}ms
                 </span>
               </div>
               <button

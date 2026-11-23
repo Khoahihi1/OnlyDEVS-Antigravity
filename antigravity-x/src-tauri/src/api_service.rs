@@ -9,9 +9,9 @@ use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -112,6 +112,22 @@ fn default_true() -> bool {
     true
 }
 
+fn default_auto_refresh_minutes() -> u64 {
+    10
+}
+
+fn default_allowed_profile() -> String {
+    "all".into()
+}
+
+fn normalize_allowed_profile(raw: Option<&str>) -> String {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("classic") => "classic".into(),
+        Some("full_nextgen") | Some("full") => "full_nextgen".into(),
+        _ => "all".into(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiServiceConfig {
@@ -129,6 +145,12 @@ pub struct ApiServiceConfig {
     #[serde(default = "default_true")]
     pub preserve_exclusive_accounts: bool,
     pub auto_start: bool,
+    /// Hide window to system tray when clicking Close (keeps API Router running in background)
+    #[serde(default = "default_true")]
+    pub minimize_to_tray: bool,
+    /// Periodically refresh pool account quotas in background while API Router is running (0 = off)
+    #[serde(default = "default_auto_refresh_minutes")]
+    pub auto_refresh_quota_minutes: u64,
     pub timeout_seconds: u64,
     pub max_retries: u32,
     pub cooldown_seconds: u64,
@@ -146,6 +168,8 @@ impl Default for ApiServiceConfig {
             use_all_accounts_when_empty: true,
             preserve_exclusive_accounts: true,
             auto_start: false,
+            minimize_to_tray: true,
+            auto_refresh_quota_minutes: 10,
             timeout_seconds: 180,
             max_retries: 2,
             cooldown_seconds: 60,
@@ -190,6 +214,18 @@ pub struct ApiKeyRecord {
     pub is_master: bool,
     pub allowed_models: Vec<String>,
     pub pinned_account_ids: Vec<String>,
+    /// "all" | "full_nextgen" | "classic" — restrict key to a specific Pro pool group
+    #[serde(default = "default_allowed_profile")]
+    pub allowed_profile: String,
+    /// Max requests per minute (0 = unlimited)
+    #[serde(default)]
+    pub rate_limit_rpm: u32,
+    /// Max tokens per UTC day (0 = unlimited)
+    #[serde(default)]
+    pub daily_token_limit: u64,
+    /// Optional unix timestamp expiry (None = never expires)
+    #[serde(default)]
+    pub expires_at: Option<i64>,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
     pub total_requests: u64,
@@ -262,6 +298,8 @@ pub struct ApiRequestLogItem {
     pub error_message: Option<String>,
     pub request_preview: String,
     pub response_preview: String,
+    #[serde(default)]
+    pub client_ip: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,9 +408,158 @@ static STICKY_MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 /// Cached shared upstream HTTP/2+TLS connection pool keyed by (timeout_secs, proxy_url)
 static UPSTREAM_CLIENT_CACHE: OnceLock<Mutex<Option<((u64, String), reqwest::Client)>>> =
     OnceLock::new();
+static API_SCHEMA_READY: OnceLock<()> = OnceLock::new();
+static CONFIG_CACHE: OnceLock<RwLock<Option<ApiServiceConfig>>> = OnceLock::new();
+static API_KEYS_CACHE: OnceLock<RwLock<Option<Vec<ApiKeyRecord>>>> = OnceLock::new();
+/// Sliding 60s request timestamps per API key for RPM rate limiting
+static KEY_RPM_BUCKETS: OnceLock<Mutex<HashMap<String, VecDeque<Instant>>>> = OnceLock::new();
+/// Cached per-key token totals for current UTC date ("YYYY-MM-DD")
+static KEY_DAILY_TOKENS: OnceLock<Mutex<HashMap<String, (String, u64)>>> = OnceLock::new();
+/// Debounce post-429 background quota refreshes per account (min 90s interval)
+static POST_429_REFRESH_DEBOUNCE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 fn upstream_client_cache() -> &'static Mutex<Option<((u64, String), reqwest::Client)>> {
     UPSTREAM_CLIENT_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn config_cache() -> &'static RwLock<Option<ApiServiceConfig>> {
+    CONFIG_CACHE.get_or_init(|| RwLock::new(None))
+}
+
+fn api_keys_cache() -> &'static RwLock<Option<Vec<ApiKeyRecord>>> {
+    API_KEYS_CACHE.get_or_init(|| RwLock::new(None))
+}
+
+fn key_rpm_buckets() -> &'static Mutex<HashMap<String, VecDeque<Instant>>> {
+    KEY_RPM_BUCKETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn key_daily_tokens() -> &'static Mutex<HashMap<String, (String, u64)>> {
+    KEY_DAILY_TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn post_429_refresh_debounce() -> &'static Mutex<HashMap<String, Instant>> {
+    POST_429_REFRESH_DEBOUNCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn invalidate_api_keys_cache() {
+    if let Ok(mut guard) = api_keys_cache().write() {
+        *guard = None;
+    }
+}
+
+fn utc_today_key() -> String {
+    Utc::now().format("%Y-%m-%d").to_string()
+}
+
+fn utc_today_start_ts() -> i64 {
+    let now = Utc::now();
+    now.date_naive()
+        .and_hms_opt(0, 0, 0)
+        .map(|dt| dt.and_utc().timestamp())
+        .unwrap_or_else(|| now.timestamp() - 86_400)
+}
+
+fn query_key_today_tokens_db(key_id: &str) -> u64 {
+    let Ok(conn) = open_db() else {
+        return 0;
+    };
+    if ensure_api_schema(&conn).is_err() {
+        return 0;
+    }
+    let start_ts = utc_today_start_ts();
+    conn.query_row(
+        "SELECT COALESCE(SUM(total_tokens), 0) FROM api_service_logs WHERE api_key_id = ?1 AND timestamp >= ?2",
+        params![key_id, start_ts],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+    .max(0) as u64
+}
+
+fn get_key_daily_tokens(key_id: &str) -> u64 {
+    let today = utc_today_key();
+    if let Ok(map) = key_daily_tokens().lock() {
+        if let Some((day, used)) = map.get(key_id) {
+            if day == &today {
+                return *used;
+            }
+        }
+    }
+    let seeded = query_key_today_tokens_db(key_id);
+    if let Ok(mut map) = key_daily_tokens().lock() {
+        map.insert(key_id.to_string(), (today, seeded));
+    }
+    seeded
+}
+
+fn bump_key_daily_tokens(key_id: &str, added: u64) {
+    if added == 0 || key_id.is_empty() || key_id == "invalid" {
+        return;
+    }
+    let today = utc_today_key();
+    if let Ok(mut map) = key_daily_tokens().lock() {
+        match map.get_mut(key_id) {
+            Some((day, used)) if day == &today => {
+                *used = used.saturating_add(added);
+            }
+            _ => {
+                map.insert(key_id.to_string(), (today, added));
+            }
+        }
+    }
+}
+
+/// Enforces per-key expiry, sliding 60s RPM limit, and daily token quota.
+fn check_api_key_limits(key: &ApiKeyRecord) -> Result<(), (u16, String, &'static str)> {
+    if let Some(exp) = key.expires_at {
+        if exp > 0 && Utc::now().timestamp() >= exp {
+            return Err((
+                401,
+                format!("API key '{}' đã hết hạn sử dụng.", key.label),
+                "authentication_error",
+            ));
+        }
+    }
+    if key.rate_limit_rpm > 0 {
+        let now = Instant::now();
+        let window = Duration::from_secs(60);
+        if let Ok(mut buckets) = key_rpm_buckets().lock() {
+            let q = buckets.entry(key.id.clone()).or_default();
+            while let Some(&front) = q.front() {
+                if now.duration_since(front) >= window {
+                    q.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if q.len() >= key.rate_limit_rpm as usize {
+                return Err((
+                    429,
+                    format!(
+                        "API key '{}' vượt giới hạn tốc độ ({} req/phút). Vui lòng thử lại sau ít giây.",
+                        key.label, key.rate_limit_rpm
+                    ),
+                    "rate_limit_error",
+                ));
+            }
+            q.push_back(now);
+        }
+    }
+    if key.daily_token_limit > 0 {
+        let used_today = get_key_daily_tokens(&key.id);
+        if used_today >= key.daily_token_limit {
+            return Err((
+                429,
+                format!(
+                    "API key '{}' đã đạt hạn mức token trong ngày ({} / {} tokens).",
+                    key.label, used_today, key.daily_token_limit
+                ),
+                "rate_limit_error",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn server_lock() -> &'static Mutex<Option<RunningServer>> {
@@ -404,6 +591,9 @@ fn sticky_lock() -> &'static Mutex<HashMap<String, String>> {
 // ============================================================================
 
 fn ensure_api_schema(conn: &Connection) -> Result<(), String> {
+    if API_SCHEMA_READY.get().is_some() {
+        return Ok(());
+    }
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS api_service_keys (
@@ -414,6 +604,10 @@ fn ensure_api_schema(conn: &Connection) -> Result<(), String> {
             is_master INTEGER NOT NULL DEFAULT 0,
             allowed_models_json TEXT NOT NULL DEFAULT '[]',
             pinned_account_ids_json TEXT NOT NULL DEFAULT '[]',
+            allowed_profile TEXT NOT NULL DEFAULT 'all',
+            rate_limit_rpm INTEGER NOT NULL DEFAULT 0,
+            daily_token_limit INTEGER NOT NULL DEFAULT 0,
+            expires_at INTEGER,
             created_at INTEGER NOT NULL,
             last_used_at INTEGER,
             total_requests INTEGER NOT NULL DEFAULT 0,
@@ -439,12 +633,35 @@ fn ensure_api_schema(conn: &Connection) -> Result<(), String> {
             total_tokens INTEGER NOT NULL DEFAULT 0,
             error_message TEXT,
             request_preview TEXT NOT NULL DEFAULT '',
-            response_preview TEXT NOT NULL DEFAULT ''
+            response_preview TEXT NOT NULL DEFAULT '',
+            client_ip TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_api_logs_ts ON api_service_logs(timestamp DESC);
         ",
     )
     .map_err(|e| format!("Init api_service schema: {e}"))?;
+
+    // Idempotent column migrations for existing databases upgraded from <= v1.1.6
+    let _ = conn.execute(
+        "ALTER TABLE api_service_keys ADD COLUMN allowed_profile TEXT NOT NULL DEFAULT 'all'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE api_service_keys ADD COLUMN rate_limit_rpm INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE api_service_keys ADD COLUMN daily_token_limit INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE api_service_keys ADD COLUMN expires_at INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE api_service_logs ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''",
+        [],
+    );
 
     // Ensure at least one master API key exists
     let count: i64 = conn
@@ -455,11 +672,13 @@ fn ensure_api_schema(conn: &Connection) -> Result<(), String> {
         let key_val = generate_api_key_value();
         let _ = conn.execute(
             "INSERT INTO api_service_keys
-             (id, label, key_value, enabled, is_master, allowed_models_json, pinned_account_ids_json, created_at)
-             VALUES (?1, ?2, ?3, 1, 1, '[]', '[]', ?4)",
+             (id, label, key_value, enabled, is_master, allowed_models_json, pinned_account_ids_json,
+              allowed_profile, rate_limit_rpm, daily_token_limit, expires_at, created_at)
+             VALUES (?1, ?2, ?3, 1, 1, '[]', '[]', 'all', 0, 0, NULL, ?4)",
             params!["master", "Default Master Key", key_val, now],
         );
     }
+    let _ = API_SCHEMA_READY.set(());
     Ok(())
 }
 
@@ -470,6 +689,11 @@ fn generate_api_key_value() -> String {
 }
 
 pub fn load_config() -> Result<ApiServiceConfig, String> {
+    if let Ok(guard) = config_cache().read() {
+        if let Some(cfg) = guard.as_ref() {
+            return Ok(cfg.clone());
+        }
+    }
     let conn = open_db()?;
     ensure_api_schema(&conn)?;
     let raw: Option<String> = conn
@@ -480,9 +704,13 @@ pub fn load_config() -> Result<ApiServiceConfig, String> {
         )
         .optional()
         .map_err(|e| format!("Read api_service_config: {e}"))?;
-    Ok(raw
+    let cfg = raw
         .and_then(|s| serde_json::from_str::<ApiServiceConfig>(&s).ok())
-        .unwrap_or_default())
+        .unwrap_or_default();
+    if let Ok(mut guard) = config_cache().write() {
+        *guard = Some(cfg.clone());
+    }
+    Ok(cfg)
 }
 
 pub fn save_config(config: ApiServiceConfig) -> Result<ApiServiceConfig, String> {
@@ -495,6 +723,9 @@ pub fn save_config(config: ApiServiceConfig) -> Result<ApiServiceConfig, String>
     if cfg.timeout_seconds < 10 {
         cfg.timeout_seconds = 180;
     }
+    if cfg.auto_refresh_quota_minutes > 1440 {
+        cfg.auto_refresh_quota_minutes = 1440;
+    }
     let raw = serde_json::to_string(&cfg).map_err(|e| format!("Serialize config: {e}"))?;
     conn.execute(
         "INSERT INTO app_settings (key, value) VALUES ('api_service_config', ?1)
@@ -502,16 +733,25 @@ pub fn save_config(config: ApiServiceConfig) -> Result<ApiServiceConfig, String>
         params![raw],
     )
     .map_err(|e| format!("Save api_service_config: {e}"))?;
+    if let Ok(mut guard) = config_cache().write() {
+        *guard = Some(cfg.clone());
+    }
     Ok(cfg)
 }
 
 pub fn list_api_keys() -> Result<Vec<ApiKeyRecord>, String> {
+    if let Ok(guard) = api_keys_cache().read() {
+        if let Some(keys) = guard.as_ref() {
+            return Ok(keys.clone());
+        }
+    }
     let conn = open_db()?;
     ensure_api_schema(&conn)?;
     let mut stmt = conn
         .prepare(
             "SELECT id, label, key_value, enabled, is_master, allowed_models_json,
-                    pinned_account_ids_json, created_at, last_used_at, total_requests, total_tokens
+                    pinned_account_ids_json, allowed_profile, rate_limit_rpm, daily_token_limit,
+                    expires_at, created_at, last_used_at, total_requests, total_tokens
              FROM api_service_keys
              ORDER BY is_master DESC, created_at ASC",
         )
@@ -520,6 +760,7 @@ pub fn list_api_keys() -> Result<Vec<ApiKeyRecord>, String> {
         .query_map([], |r| {
             let allowed_raw: String = r.get(5)?;
             let pinned_raw: String = r.get(6)?;
+            let profile_raw: String = r.get::<_, String>(7).unwrap_or_else(|_| "all".into());
             Ok(ApiKeyRecord {
                 id: r.get(0)?,
                 label: r.get(1)?,
@@ -528,20 +769,33 @@ pub fn list_api_keys() -> Result<Vec<ApiKeyRecord>, String> {
                 is_master: r.get::<_, i64>(4)? != 0,
                 allowed_models: serde_json::from_str(&allowed_raw).unwrap_or_default(),
                 pinned_account_ids: serde_json::from_str(&pinned_raw).unwrap_or_default(),
-                created_at: r.get(7)?,
-                last_used_at: r.get(8)?,
-                total_requests: r.get::<_, i64>(9)?.max(0) as u64,
-                total_tokens: r.get::<_, i64>(10)?.max(0) as u64,
+                allowed_profile: normalize_allowed_profile(Some(&profile_raw)),
+                rate_limit_rpm: r.get::<_, i64>(8).unwrap_or(0).max(0) as u32,
+                daily_token_limit: r.get::<_, i64>(9).unwrap_or(0).max(0) as u64,
+                expires_at: r.get::<_, Option<i64>>(10).unwrap_or(None),
+                created_at: r.get(11)?,
+                last_used_at: r.get(12)?,
+                total_requests: r.get::<_, i64>(13)?.max(0) as u64,
+                total_tokens: r.get::<_, i64>(14)?.max(0) as u64,
             })
         })
         .map_err(|e| format!("Query list_api_keys: {e}"))?;
-    Ok(rows.flatten().collect())
+    let keys: Vec<ApiKeyRecord> = rows.flatten().collect();
+    if let Ok(mut guard) = api_keys_cache().write() {
+        *guard = Some(keys.clone());
+    }
+    Ok(keys)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_api_key(
     label: String,
     allowed_models: Vec<String>,
     pinned_account_ids: Vec<String>,
+    allowed_profile: Option<String>,
+    rate_limit_rpm: Option<u32>,
+    daily_token_limit: Option<u64>,
+    expires_at: Option<i64>,
 ) -> Result<ApiKeyRecord, String> {
     let clean_label = label.trim();
     if clean_label.is_empty() {
@@ -554,13 +808,30 @@ pub fn create_api_key(
     let now = Utc::now().timestamp();
     let allowed_json = serde_json::to_string(&allowed_models).unwrap_or_else(|_| "[]".into());
     let pinned_json = serde_json::to_string(&pinned_account_ids).unwrap_or_else(|_| "[]".into());
+    let profile = normalize_allowed_profile(allowed_profile.as_deref());
+    let rpm = rate_limit_rpm.unwrap_or(0);
+    let daily_cap = daily_token_limit.unwrap_or(0);
+    let exp = expires_at.filter(|&v| v > 0);
     conn.execute(
         "INSERT INTO api_service_keys
-         (id, label, key_value, enabled, is_master, allowed_models_json, pinned_account_ids_json, created_at)
-         VALUES (?1, ?2, ?3, 1, 0, ?4, ?5, ?6)",
-        params![id, clean_label, key, allowed_json, pinned_json, now],
+         (id, label, key_value, enabled, is_master, allowed_models_json, pinned_account_ids_json,
+          allowed_profile, rate_limit_rpm, daily_token_limit, expires_at, created_at)
+         VALUES (?1, ?2, ?3, 1, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            id,
+            clean_label,
+            key,
+            allowed_json,
+            pinned_json,
+            profile,
+            rpm as i64,
+            daily_cap as i64,
+            exp,
+            now
+        ],
     )
     .map_err(|e| format!("Create API key: {e}"))?;
+    invalidate_api_keys_cache();
 
     Ok(ApiKeyRecord {
         id,
@@ -570,6 +841,10 @@ pub fn create_api_key(
         is_master: false,
         allowed_models,
         pinned_account_ids,
+        allowed_profile: profile,
+        rate_limit_rpm: rpm,
+        daily_token_limit: daily_cap,
+        expires_at: exp,
         created_at: now,
         last_used_at: None,
         total_requests: 0,
@@ -577,12 +852,17 @@ pub fn create_api_key(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn update_api_key(
     id: String,
     label: Option<String>,
     enabled: Option<bool>,
     allowed_models: Option<Vec<String>>,
     pinned_account_ids: Option<Vec<String>>,
+    allowed_profile: Option<String>,
+    rate_limit_rpm: Option<u32>,
+    daily_token_limit: Option<u64>,
+    expires_at: Option<Option<i64>>,
 ) -> Result<ApiKeyRecord, String> {
     let conn = open_db()?;
     ensure_api_schema(&conn)?;
@@ -603,23 +883,41 @@ pub fn update_api_key(
     if let Some(p) = pinned_account_ids {
         target.pinned_account_ids = p;
     }
+    if let Some(prof) = allowed_profile {
+        target.allowed_profile = normalize_allowed_profile(Some(&prof));
+    }
+    if let Some(rpm) = rate_limit_rpm {
+        target.rate_limit_rpm = rpm;
+    }
+    if let Some(cap) = daily_token_limit {
+        target.daily_token_limit = cap;
+    }
+    if let Some(exp_opt) = expires_at {
+        target.expires_at = exp_opt.filter(|&v| v > 0);
+    }
     let allowed_json =
         serde_json::to_string(&target.allowed_models).unwrap_or_else(|_| "[]".into());
     let pinned_json =
         serde_json::to_string(&target.pinned_account_ids).unwrap_or_else(|_| "[]".into());
     conn.execute(
         "UPDATE api_service_keys
-         SET label = ?1, enabled = ?2, allowed_models_json = ?3, pinned_account_ids_json = ?4
-         WHERE id = ?5",
+         SET label = ?1, enabled = ?2, allowed_models_json = ?3, pinned_account_ids_json = ?4,
+             allowed_profile = ?5, rate_limit_rpm = ?6, daily_token_limit = ?7, expires_at = ?8
+         WHERE id = ?9",
         params![
             target.label,
             if target.enabled { 1 } else { 0 },
             allowed_json,
             pinned_json,
+            target.allowed_profile,
+            target.rate_limit_rpm as i64,
+            target.daily_token_limit as i64,
+            target.expires_at,
             target.id
         ],
     )
     .map_err(|e| format!("Update API key: {e}"))?;
+    invalidate_api_keys_cache();
     Ok(target)
 }
 
@@ -636,6 +934,7 @@ pub fn rotate_api_key(id: String) -> Result<ApiKeyRecord, String> {
     if changed == 0 {
         return Err(format!("Không tìm thấy API Key {id}"));
     }
+    invalidate_api_keys_cache();
     list_api_keys()?
         .into_iter()
         .find(|k| k.id == id)
@@ -657,6 +956,7 @@ pub fn delete_api_key(id: String) -> Result<(), String> {
     }
     conn.execute("DELETE FROM api_service_keys WHERE id = ?1", params![&id])
         .map_err(|e| format!("Delete API key: {e}"))?;
+    invalidate_api_keys_cache();
     Ok(())
 }
 
@@ -672,6 +972,7 @@ fn find_valid_api_key(token: &str) -> Option<ApiKeyRecord> {
 }
 
 fn record_api_log(item: &ApiRequestLogItem) {
+    bump_key_daily_tokens(&item.api_key_id, item.total_tokens);
     let Ok(conn) = open_db() else { return };
     if ensure_api_schema(&conn).is_err() {
         return;
@@ -681,8 +982,8 @@ fn record_api_log(item: &ApiRequestLogItem) {
          (id, timestamp, api_key_id, api_key_label, account_id, account_email, protocol,
           request_model, resolved_model, stream, status_code, latency_ms,
           input_tokens, output_tokens, thinking_tokens, cache_read_tokens, total_tokens,
-          error_message, request_preview, response_preview)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+          error_message, request_preview, response_preview, client_ip)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
         params![
             item.id,
             item.timestamp,
@@ -704,6 +1005,7 @@ fn record_api_log(item: &ApiRequestLogItem) {
             item.error_message,
             item.request_preview,
             item.response_preview,
+            item.client_ip,
         ],
     );
     let _ = conn.execute(
@@ -714,6 +1016,16 @@ fn record_api_log(item: &ApiRequestLogItem) {
          WHERE id = ?3",
         params![item.timestamp, item.total_tokens as i64, item.api_key_id],
     );
+    // Keep cached key request/token counters fresh in RAM without re-querying SQLite
+    if let Ok(mut guard) = api_keys_cache().write() {
+        if let Some(keys) = guard.as_mut() {
+            if let Some(k) = keys.iter_mut().find(|k| k.id == item.api_key_id) {
+                k.last_used_at = Some(item.timestamp);
+                k.total_requests = k.total_requests.saturating_add(1);
+                k.total_tokens = k.total_tokens.saturating_add(item.total_tokens);
+            }
+        }
+    }
     // Keep table bounded to last 5000 logs
     let _ = conn.execute(
         "DELETE FROM api_service_logs WHERE id IN (
@@ -1080,6 +1392,19 @@ fn select_pool_members(
                 return false;
             }
             if let Some(k) = key {
+                match k.allowed_profile.as_str() {
+                    "classic" => {
+                        if classify_account_profile(a) != AccountProfile::Classic {
+                            return false;
+                        }
+                    }
+                    "full_nextgen" => {
+                        if classify_account_profile(a) != AccountProfile::FullNextgen {
+                            return false;
+                        }
+                    }
+                    _ => {}
+                }
                 if !k.pinned_account_ids.is_empty() {
                     return k.pinned_account_ids.contains(&a.id);
                 }
@@ -2431,6 +2756,9 @@ async fn send_upstream_with_failover(
                             cool,
                             format!("HTTP {status}"),
                         );
+                        if status == 429 {
+                            spawn_post_429_quota_sync(&acc.id);
+                        }
                         last_err = (
                             status,
                             err_body,
@@ -2749,10 +3077,34 @@ fn extract_api_token(req: &HttpRequest) -> Option<String> {
     None
 }
 
+fn normalize_peer_ip(raw_ip: &str) -> String {
+    raw_ip
+        .strip_prefix("::ffff:")
+        .unwrap_or(raw_ip)
+        .to_string()
+}
+
+fn spawn_post_429_quota_sync(account_id: &str) {
+    let now = Instant::now();
+    if let Ok(mut map) = post_429_refresh_debounce().lock() {
+        if let Some(last) = map.get(account_id) {
+            if now.duration_since(*last) < Duration::from_secs(90) {
+                return;
+            }
+        }
+        map.insert(account_id.to_string(), now);
+    }
+    let acc_id = account_id.to_string();
+    tokio::spawn(async move {
+        let _ = accounts::refresh_single_account_quota(acc_id).await;
+    });
+}
+
 async fn handle_connection(
     mut stream: TcpStream,
     conn_gen: u64,
     mut shutdown_rx: watch::Receiver<bool>,
+    client_ip: String,
 ) {
     let _ = stream.set_nodelay(true);
     for _ in 0..64 {
@@ -2796,6 +3148,7 @@ async fn handle_connection(
             wants_keep_alive,
             conn_gen,
             &mut shutdown_rx,
+            &client_ip,
         )
         .await;
         if !keep_open {
@@ -2810,6 +3163,7 @@ async fn handle_single_request(
     keep_alive: bool,
     conn_gen: u64,
     shutdown_rx: &mut watch::Receiver<bool>,
+    client_ip: &str,
 ) -> bool {
     if *shutdown_rx.borrow() || SERVER_ACTIVE_GEN.load(Ordering::SeqCst) != conn_gen {
         let _ = write_json_response_ka(
@@ -2896,6 +3250,7 @@ async fn handle_single_request(
                 error_message: Some("Invalid or disabled API key".into()),
                 request_preview: String::new(),
                 response_preview: String::new(),
+                client_ip: client_ip.to_string(),
             });
         }
         return write_json_response_ka(
@@ -2913,13 +3268,69 @@ async fn handle_single_request(
             && keep_alive;
     };
 
+    // Enforce expiry, per-key RPM rate limit, and daily token quota
+    if let Err((status_code, err_msg, err_type)) = check_api_key_limits(&api_key) {
+        record_api_log_async(ApiRequestLogItem {
+            id: Uuid::new_v4().to_string(),
+            timestamp: Utc::now().timestamp(),
+            api_key_id: api_key.id.clone(),
+            api_key_label: api_key.label.clone(),
+            account_id: String::new(),
+            account_email: String::new(),
+            protocol: "http".into(),
+            request_model: format!("{} {}", req.method, norm_path),
+            resolved_model: "-".into(),
+            stream: false,
+            status_code,
+            latency_ms: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            thinking_tokens: 0,
+            cache_read_tokens: 0,
+            total_tokens: 0,
+            error_message: Some(err_msg.clone()),
+            request_preview: String::new(),
+            response_preview: String::new(),
+            client_ip: client_ip.to_string(),
+        });
+        return write_json_response_ka(
+            stream,
+            status_code,
+            &json!({
+                "error": {
+                    "message": err_msg,
+                    "type": err_type
+                }
+            }),
+            keep_alive,
+        )
+        .await
+            && keep_alive;
+    }
+
     if req.method == "GET" && (norm_path == "/v1/models" || norm_path == "/models") {
         let models = list_available_models().unwrap_or_default();
+        let profile_members = if api_key.allowed_profile != "all" {
+            let cfg_snap = load_config().unwrap_or_default();
+            Some(select_pool_members(
+                accounts::list_accounts_sync().unwrap_or_default(),
+                &cfg_snap,
+                Some(&api_key),
+            ))
+        } else {
+            None
+        };
         let data: Vec<Value> = models
             .into_iter()
             .filter(|m| {
                 api_key.allowed_models.is_empty()
                     || api_key.allowed_models.iter().any(|a| glob_match(a, &m.id))
+            })
+            .filter(|m| match &profile_members {
+                Some(members) => members
+                    .iter()
+                    .any(|acc| account_model_support(acc, &m.id) != ModelSupport::Unsupported),
+                None => true,
             })
             .map(|m| {
                 json!({
@@ -2974,6 +3385,7 @@ async fn handle_single_request(
             error_message: Some(err_msg.clone()),
             request_preview: String::new(),
             response_preview: String::new(),
+            client_ip: client_ip.to_string(),
         });
         return write_json_response_ka(
             stream,
@@ -3015,6 +3427,7 @@ async fn handle_single_request(
                 error_message: Some(err_msg.clone()),
                 request_preview: String::from_utf8_lossy(&req.body).chars().take(200).collect(),
                 response_preview: String::new(),
+                client_ip: client_ip.to_string(),
             });
             return write_json_response_ka(
                 stream,
@@ -3085,6 +3498,7 @@ async fn handle_single_request(
             error_message: Some(err_msg.clone()),
             request_preview: String::new(),
             response_preview: String::new(),
+            client_ip: client_ip.to_string(),
         });
         return write_json_response_ka(
             stream,
@@ -3132,6 +3546,7 @@ async fn handle_single_request(
                 error_message: Some(err_msg.clone()),
                 request_preview: err_preview,
                 response_preview: String::new(),
+                client_ip: client_ip.to_string(),
             });
             write_json_response_ka(
                 stream,
@@ -3699,6 +4114,7 @@ async fn handle_single_request(
                 error_message: None,
                 request_preview: req_preview,
                 response_preview: resp_preview,
+                client_ip: client_ip.to_string(),
             });
             keep_open
         }
@@ -3910,8 +4326,14 @@ pub async fn start_server() -> Result<ApiServiceStatus, String> {
                             break;
                         }
                         match accepted {
-                            Ok((stream, _peer)) => {
-                                tokio::spawn(handle_connection(stream, generation, conn_rx_tpl.clone()));
+                            Ok((stream, peer)) => {
+                                let peer_ip = normalize_peer_ip(&peer.ip().to_string());
+                                tokio::spawn(handle_connection(
+                                    stream,
+                                    generation,
+                                    conn_rx_tpl.clone(),
+                                    peer_ip,
+                                ));
                             }
                             Err(_) => {
                                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3946,8 +4368,14 @@ pub async fn start_server() -> Result<ApiServiceStatus, String> {
                             break;
                         }
                         match accepted {
-                            Ok((stream, _peer)) => {
-                                tokio::spawn(handle_connection(stream, generation, conn_rx_tpl.clone()));
+                            Ok((stream, peer)) => {
+                                let peer_ip = normalize_peer_ip(&peer.ip().to_string());
+                                tokio::spawn(handle_connection(
+                                    stream,
+                                    generation,
+                                    conn_rx_tpl.clone(),
+                                    peer_ip,
+                                ));
                             }
                             Err(_) => {
                                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4078,7 +4506,7 @@ pub fn list_request_logs(limit: Option<usize>) -> Result<Vec<ApiRequestLogItem>,
             "SELECT id, timestamp, api_key_id, api_key_label, account_id, account_email,
                     protocol, request_model, resolved_model, stream, status_code, latency_ms,
                     input_tokens, output_tokens, thinking_tokens, cache_read_tokens, total_tokens,
-                    error_message, request_preview, response_preview
+                    error_message, request_preview, response_preview, client_ip
              FROM api_service_logs
              ORDER BY timestamp DESC
              LIMIT ?1",
@@ -4107,6 +4535,7 @@ pub fn list_request_logs(limit: Option<usize>) -> Result<Vec<ApiRequestLogItem>,
                 error_message: r.get(17)?,
                 request_preview: r.get(18)?,
                 response_preview: r.get(19)?,
+                client_ip: r.get::<_, String>(20).unwrap_or_default(),
             })
         })
         .map_err(|e| format!("Query list logs: {e}"))?;
@@ -4123,6 +4552,10 @@ pub fn clear_request_logs() -> Result<(), String> {
         [],
     )
     .ok();
+    if let Ok(mut map) = key_daily_tokens().lock() {
+        map.clear();
+    }
+    invalidate_api_keys_cache();
     Ok(())
 }
 
@@ -4359,6 +4792,7 @@ pub async fn test_chat_completion(
                 error_message: None,
                 request_preview: req_preview,
                 response_preview: parsed.text.chars().take(260).collect(),
+                client_ip: "127.0.0.1".into(),
             });
             Ok(ApiTestChatResult {
                 ok: true,
@@ -4397,6 +4831,7 @@ pub async fn test_chat_completion(
                 error_message: Some(err.clone()),
                 request_preview: prompt.chars().take(240).collect(),
                 response_preview: String::new(),
+                client_ip: "127.0.0.1".into(),
             });
             Ok(ApiTestChatResult {
                 ok: false,
@@ -4423,6 +4858,47 @@ pub fn spawn_auto_start_if_enabled() {
             });
         }
     }
+}
+
+/// Periodically refreshes pool account quotas in background while API Router is running,
+/// keeping Total Pool Quota and smart routing scores fresh without manual clicks.
+pub fn spawn_background_quota_worker(app_handle: tauri::AppHandle) {
+    use tauri::Emitter;
+    tauri::async_runtime::spawn(async move {
+        let mut last_sweep = Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            if !is_server_running() {
+                continue;
+            }
+            let Ok(cfg) = load_config() else {
+                continue;
+            };
+            if cfg.auto_refresh_quota_minutes == 0 {
+                continue;
+            }
+            let interval = Duration::from_secs(cfg.auto_refresh_quota_minutes.max(1) * 60);
+            if last_sweep.elapsed() < interval {
+                continue;
+            }
+            last_sweep = Instant::now();
+            let all = accounts::list_accounts_sync().unwrap_or_default();
+            let members = select_pool_members(all, &cfg, None);
+            let mut updated = 0usize;
+            for acc in members {
+                if !is_server_running() {
+                    break;
+                }
+                if accounts::refresh_single_account_quota(acc.id).await.is_ok() {
+                    updated += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(350)).await;
+            }
+            if updated > 0 {
+                let _ = app_handle.emit("api-pool-quota-updated", updated);
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -4655,7 +5131,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_connection(stream, test_gen, rx).await;
+            handle_connection(stream, test_gen, rx, "127.0.0.1".into()).await;
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -4696,7 +5172,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_connection(stream, test_gen, shutdown_rx).await;
+            handle_connection(stream, test_gen, shutdown_rx, "127.0.0.1".into()).await;
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -4755,5 +5231,74 @@ mod tests {
         assert!(text.contains("13\r\ndata: {\"ok\":true}\n\n\r\n"));
         assert!(text.ends_with("0\r\n\r\n"));
         let _ = server.await;
+    }
+
+    #[test]
+    fn key_profile_lock_and_limits_and_ip_normalization_work() {
+        // 1. Peer IP normalization strips IPv4-mapped IPv6 prefix
+        assert_eq!(normalize_peer_ip("::ffff:192.168.1.50"), "192.168.1.50");
+        assert_eq!(normalize_peer_ip("192.168.1.107"), "192.168.1.107");
+
+        // 2. Classic-locked API key MUST exclude Full/Argon accounts from pool selection
+        let full_acc = make_acc(
+            "acc-full",
+            "full@example.com",
+            vec![("gemini-4-argon", 100), ("gemini-3.8-flash-tiered", 100)],
+        );
+        let classic_acc = make_acc(
+            "acc-classic",
+            "classic@example.com",
+            vec![("claude-opus-4-6-thinking", 100), ("gemini-3.8-flash-tiered", 100)],
+        );
+        let cfg = ApiServiceConfig::default();
+        let classic_key = ApiKeyRecord {
+            id: "key-friend-classic".into(),
+            label: "Friend Classic".into(),
+            key: "agt_test_1".into(),
+            enabled: true,
+            is_master: false,
+            allowed_models: vec![],
+            pinned_account_ids: vec![],
+            allowed_profile: "classic".into(),
+            rate_limit_rpm: 2,
+            daily_token_limit: 500,
+            expires_at: None,
+            created_at: 0,
+            last_used_at: None,
+            total_requests: 0,
+            total_tokens: 0,
+        };
+        let selected = select_pool_members(vec![full_acc, classic_acc], &cfg, Some(&classic_key));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "acc-classic");
+
+        // 3. Sliding 60s RPM rate limiter allows 2 reqs then blocks 3rd with HTTP 429
+        if let Ok(mut map) = key_rpm_buckets().lock() {
+            map.remove(&classic_key.id);
+        }
+        if let Ok(mut map) = key_daily_tokens().lock() {
+            map.insert(classic_key.id.clone(), (utc_today_key(), 100));
+        }
+        assert!(check_api_key_limits(&classic_key).is_ok());
+        assert!(check_api_key_limits(&classic_key).is_ok());
+        let err_rpm = check_api_key_limits(&classic_key).unwrap_err();
+        assert_eq!(err_rpm.0, 429);
+
+        // 4. Daily token limit blocks with HTTP 429
+        let mut cap_key = classic_key.clone();
+        cap_key.id = "key-cap-test".into();
+        cap_key.rate_limit_rpm = 0;
+        cap_key.daily_token_limit = 1000;
+        if let Ok(mut map) = key_daily_tokens().lock() {
+            map.insert(cap_key.id.clone(), (utc_today_key(), 1000));
+        }
+        let err_cap = check_api_key_limits(&cap_key).unwrap_err();
+        assert_eq!(err_cap.0, 429);
+
+        // 5. Expired key rejects with HTTP 401
+        let mut exp_key = cap_key.clone();
+        exp_key.expires_at = Some(Utc::now().timestamp() - 10);
+        let err_exp = check_api_key_limits(&exp_key).unwrap_err();
+        assert_eq!(err_exp.0, 401);
     }
 }

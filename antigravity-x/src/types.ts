@@ -636,6 +636,8 @@ export type ApiServiceConfig = {
   useAllAccountsWhenEmpty: boolean;
   preserveExclusiveAccounts: boolean;
   autoStart: boolean;
+  minimizeToTray: boolean;
+  autoRefreshQuotaMinutes: number;
   timeoutSeconds: number;
   maxRetries: number;
   cooldownSeconds: number;
@@ -651,6 +653,10 @@ export type ApiKeyRecord = {
   isMaster: boolean;
   allowedModels: string[];
   pinnedAccountIds: string[];
+  allowedProfile: "all" | "full_nextgen" | "classic" | string;
+  rateLimitRpm: number;
+  dailyTokenLimit: number;
+  expiresAt?: number | null;
   createdAt: number;
   lastUsedAt?: number | null;
   totalRequests: number;
@@ -715,6 +721,7 @@ export type ApiRequestLogItem = {
   errorMessage?: string | null;
   requestPreview: string;
   responsePreview: string;
+  clientIp?: string;
 };
 
 export type ApiUsageBreakdownRow = {

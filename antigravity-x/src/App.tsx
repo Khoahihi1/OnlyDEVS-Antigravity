@@ -33,7 +33,7 @@ import type {
   VersionJumpInfo,
 } from "./types";
 
-const APP_VERSION = "1.1.6";
+const APP_VERSION = "1.2.0";
 
 const VALID_LANGS: AppLanguage[] = ["vi", "en", "zh-CN", "zh-TW", "ja", "ko", "ru", "de"];
 const VALID_THEME_COLORS: AppThemeColor[] = [
@@ -173,6 +173,34 @@ export default function App() {
 
   useEffect(() => {
     void refreshAll();
+  }, [refreshAll]);
+
+  // Listen to System Tray API toggle & background quota auto-refresh events
+  useEffect(() => {
+    let unlistenStatus: (() => void) | null = null;
+    let unlistenQuota: (() => void) | null = null;
+    void (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        unlistenStatus = await listen<ApiServiceStatus>(
+          "api-service-status-changed",
+          (ev) => {
+            if (ev.payload) {
+              setApiServiceStatus(ev.payload);
+            }
+          },
+        );
+        unlistenQuota = await listen<number>("api-pool-quota-updated", () => {
+          void refreshAll();
+        });
+      } catch {
+        // non-Tauri web preview mode
+      }
+    })();
+    return () => {
+      unlistenStatus?.();
+      unlistenQuota?.();
+    };
   }, [refreshAll]);
 
   // Startup version jump notice + mandatory update check on launch & every 15m

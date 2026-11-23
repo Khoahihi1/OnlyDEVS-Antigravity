@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_opener::OpenerExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -202,7 +202,23 @@ pub struct OAuthPrepareResult {
 // SQLite Schema & Storage
 // ============================================================================
 
+static ACCOUNTS_SCHEMA_READY: OnceLock<()> = OnceLock::new();
+static ACCOUNTS_CACHE: OnceLock<RwLock<Option<Vec<AntigravityAccount>>>> = OnceLock::new();
+
+fn accounts_cache() -> &'static RwLock<Option<Vec<AntigravityAccount>>> {
+    ACCOUNTS_CACHE.get_or_init(|| RwLock::new(None))
+}
+
+pub fn invalidate_accounts_cache() {
+    if let Ok(mut guard) = accounts_cache().write() {
+        *guard = None;
+    }
+}
+
 fn ensure_accounts_schema(conn: &Connection) -> Result<(), String> {
+    if ACCOUNTS_SCHEMA_READY.get().is_some() {
+        return Ok(());
+    }
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS antigravity_accounts (
@@ -231,7 +247,9 @@ fn ensure_accounts_schema(conn: &Connection) -> Result<(), String> {
         );
         ",
     )
-    .map_err(|e| format!("Init accounts schema: {e}"))
+    .map_err(|e| format!("Init accounts schema: {e}"))?;
+    let _ = ACCOUNTS_SCHEMA_READY.set(());
+    Ok(())
 }
 
 fn get_current_account_id(conn: &Connection) -> Option<String> {
@@ -250,6 +268,7 @@ fn set_current_account_id(conn: &Connection, account_id: &str) -> Result<(), Str
         params![account_id],
     )
     .map_err(|e| format!("Save current_account_id: {e}"))?;
+    invalidate_accounts_cache();
     Ok(())
 }
 
@@ -271,6 +290,7 @@ fn save_account_to_db(conn: &Connection, account: &AntigravityAccount) -> Result
         ],
     )
     .map_err(|e| format!("Upsert account DB: {e}"))?;
+    invalidate_accounts_cache();
     Ok(())
 }
 
@@ -315,6 +335,11 @@ fn find_account_by_email_db(
 }
 
 pub fn list_accounts_sync() -> Result<Vec<AntigravityAccount>, String> {
+    if let Ok(guard) = accounts_cache().read() {
+        if let Some(cached) = guard.as_ref() {
+            return Ok(cached.clone());
+        }
+    }
     let conn = open_db()?;
     ensure_accounts_schema(&conn)?;
     let current_id = get_current_account_id(&conn);
@@ -336,6 +361,9 @@ pub fn list_accounts_sync() -> Result<Vec<AntigravityAccount>, String> {
             .cmp(&a.is_current)
             .then_with(|| b.last_used.cmp(&a.last_used))
     });
+    if let Ok(mut guard) = accounts_cache().write() {
+        *guard = Some(out.clone());
+    }
     Ok(out)
 }
 
@@ -2019,6 +2047,9 @@ pub fn delete_accounts_by_ids(account_ids: Vec<String>) -> Result<usize, String>
         deleted += conn
             .execute("DELETE FROM antigravity_accounts WHERE id = ?1", params![id])
             .unwrap_or(0);
+    }
+    if deleted > 0 {
+        invalidate_accounts_cache();
     }
     Ok(deleted)
 }
