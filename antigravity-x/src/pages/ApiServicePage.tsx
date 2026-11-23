@@ -1313,15 +1313,17 @@ print(resp.choices[0].message.content)`;
                 >
                   <RefreshCw size={14} />
                 </button>
-                <button
-                  type="button"
-                  className="ag-toolbar-icon-btn"
-                  title={vi ? "Khởi động lại Router" : "Restart Router"}
-                  disabled={busyKey === "restart"}
-                  onClick={() => void handleRestartServer()}
-                >
-                  <Play size={14} />
-                </button>
+                {status.running ? (
+                  <button
+                    type="button"
+                    className="ag-toolbar-icon-btn"
+                    title={vi ? "Khởi động lại Router" : "Restart Router"}
+                    disabled={busyKey === "restart"}
+                    onClick={() => void handleRestartServer()}
+                  >
+                    <Play size={14} />
+                  </button>
+                ) : null}
               </div>
             </div>
           </section>
@@ -1906,7 +1908,14 @@ print(resp.choices[0].message.content)`;
               <button
                 type="button"
                 className="agx-btn agx-btn--primary"
-                disabled={busyKey === "test-chat" || !testPrompt.trim()}
+                disabled={busyKey === "test-chat" || !testPrompt.trim() || !status?.running}
+                title={
+                  !status?.running
+                    ? vi
+                      ? "Hãy bấm Chạy API trước khi test"
+                      : "Start API Router before testing"
+                    : undefined
+                }
                 onClick={() => void handleRunTestChat()}
               >
                 {busyKey === "test-chat" ? (
@@ -1914,7 +1923,15 @@ print(resp.choices[0].message.content)`;
                 ) : (
                   <Send size={14} />
                 )}
-                <span>{vi ? "Gửi yêu cầu thử" : "Send Test Request"}</span>
+                <span>
+                  {!status?.running
+                    ? vi
+                      ? "API Router đang tắt (Bật API để test)"
+                      : "API Router is OFF (Start to test)"
+                    : vi
+                      ? "Gửi yêu cầu thử"
+                      : "Send Test Request"}
+                </span>
               </button>
             </div>
 

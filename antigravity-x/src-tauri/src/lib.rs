@@ -588,8 +588,8 @@ async fn api_service_start() -> Result<api_service::ApiServiceStatus, String> {
 }
 
 #[tauri::command]
-fn api_service_stop() -> Result<api_service::ApiServiceStatus, String> {
-    api_service::stop_server()
+async fn api_service_stop() -> Result<api_service::ApiServiceStatus, String> {
+    api_service::stop_server().await
 }
 
 #[tauri::command]
@@ -794,6 +794,14 @@ pub fn run() {
             api_service_lan_diagnostics,
             api_service_open_lan_firewall,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
+            ) {
+                api_service::stop_server_sync();
+            }
+        });
 }

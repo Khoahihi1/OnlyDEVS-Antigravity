@@ -10,12 +10,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::accounts::{self, AntigravityAccount};
@@ -342,7 +342,9 @@ struct RunningServer {
     host: String,
     port: u16,
     started_at: i64,
-    shutdown_txs: Vec<oneshot::Sender<()>>,
+    generation: u64,
+    shutdown_tx: watch::Sender<bool>,
+    accept_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 struct CooldownEntry {
@@ -354,6 +356,10 @@ struct CooldownEntry {
 }
 
 static SERVER_STATE: OnceLock<Mutex<Option<RunningServer>>> = OnceLock::new();
+static LIFECYCLE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static SERVER_GEN_SEQ: AtomicU64 = AtomicU64::new(1);
+/// 0 means server is stopped; non-zero matches the active RunningServer generation.
+static SERVER_ACTIVE_GEN: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static RR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// Keyed by "(account_id, scope)" where scope is "all" | "gemini" | "claude" | "argon" | "carbon"
@@ -371,6 +377,14 @@ fn upstream_client_cache() -> &'static Mutex<Option<((u64, String), reqwest::Cli
 
 fn server_lock() -> &'static Mutex<Option<RunningServer>> {
     SERVER_STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn lifecycle_lock() -> &'static tokio::sync::Mutex<()> {
+    LIFECYCLE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+pub fn is_server_running() -> bool {
+    SERVER_ACTIVE_GEN.load(Ordering::SeqCst) != 0
 }
 
 fn cooldown_lock() -> &'static Mutex<HashMap<(String, String), CooldownEntry>> {
@@ -2735,20 +2749,55 @@ fn extract_api_token(req: &HttpRequest) -> Option<String> {
     None
 }
 
-async fn handle_connection(mut stream: TcpStream) {
+async fn handle_connection(
+    mut stream: TcpStream,
+    conn_gen: u64,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
     let _ = stream.set_nodelay(true);
     for _ in 0..64 {
-        let req = match tokio::time::timeout(Duration::from_secs(60), read_http_request(&mut stream))
-            .await
-        {
-            Ok(Ok(r)) => r,
-            _ => return,
+        if *shutdown_rx.borrow() || SERVER_ACTIVE_GEN.load(Ordering::SeqCst) != conn_gen {
+            return;
+        }
+        let req = tokio::select! {
+            _ = shutdown_rx.changed() => {
+                // API Router stopped: drop idle keep-alive socket immediately
+                return;
+            }
+            res = tokio::time::timeout(Duration::from_secs(60), read_http_request(&mut stream)) => {
+                match res {
+                    Ok(Ok(r)) => r,
+                    _ => return,
+                }
+            }
         };
+        if *shutdown_rx.borrow() || SERVER_ACTIVE_GEN.load(Ordering::SeqCst) != conn_gen {
+            let _ = write_json_response_ka(
+                &mut stream,
+                503,
+                &json!({
+                    "error": {
+                        "message": "OnlyDEVS Antigravity API Router is stopped.",
+                        "type": "service_unavailable"
+                    }
+                }),
+                false,
+            )
+            .await;
+            return;
+        }
         let wants_keep_alive = !req
             .headers
             .get("connection")
             .is_some_and(|v| v.to_ascii_lowercase().contains("close"));
-        let keep_open = handle_single_request(&mut stream, req, wants_keep_alive).await;
+        let keep_open = handle_single_request(
+            &mut stream,
+            req,
+            wants_keep_alive,
+            conn_gen,
+            &mut shutdown_rx,
+        )
+        .await;
         if !keep_open {
             return;
         }
@@ -2759,7 +2808,24 @@ async fn handle_single_request(
     stream: &mut TcpStream,
     req: HttpRequest,
     keep_alive: bool,
+    conn_gen: u64,
+    shutdown_rx: &mut watch::Receiver<bool>,
 ) -> bool {
+    if *shutdown_rx.borrow() || SERVER_ACTIVE_GEN.load(Ordering::SeqCst) != conn_gen {
+        let _ = write_json_response_ka(
+            stream,
+            503,
+            &json!({
+                "error": {
+                    "message": "OnlyDEVS Antigravity API Router is stopped.",
+                    "type": "service_unavailable"
+                }
+            }),
+            false,
+        )
+        .await;
+        return false;
+    }
     if req.method == "OPTIONS" {
         let conn_hdr = if keep_alive {
             "Connection: keep-alive"
@@ -3105,20 +3171,27 @@ async fn handle_single_request(
                     let mut client_alive = true;
 
                     while client_alive {
-                        let chunk = match tokio::time::timeout(
-                            Duration::from_secs(10),
-                            resp.chunk(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(Some(c))) => c,
-                            Ok(Ok(None)) | Ok(Err(_)) => break,
-                            Err(_) => {
-                                // 10s upstream silence (e.g. long thinking): send SSE keepalive comment
-                                if write_sse_chunk(stream, ": keepalive\n\n").await.is_err() {
-                                    client_alive = false;
+                        if *shutdown_rx.borrow() || SERVER_ACTIVE_GEN.load(Ordering::SeqCst) != conn_gen {
+                            client_alive = false;
+                            break;
+                        }
+                        let chunk = tokio::select! {
+                            _ = shutdown_rx.changed() => {
+                                client_alive = false;
+                                break;
+                            }
+                            res = tokio::time::timeout(Duration::from_secs(10), resp.chunk()) => {
+                                match res {
+                                    Ok(Ok(Some(c))) => c,
+                                    Ok(Ok(None)) | Ok(Err(_)) => break,
+                                    Err(_) => {
+                                        // 10s upstream silence (e.g. long thinking): send SSE keepalive comment
+                                        if write_sse_chunk(stream, ": keepalive\n\n").await.is_err() {
+                                            client_alive = false;
+                                        }
+                                        continue;
+                                    }
                                 }
-                                continue;
                             }
                         };
                         sse_buf.push_str(&String::from_utf8_lossy(&chunk));
@@ -3764,7 +3837,20 @@ async fn bind_listener_with_retry(addr: &str) -> Result<TcpListener, std::io::Er
     }
 }
 
+async fn stop_server_locked() {
+    SERVER_ACTIVE_GEN.store(0, Ordering::SeqCst);
+    let running = server_lock().lock().ok().and_then(|mut g| g.take());
+    if let Some(running) = running {
+        let _ = running.shutdown_tx.send(true);
+        for handle in running.accept_handles {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
 pub async fn start_server() -> Result<ApiServiceStatus, String> {
+    let _lifecycle = lifecycle_lock().lock().await;
     let cfg = load_config()?;
     // If already running on same bind/port, return status
     let bind_host = if cfg.access_scope == "lan" {
@@ -3775,14 +3861,17 @@ pub async fn start_server() -> Result<ApiServiceStatus, String> {
     {
         let guard = server_lock().lock().map_err(|_| "Lock poisoned")?;
         if let Some(running) = guard.as_ref() {
-            if running.host == bind_host && running.port == cfg.port {
+            if running.host == bind_host
+                && running.port == cfg.port
+                && SERVER_ACTIVE_GEN.load(Ordering::SeqCst) == running.generation
+            {
                 drop(guard);
                 return get_status();
             }
         }
     }
 
-    stop_server()?;
+    stop_server_locked().await;
 
     let addr = format!("{bind_host}:{}", cfg.port);
     let listener = bind_listener_with_retry(&addr).await.map_err(|e| {
@@ -3797,50 +3886,32 @@ pub async fn start_server() -> Result<ApiServiceStatus, String> {
         }
     })?;
 
-    let mut shutdown_txs = Vec::new();
-    let (tx4, mut rx4) = oneshot::channel::<()>();
-    shutdown_txs.push(tx4);
+    let generation = SERVER_GEN_SEQ.fetch_add(1, Ordering::SeqCst).max(1);
+    let (shutdown_tx, shutdown_rx_base) = watch::channel(false);
     let started_at = Utc::now().timestamp();
+    let mut accept_handles = Vec::new();
 
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = &mut rx4 => {
-                    break;
-                }
-                accepted = listener.accept() => {
-                    match accepted {
-                        Ok((stream, _peer)) => {
-                            tokio::spawn(handle_connection(stream));
-                        }
-                        Err(_) => {
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                        }
-                    }
-                }
-            }
-        }
-    });
+    // Activate generation BEFORE spawning accept loops so first request is accepted cleanly
+    SERVER_ACTIVE_GEN.store(generation, Ordering::SeqCst);
 
-    // Also bind IPv6 loopback/wildcard so `http://localhost:<port>/v1` resolves immediately on Windows 11
-    let v6_addr = if cfg.access_scope == "lan" {
-        format!("[::]:{}", cfg.port)
-    } else {
-        format!("[::1]:{}", cfg.port)
-    };
-    if let Ok(listener_v6) = TcpListener::bind(&v6_addr).await {
-        let (tx6, mut rx6) = oneshot::channel::<()>();
-        shutdown_txs.push(tx6);
-        tokio::spawn(async move {
+    {
+        let mut rx4 = shutdown_rx_base.clone();
+        let conn_rx_tpl = shutdown_rx_base.clone();
+        let h4 = tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = &mut rx6 => {
-                        break;
+                    _ = rx4.changed() => {
+                        if *rx4.borrow() {
+                            break;
+                        }
                     }
-                    accepted = listener_v6.accept() => {
+                    accepted = listener.accept() => {
+                        if *rx4.borrow() || SERVER_ACTIVE_GEN.load(Ordering::SeqCst) != generation {
+                            break;
+                        }
                         match accepted {
                             Ok((stream, _peer)) => {
-                                tokio::spawn(handle_connection(stream));
+                                tokio::spawn(handle_connection(stream, generation, conn_rx_tpl.clone()));
                             }
                             Err(_) => {
                                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3850,6 +3921,43 @@ pub async fn start_server() -> Result<ApiServiceStatus, String> {
                 }
             }
         });
+        accept_handles.push(h4);
+    }
+
+    // Also bind IPv6 loopback/wildcard so `http://localhost:<port>/v1` resolves immediately on Windows 11
+    let v6_addr = if cfg.access_scope == "lan" {
+        format!("[::]:{}", cfg.port)
+    } else {
+        format!("[::1]:{}", cfg.port)
+    };
+    if let Ok(listener_v6) = TcpListener::bind(&v6_addr).await {
+        let mut rx6 = shutdown_rx_base.clone();
+        let conn_rx_tpl = shutdown_rx_base.clone();
+        let h6 = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = rx6.changed() => {
+                        if *rx6.borrow() {
+                            break;
+                        }
+                    }
+                    accepted = listener_v6.accept() => {
+                        if *rx6.borrow() || SERVER_ACTIVE_GEN.load(Ordering::SeqCst) != generation {
+                            break;
+                        }
+                        match accepted {
+                            Ok((stream, _peer)) => {
+                                tokio::spawn(handle_connection(stream, generation, conn_rx_tpl.clone()));
+                            }
+                            Err(_) => {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        accept_handles.push(h6);
     }
 
     {
@@ -3858,27 +3966,37 @@ pub async fn start_server() -> Result<ApiServiceStatus, String> {
             host: bind_host.to_string(),
             port: cfg.port,
             started_at,
-            shutdown_txs,
+            generation,
+            shutdown_tx,
+            accept_handles,
         });
     }
 
     get_status()
 }
 
-pub fn stop_server() -> Result<ApiServiceStatus, String> {
-    if let Ok(mut guard) = server_lock().lock() {
-        if let Some(mut running) = guard.take() {
-            for tx in running.shutdown_txs.drain(..) {
-                let _ = tx.send(());
-            }
-        }
-    }
+pub async fn stop_server() -> Result<ApiServiceStatus, String> {
+    let _lifecycle = lifecycle_lock().lock().await;
+    stop_server_locked().await;
     get_status()
 }
 
+/// Immediate non-blocking teardown used on app exit hooks.
+pub fn stop_server_sync() {
+    SERVER_ACTIVE_GEN.store(0, Ordering::SeqCst);
+    if let Ok(mut guard) = server_lock().lock() {
+        if let Some(running) = guard.take() {
+            let _ = running.shutdown_tx.send(true);
+            for handle in running.accept_handles {
+                handle.abort();
+            }
+        }
+    }
+}
+
 pub async fn restart_server() -> Result<ApiServiceStatus, String> {
-    let _ = stop_server();
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    let _ = stop_server().await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
     start_server().await
 }
 
@@ -4191,6 +4309,9 @@ pub async fn test_chat_completion(
     model: String,
     prompt: String,
 ) -> Result<ApiTestChatResult, String> {
+    if !is_server_running() {
+        return Err("API Router đang tắt. Hãy bấm 'Chạy API' trước khi test.".into());
+    }
     let cfg = load_config()?;
     let keys = list_api_keys()?;
     let key = keys
@@ -4525,11 +4646,16 @@ mod tests {
 
     #[tokio::test]
     async fn http_keep_alive_and_v1_ping_reuse_same_socket_fast() {
+        let _guard = lifecycle_lock().lock().await;
+        let test_gen = SERVER_GEN_SEQ.fetch_add(1, Ordering::SeqCst).max(1);
+        SERVER_ACTIVE_GEN.store(test_gen, Ordering::SeqCst);
+        let (_tx, rx) = watch::channel(false);
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_connection(stream).await;
+            handle_connection(stream, test_gen, rx).await;
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -4556,6 +4682,55 @@ mod tests {
         assert!(resp2.starts_with("HTTP/1.1 200 OK"));
         assert!(resp2.contains("Connection: close"));
         let _ = server.await;
+        SERVER_ACTIVE_GEN.store(0, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn stop_signal_immediately_cuts_active_keep_alive_connection() {
+        let _guard = lifecycle_lock().lock().await;
+        let test_gen = SERVER_GEN_SEQ.fetch_add(1, Ordering::SeqCst).max(1);
+        SERVER_ACTIVE_GEN.store(test_gen, Ordering::SeqCst);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream, test_gen, shutdown_rx).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // 1st request succeeds while running
+        client
+            .write_all(b"GET /v1 HTTP/1.1\r\nHost: 127.0.0.1:57120\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf1 = [0u8; 1024];
+        let n1 = client.read(&mut buf1).await.unwrap();
+        let resp1 = String::from_utf8_lossy(&buf1[..n1]);
+        assert!(resp1.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp1.contains("Connection: keep-alive"));
+
+        // Simulate clicking "Stop API"
+        SERVER_ACTIVE_GEN.store(0, Ordering::SeqCst);
+        let _ = shutdown_tx.send(true);
+        // Server handler must exit immediately (not wait 60s idle timeout!)
+        tokio::time::timeout(Duration::from_millis(500), server)
+            .await
+            .expect("handle_connection should exit immediately on stop")
+            .unwrap();
+
+        // Subsequent request on the old keep-alive socket MUST NOT return 200 OK
+        let _ = client
+            .write_all(b"GET /v1 HTTP/1.1\r\nHost: 127.0.0.1:57120\r\n\r\n")
+            .await;
+        let mut buf2 = [0u8; 512];
+        let n2 = client.read(&mut buf2).await.unwrap_or(0);
+        let resp2 = String::from_utf8_lossy(&buf2[..n2]);
+        assert!(
+            n2 == 0 || resp2.starts_with("HTTP/1.1 503"),
+            "Expected EOF or 503 after stop, got: {resp2}"
+        );
     }
 
     #[tokio::test]
