@@ -61,6 +61,37 @@ flowchart LR
 
 ---
 
+## ⚙️ Recommended Settings (For Optimal Operation)
+
+After installing **OnlyDEVS — Antigravity**, apply these recommended settings so plugins, prompts, and the API Router run smoothly without conflicts:
+
+### 1. 🧩 Plugin Tab (`onlydevs-filter-bypass`)
+- **Enable `onlydevs-filter-bypass` (`v1.3.1` · Built-in Default):** Turn the top-right switch **ON** (`Đang bật`).
+- **Sync Hooks on first run:** Click **`Đồng bộ / Sửa Hooks từ Source Mặc định`** (Sync / Repair Hooks from Default Source) and verify all 4 lifecycle hooks are active: `PostInvocation`, `PreInvocation`, `SessionStart`, `Stop`.
+- **Verify with Self-Test:** Click **`Chạy Self-Test (test_filter_bypass.py)`** to confirm hooks execute cleanly with Python.
+- **Avoid duplicate plugins:** Keep only **`onlydevs-filter-bypass`** enabled — turn **OFF** any older/duplicate filter-bypass plugin (e.g., `antigravity-filter-bypass`) so hooks do not fire twice.
+
+### 2. 📝 Prompt Tab (`~/.gemini/config/AGENTS.md`)
+- **Enable method:** Select **`Replace existing`** (`Replace instruction file`) so activating a template cleanly replaces `~/.gemini/config/AGENTS.md` instead of stacking conflicting instructions.
+- **Active Prompt:** Turn **ON** **one** primary template under `Security / reverse` (recommended: **`KhoaHihi`**, or **`Gemini-4-Argon`** / **`Gemini-4-Carbon`** / **`Gemini-Hydrogen`**).
+- If templates are missing on a fresh install, click **`Sync GitHub templates`** at the top right.
+
+### 3. 👤 Accounts & Pool Tab
+- Sign in via **Google OAuth** (or sync local accounts) and click **Refresh All Quotas** once so every account is accurately classified into **`Pro · Full Next-Gen (Argon / G4 / C5.5)`** vs **`Pro · Classic (G3.8 / Claude 4.6)`**.
+- Click **`+ API`** (`API ✓`) on each account card you want included in the API Router pool.
+
+### 4. ⚡ API Service Router Tab
+| Setting | Recommended Value | Why |
+| :--- | :--- | :--- |
+| **Routing Strategy** | `Smart (Model & Quota)` (`smart`) | Strictly matches Full/Argon vs Classic models and picks the highest remaining quota. |
+| **Preserve Full/Argon Accounts** | **ON** (`Checked`) | Routes shared models (`3.8` / `3-Flash`) to Classic accounts first so Full/Argon quota stays reserved for `Argon / G4 / C5.5`. |
+| **Background Quota Refresh** | **`10`** minutes | Keeps the live Split Pro Pool Quota dashboard and smart routing scores fresh automatically while API is running. |
+| **Minimize to System Tray** | **ON** (`Checked`) | Closing the window hides the app to the Windows System Tray so your LAN API Router stays online in the background. |
+| **Access Scope (LAN sharing)** | `LAN (0.0.0.0)` + click **`Open LAN Firewall`** | Opens inbound `TCP <port>` + `ICMPv4` Ping on Windows Firewall in 1 click (prevents LAN ping/request timeouts on `Public` networks). |
+| **Sharing with friends / team** | Create a **secondary API Key** | Lock to **`Pro · Classic only`** + set **RPM limit** / **Daily Token Cap** / **Expiry** instead of sharing your Master Key. |
+
+---
+
 ## 📥 Download (Pre-built)
 
 Grab the latest Windows x64 installer or portable binary from [**GitHub Releases**](https://github.com/Khoahihi1/OnlyDEVS-Antigravity/releases/latest):
