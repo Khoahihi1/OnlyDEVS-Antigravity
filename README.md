@@ -57,7 +57,7 @@ flowchart LR
 ```
 
 - **Why standard `/v1/*` routes?** Providing OpenAI-style (`/v1/chat/completions`, `/v1/models`) and Anthropic-style (`/v1/messages`) inbound compatibility lets any third-party tool point its Base URL to `http://127.0.0.1:57120/v1` and use your Antigravity quota with streaming, thinking, tool calls, and automatic account failover.
-- **Routing & Management:** Supports **Smart Model-Aware (`smart`)** routing (strictly matches `Full / Argon / Gemini 4 / Claude 5.5` vs `Classic / Gemini 3.8 / Claude 4.6` accounts and preserves Full/Argon quota on shared models), plus `highest_quota`, `round_robin`, `sticky_session`, and `failover` strategies, scoped per-bucket cooldowns (`claude` / `gemini` / `argon`), runtime 404 learning, automatic OAuth refresh on `401`, scoped API keys, custom model alias rules, live playground, request logs inspector, and dedicated API usage analytics.
+- **Routing, Performance & Management:** Supports **Smart Model-Aware (`smart`)** routing (strictly matches `Full / Argon / Gemini 4 / Claude 5.5` vs `Classic / Gemini 3.8 / Claude 4.6` accounts and preserves Full/Argon quota on shared models), live **Split Pro Pool Quota** dashboard, pooled HTTP/2 + TLS upstream connections, `TCP_NODELAY`, HTTP/1.1 Keep-Alive, RFC 9112 chunked SSE with 10s keepalive heartbeats, **1-click Windows LAN Firewall** opener, `highest_quota` / `round_robin` / `sticky_session` / `failover` strategies, scoped per-bucket cooldowns, runtime 404 learning, automatic OAuth refresh on `401`, scoped API keys, custom model alias rules, live playground, request logs inspector, and dedicated API usage analytics.
 
 ---
 
