@@ -71,10 +71,18 @@ After installing **OnlyDEVS — Antigravity**, apply these recommended settings 
 - **Verify with Self-Test:** Click **`Chạy Self-Test (test_filter_bypass.py)`** to confirm hooks execute cleanly with Python.
 - **Avoid duplicate plugins:** Keep only **`onlydevs-filter-bypass`** enabled — turn **OFF** any older/duplicate filter-bypass plugin (e.g., `antigravity-filter-bypass`) so hooks do not fire twice.
 
+<p align="center">
+  <img src="docs/images/settings-plugin.png" alt="Recommended Plugin Settings — onlydevs-filter-bypass" width="900" />
+</p>
+
 ### 2. 📝 Prompt Tab (`~/.gemini/config/AGENTS.md`)
 - **Enable method:** Select **`Replace existing`** (`Replace instruction file`) so activating a template cleanly replaces `~/.gemini/config/AGENTS.md` instead of stacking conflicting instructions.
 - **Active Prompt:** Turn **ON** **one** primary template under `Security / reverse` (recommended: **`KhoaHihi`**, or **`Gemini-4-Argon`** / **`Gemini-4-Carbon`** / **`Gemini-Hydrogen`**).
 - If templates are missing on a fresh install, click **`Sync GitHub templates`** at the top right.
+
+<p align="center">
+  <img src="docs/images/settings-prompt.png" alt="Recommended Prompt Settings — Replace existing + Active template" width="900" />
+</p>
 
 ### 3. 👤 Accounts & Pool Tab
 - Sign in via **Google OAuth** (or sync local accounts) and click **Refresh All Quotas** once so every account is accurately classified into **`Pro · Full Next-Gen (Argon / G4 / C5.5)`** vs **`Pro · Classic (G3.8 / Claude 4.6)`**.
