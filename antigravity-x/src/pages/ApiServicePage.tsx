@@ -446,8 +446,6 @@ export function ApiServicePage({
       { key: "gemini:weekly", label: "Gemini 4 · Weekly" },
       { key: "claude:5h", label: "Claude 5.5 · 5h" },
       { key: "claude:weekly", label: "Claude 5.5 · Weekly" },
-      { key: "argon:weekly", label: "Gemini 4 Argon (Weekly)" },
-      { key: "carbon:weekly", label: "Gemini 4 Carbon (Weekly)", optional: true },
     ]);
 
     const classicPro = buildGroup(classicProAccs, [

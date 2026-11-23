@@ -1310,22 +1310,6 @@ fn account_quota_score(acc: &AntigravityAccount, model: &str) -> i32 {
             }
         }
         match scope {
-            "argon" => {
-                if name == "gemini-argon-wtu-weekly" || name == "argon:weekly" {
-                    bucket_weekly = Some(m.percentage);
-                    if m.summary_exhausted == Some(true) {
-                        bucket_exhausted = true;
-                    }
-                }
-            }
-            "carbon" => {
-                if name == "gemini-carbon-wtu-weekly" || name == "carbon:weekly" {
-                    bucket_weekly = Some(m.percentage);
-                    if m.summary_exhausted == Some(true) {
-                        bucket_exhausted = true;
-                    }
-                }
-            }
             "claude" => {
                 if name == "3p-5h" || name == "claude:5h" {
                     bucket_5h = Some(m.percentage);
@@ -1340,13 +1324,22 @@ fn account_quota_score(acc: &AntigravityAccount, model: &str) -> i32 {
                 }
             }
             _ => {
+                // Gemini, Argon, and Carbon share the Gemini 5h & Weekly quota buckets
                 if name == "gemini-5h" || name == "gemini:5h" {
                     bucket_5h = Some(m.percentage);
                     if m.summary_exhausted == Some(true) {
                         bucket_exhausted = true;
                     }
-                } else if name == "gemini-weekly" || name == "gemini:weekly" {
-                    bucket_weekly = Some(m.percentage);
+                } else if name == "gemini-weekly"
+                    || name == "gemini:weekly"
+                    || (scope == "argon" && (name == "gemini-argon-wtu-weekly" || name == "argon:weekly"))
+                    || (scope == "carbon" && (name == "gemini-carbon-wtu-weekly" || name == "carbon:weekly"))
+                {
+                    bucket_weekly = Some(
+                        bucket_weekly
+                            .map(|prev| prev.min(m.percentage))
+                            .unwrap_or(m.percentage),
+                    );
                     if m.summary_exhausted == Some(true) {
                         bucket_exhausted = true;
                     }
