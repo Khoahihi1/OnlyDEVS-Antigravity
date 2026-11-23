@@ -345,7 +345,7 @@ export function ApiServicePage({
     const otherAccs: AntigravityAccount[] = [];
 
     for (const acc of poolAccounts) {
-      const tier = normalizeTierBadge(acc.quota?.subscriptionTier);
+      const tier = normalizeTierBadge(acc.quota?.subscriptionTier, acc);
       const profile = classifyAccountModelProfile(acc);
       if (profile.kind === "full_nextgen" && tier !== "FREE") {
         fullProAccs.push(acc);
@@ -363,7 +363,7 @@ export function ApiServicePage({
       const tierCounts = new Map<string, number>();
       let readyCount = 0;
       const itemMaps = list.map((acc) => {
-        const t = normalizeTierBadge(acc.quota?.subscriptionTier);
+        const t = normalizeTierBadge(acc.quota?.subscriptionTier, acc);
         tierCounts.set(t, (tierCounts.get(t) ?? 0) + 1);
         if ((cooldownMap.get(acc.id)?.length ?? 0) === 0) {
           readyCount += 1;
@@ -945,20 +945,20 @@ print(resp.choices[0].message.content)`;
                 ) : null}
               </div>
 
-              {/* Group 2: Pro Classic (G3.8 / Claude 4.6) */}
+              {/* Group 2: ProLite Classic (G3.8 / Claude 4.6) */}
               <div className="ag-api-quota-group is-classic">
                 <div className="ag-api-quota-group__head">
                   <div className="ag-api-quota-group__title">
                     <strong>
                       <Cpu size={14} />
-                      <span>Pro · Classic (G3.8 / Claude 4.6)</span>
+                      <span>ProLite · Classic (G3.8 / Claude 4.6)</span>
                     </strong>
                     <span>
                       {poolQuotaSummary.classicPro.accountCount > 0
                         ? `${poolQuotaSummary.classicPro.readyCount}/${poolQuotaSummary.classicPro.accountCount} ${vi ? "acc sẵn sàng" : "ready"} · ${poolQuotaSummary.classicPro.tierBreakdown}`
                         : vi
-                          ? "Chưa có acc Classic trong pool"
-                          : "No Classic accounts in pool"}
+                          ? "Chưa có acc ProLite trong pool"
+                          : "No ProLite accounts in pool"}
                     </span>
                   </div>
                   <div className="ag-api-quota-group__total">
@@ -1199,10 +1199,10 @@ print(resp.choices[0].message.content)`;
                   </span>
                   <div className="ag-api-pool-split">
                     <span className="ag-api-profile-pill is-full">
-                      Full · G4/Argon/C5.5: {status.poolFullNextgen}
+                      PRO · G4/Argon/C5.5: {status.poolFullNextgen}
                     </span>
                     <span className="ag-api-profile-pill is-classic">
-                      Classic · 3.8/C4.6: {status.poolClassic}
+                      ProLite · 3.8/C4.6: {status.poolClassic}
                     </span>
                     {status.poolUnknown > 0 ? (
                       <span className="ag-api-profile-pill is-unknown">
@@ -1258,9 +1258,9 @@ print(resp.choices[0].message.content)`;
                               }`}
                             >
                               {profile.kind === "full_nextgen"
-                                ? "Full · Argon/G4"
+                                ? "PRO · Argon/G4"
                                 : profile.kind === "classic"
-                                  ? "Classic · 3.8/C4.6"
+                                  ? "ProLite · 3.8/C4.6"
                                   : vi
                                     ? "Chưa quét"
                                     : "Unscanned"}
@@ -2492,9 +2492,9 @@ print(resp.choices[0].message.content)`;
                         }`}
                       >
                         {prof.kind === "full_nextgen"
-                          ? "Full · Argon"
+                          ? "PRO · Argon"
                           : prof.kind === "classic"
-                            ? "Classic · C4.6"
+                            ? "ProLite · 3.8/C4.6"
                             : vi
                               ? "Chưa quét"
                               : "Unscanned"}
@@ -2568,13 +2568,13 @@ print(resp.choices[0].message.content)`;
                     </option>
                     <option value="classic">
                       {vi
-                        ? "Chỉ Pro · Classic (G3.8 / Claude 4.6 — giữ nguyên Argon/G4)"
-                        : "Pro · Classic only (G3.8 / Claude 4.6)"}
+                        ? "Chỉ ProLite · Classic (G3.8 / Claude 4.6 — giữ nguyên Argon/G4)"
+                        : "ProLite · Classic only (G3.8 / Claude 4.6)"}
                     </option>
                     <option value="full_nextgen">
                       {vi
-                        ? "Chỉ Pro · Full Next-Gen (Argon / G4 / Claude 5.5)"
-                        : "Pro · Full Next-Gen only (Argon / G4 / C5.5)"}
+                        ? "Chỉ PRO · Full Next-Gen (Argon / G4 / Claude 5.5)"
+                        : "PRO · Full Next-Gen only (Argon / G4 / C5.5)"}
                     </option>
                   </select>
                 </label>

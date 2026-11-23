@@ -2861,6 +2861,13 @@
   color: #60a5fa;
 }
 
+.ag-badge-tier.is-prolite {
+  background: rgba(245, 158, 11, 0.18);
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  color: #fbbf24;
+  text-transform: none;
+}
+
 .ag-badge-tier.is-ultra {
   background: rgba(168, 85, 247, 0.22);
   border: 1px solid rgba(168, 85, 247, 0.45);

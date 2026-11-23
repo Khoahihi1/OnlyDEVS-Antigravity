@@ -121,6 +121,7 @@ type ViewMode = "grid" | "list" | "compact";
 type TierFilter =
   | "ALL"
   | "PRO"
+  | "ProLite"
   | "ULTRA"
   | "FREE"
   | "VALID"
@@ -483,14 +484,16 @@ export function AccountsPage({
 
   const tierCounts = useMemo(() => {
     let pro = 0;
+    let proLite = 0;
     let ultra = 0;
     let free = 0;
     let reauth = 0;
     let forbidden = 0;
     let valid = 0;
     for (const acc of accounts) {
-      const t = normalizeTierBadge(acc.quota?.subscriptionTier);
+      const t = normalizeTierBadge(acc.quota?.subscriptionTier, acc);
       if (t === "PRO") pro++;
+      else if (t === "ProLite") proLite++;
       else if (t === "ULTRA") ultra++;
       else free++;
       const needs = isAccountNeedsReauth(acc);
@@ -499,7 +502,7 @@ export function AccountsPage({
       if (forb) forbidden++;
       if (!needs && !forb && !acc.disabled) valid++;
     }
-    return { all: accounts.length, pro, ultra, free, valid, reauth, forbidden };
+    return { all: accounts.length, pro, proLite, ultra, free, valid, reauth, forbidden };
   }, [accounts]);
 
   const activeGroup = useMemo(
@@ -517,10 +520,11 @@ export function AccountsPage({
       if (activeGroup && !activeGroup.accountIds.includes(acc.id)) return false;
 
       if (tierFilter !== "ALL") {
-        const t = normalizeTierBadge(acc.quota?.subscriptionTier);
+        const t = normalizeTierBadge(acc.quota?.subscriptionTier, acc);
         const needs = isAccountNeedsReauth(acc);
         const forb = Boolean(acc.quota?.isForbidden);
         if (tierFilter === "PRO" && t !== "PRO") return false;
+        if (tierFilter === "ProLite" && t !== "ProLite") return false;
         if (tierFilter === "ULTRA" && t !== "ULTRA") return false;
         if (tierFilter === "FREE" && t !== "FREE") return false;
         if (tierFilter === "REAUTH" && !needs) return false;
@@ -1048,7 +1052,7 @@ export function AccountsPage({
 
   // Render single Account Card (Grid / List / Compact)
   const renderAccountCard = (acc: AntigravityAccount) => {
-    const tier = normalizeTierBadge(acc.quota?.subscriptionTier);
+    const tier = normalizeTierBadge(acc.quota?.subscriptionTier, acc);
     const needsReauth = isAccountNeedsReauth(acc);
     const isForbidden = Boolean(acc.quota?.isForbidden);
     const isSelected = selectedIds.has(acc.id);
@@ -1625,6 +1629,7 @@ export function AccountsPage({
                   {vi ? `Tất cả (${tierCounts.all})` : `All (${tierCounts.all})`}
                 </option>
                 <option value="PRO">PRO ({tierCounts.pro})</option>
+                <option value="ProLite">ProLite ({tierCounts.proLite})</option>
                 <option value="ULTRA">ULTRA ({tierCounts.ultra})</option>
                 <option value="FREE">FREE ({tierCounts.free})</option>
                 <option value="VALID">
@@ -2335,9 +2340,10 @@ export function AccountsPage({
                 <span
                   className={`ag-badge-tier is-${normalizeTierBadge(
                     launchAccount.quota?.subscriptionTier,
+                    launchAccount,
                   ).toLowerCase()}`}
                 >
-                  {normalizeTierBadge(launchAccount.quota?.subscriptionTier)}
+                  {normalizeTierBadge(launchAccount.quota?.subscriptionTier, launchAccount)}
                 </span>
               </div>
 
@@ -2509,7 +2515,7 @@ export function AccountsPage({
               <div>
                 <h3>{maskEmail(infoAccount.email, privacyMode)}</h3>
                 <span className="agx-muted">
-                  Tier: {infoAccount.quota?.subscriptionTier || "FREE"} · Project:{" "}
+                  Tier: {normalizeTierBadge(infoAccount.quota?.subscriptionTier, infoAccount)} · Project:{" "}
                   {infoAccount.quota?.projectId ||
                     infoAccount.token.projectId ||
                     "—"}

@@ -23,10 +23,57 @@ const FREE_BUCKET_WINDOWS: ReadonlyArray<{ key: string; label: string }> = [
 
 const BUCKET_KEYS = new Set(PAID_BUCKET_WINDOWS.map((w) => w.key));
 
-export function normalizeTierBadge(tier?: string | null): "ULTRA" | "PRO" | "FREE" {
+export type PlanTierBadge = "ULTRA" | "PRO" | "ProLite" | "FREE";
+
+export function isClassicProLiteModels(models?: ModelQuota[] | null): boolean {
+  if (!models || models.length === 0) return false;
+  let isNextgen = false;
+  let hasReal = false;
+  for (const m of models) {
+    const n = m.name.trim().toLowerCase();
+    if (
+      n === "gemini-argon-wtu-weekly" ||
+      n === "argon:weekly" ||
+      n.startsWith("gemini-4-argon") ||
+      n.startsWith("gemini-4-neon") ||
+      n.startsWith("claude-sonnet-5-5") ||
+      n.startsWith("claude-opus-5-5") ||
+      (n.startsWith("gemini-4-hydrogen") && !n.endsWith("sonar"))
+    ) {
+      isNextgen = true;
+    }
+    if (
+      !n.includes(":") &&
+      !n.endsWith("-5h") &&
+      !n.endsWith("-weekly") &&
+      !n.startsWith("tab_") &&
+      !n.startsWith("chat_") &&
+      !n.includes("wtu")
+    ) {
+      hasReal = true;
+    }
+  }
+  return !isNextgen && hasReal;
+}
+
+export function normalizeTierBadge(
+  tier?: string | null,
+  modelsOrAccount?: ModelQuota[] | AntigravityAccount | null,
+): PlanTierBadge {
   const t = (tier || "").toLowerCase();
   if (t.includes("ultra")) return "ULTRA";
-  if (t.includes("pro") || t.includes("g1") || t.includes("paid") || t.includes("plus")) {
+  if (t.includes("prolite") || t.includes("pro_lite") || t.includes("pro-lite")) {
+    return "ProLite";
+  }
+  const models: ModelQuota[] | null | undefined = Array.isArray(modelsOrAccount)
+    ? modelsOrAccount
+    : modelsOrAccount?.quota?.models;
+  const isProTier =
+    t.includes("pro") || t.includes("g1") || t.includes("paid") || t.includes("plus");
+  if (isProTier) {
+    if (isClassicProLiteModels(models)) {
+      return "ProLite";
+    }
     return "PRO";
   }
   return "FREE";
@@ -79,7 +126,7 @@ export function getAntigravityQuotaDisplayItems(
   account: AntigravityAccount,
 ): AgQuotaDisplayItem[] {
   const models: ModelQuota[] = account.quota?.models || [];
-  const tier = normalizeTierBadge(account.quota?.subscriptionTier);
+  const tier = normalizeTierBadge(account.quota?.subscriptionTier, models);
   const isFree = tier === "FREE";
   const stale = account.quota?.quotaSummaryStale || undefined;
   const legacyModels =

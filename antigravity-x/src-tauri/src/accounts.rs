@@ -1380,6 +1380,42 @@ async fn fetch_cloud_code_quota(
     models.sort_by(|a, b| a.name.cmp(&b.name));
     let now_ts = Utc::now().timestamp();
 
+    // Reclassify Classic Pro accounts (Gemini 3.8 + Claude 4.6 without Next-Gen Argon/G4/C5.5) as ProLite
+    if let Some(ref raw_tier) = subscription_tier {
+        let t = raw_tier.to_ascii_lowercase();
+        let is_pro_like =
+            !t.contains("ultra") && (t.contains("pro") || t.contains("g1") || t.contains("paid") || t.contains("plus"));
+        if is_pro_like && !models.is_empty() {
+            let mut is_nextgen = false;
+            let mut has_real = false;
+            for m in &models {
+                let n = m.name.trim().to_ascii_lowercase();
+                if n == "gemini-argon-wtu-weekly"
+                    || n == "argon:weekly"
+                    || n.starts_with("gemini-4-argon")
+                    || n.starts_with("gemini-4-neon")
+                    || n.starts_with("claude-sonnet-5-5")
+                    || n.starts_with("claude-opus-5-5")
+                    || (n.starts_with("gemini-4-hydrogen") && !n.ends_with("sonar"))
+                {
+                    is_nextgen = true;
+                }
+                if !n.contains(':')
+                    && !n.ends_with("-5h")
+                    && !n.ends_with("-weekly")
+                    && !n.starts_with("tab_")
+                    && !n.starts_with("chat_")
+                    && !n.contains("wtu")
+                {
+                    has_real = true;
+                }
+            }
+            if !is_nextgen && has_real {
+                subscription_tier = Some("ProLite".to_string());
+            }
+        }
+    }
+
     let quota = QuotaData {
         models,
         last_updated: now_ts,
