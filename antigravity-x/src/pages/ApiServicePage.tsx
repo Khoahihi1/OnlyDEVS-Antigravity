@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
+  AlertTriangle,
   BarChart3,
   BookOpen,
   Check,
@@ -22,8 +23,10 @@ import {
   Save,
   Search,
   Send,
+  ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
+  Sparkles,
   Trash2,
   Users,
   X,
@@ -39,14 +42,22 @@ import type {
   ApiServiceUsageSummary,
   ApiTestChatResult,
   AppLanguage,
+  LanDiagnostics,
   ModelAliasRule,
+  RefreshStats,
 } from "../types";
 import { agxInvoke } from "../platform/invoke";
 import {
   formatExactNumber,
   formatTokensShort,
 } from "../components/AntigravityUsageTrend";
-import { getAntigravityOverallScore } from "../components/AntigravityQuotaSection";
+import {
+  formatResetCountdown,
+  getAntigravityOverallScore,
+  getAntigravityQuotaDisplayItems,
+  getQuotaTone,
+  normalizeTierBadge,
+} from "../components/AntigravityQuotaSection";
 
 type ApiServicePageProps = {
   lang: AppLanguage;
@@ -160,6 +171,7 @@ export function ApiServicePage({
   const [banner, setBanner] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [revealMasterKey, setRevealMasterKey] = useState(false);
+  const [lanDiag, setLanDiag] = useState<LanDiagnostics | null>(null);
 
   // Editable config draft
   const [cfgDraft, setCfgDraft] = useState<ApiServiceConfig | null>(null);
@@ -234,6 +246,24 @@ export function ApiServicePage({
   }, [loadAll]);
 
   useEffect(() => {
+    if (status?.config.accessScope !== "lan") {
+      setLanDiag(null);
+      return;
+    }
+    let cancelled = false;
+    void agxInvoke<LanDiagnostics>("api_service_lan_diagnostics", {
+      port: status.port,
+    })
+      .then((diag) => {
+        if (!cancelled) setLanDiag(diag);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [status?.config.accessScope, status?.port]);
+
+  useEffect(() => {
     if (!autoRefreshLogs || (subTab !== "logs" && subTab !== "overview")) return;
     const t = window.setInterval(() => {
       void agxInvoke<ApiServiceStatus>("api_service_get_status")
@@ -285,6 +315,198 @@ export function ApiServicePage({
     }
     return m;
   }, [status]);
+
+  type QuotaBucketAgg = {
+    key: string;
+    label: string;
+    sumPct: number;
+    maxPct: number;
+    avgPct: number;
+    availableCount: number;
+    totalCount: number;
+    earliestReset: string;
+  };
+
+  type PoolQuotaGroupSummary = {
+    accountCount: number;
+    readyCount: number;
+    tierBreakdown: string;
+    totalEquivAcc: number;
+    buckets: QuotaBucketAgg[];
+  };
+
+  const poolQuotaSummary = useMemo(() => {
+    const fullProAccs: AntigravityAccount[] = [];
+    const classicProAccs: AntigravityAccount[] = [];
+    const otherAccs: AntigravityAccount[] = [];
+
+    for (const acc of poolAccounts) {
+      const tier = normalizeTierBadge(acc.quota?.subscriptionTier);
+      const profile = classifyAccountModelProfile(acc);
+      if (profile.kind === "full_nextgen" && tier !== "FREE") {
+        fullProAccs.push(acc);
+      } else if (profile.kind === "classic" && tier !== "FREE") {
+        classicProAccs.push(acc);
+      } else {
+        otherAccs.push(acc);
+      }
+    }
+
+    const buildGroup = (
+      list: AntigravityAccount[],
+      specs: ReadonlyArray<{ key: string; label: string; optional?: boolean }>,
+    ): PoolQuotaGroupSummary => {
+      const tierCounts = new Map<string, number>();
+      let readyCount = 0;
+      const itemMaps = list.map((acc) => {
+        const t = normalizeTierBadge(acc.quota?.subscriptionTier);
+        tierCounts.set(t, (tierCounts.get(t) ?? 0) + 1);
+        if ((cooldownMap.get(acc.id)?.length ?? 0) === 0) {
+          readyCount += 1;
+        }
+        const map = new Map<string, { pct: number; resetTime: string }>();
+        for (const item of getAntigravityQuotaDisplayItems(acc)) {
+          map.set(item.key, {
+            pct: Math.max(0, Math.min(100, item.percentage)),
+            resetTime: item.resetTime,
+          });
+        }
+        return map;
+      });
+
+      const buckets: QuotaBucketAgg[] = [];
+      for (const spec of specs) {
+        let sumPct = 0;
+        let totalCount = 0;
+        let availableCount = 0;
+        let earliestMs = Number.POSITIVE_INFINITY;
+        let earliestReset = "";
+
+        for (const m of itemMaps) {
+          const hit = m.get(spec.key);
+          if (!hit) continue;
+          totalCount += 1;
+          sumPct += hit.pct;
+          if (hit.pct > 0) availableCount += 1;
+          if (hit.resetTime) {
+            const ms = Date.parse(hit.resetTime);
+            if (!Number.isNaN(ms) && ms > Date.now() && ms < earliestMs) {
+              earliestMs = ms;
+              earliestReset = hit.resetTime;
+            }
+          }
+        }
+        if (totalCount === 0 && spec.optional) continue;
+        const maxPct = totalCount * 100;
+        const avgPct = totalCount > 0 ? Math.round(sumPct / totalCount) : 0;
+        buckets.push({
+          key: spec.key,
+          label: spec.label,
+          sumPct,
+          maxPct,
+          avgPct,
+          availableCount,
+          totalCount,
+          earliestReset,
+        });
+      }
+
+      // Equivalent full-account score across primary 5h buckets (min of available buckets per acc)
+      let totalEquivAcc = 0;
+      for (const m of itemMaps) {
+        const g5 = m.get("gemini:5h")?.pct;
+        const c5 = m.get("claude:5h")?.pct;
+        const gw = m.get("gemini:weekly")?.pct;
+        const cw = m.get("claude:weekly")?.pct;
+        const vals = [g5, c5, gw, cw].filter((v): v is number => v != null);
+        if (vals.length > 0) {
+          totalEquivAcc += vals.reduce((a, b) => a + b, 0) / (vals.length * 100);
+        }
+      }
+
+      const tierBreakdown = Array.from(tierCounts.entries())
+        .map(([k, v]) => `${v} ${k}`)
+        .join(" · ");
+
+      return {
+        accountCount: list.length,
+        readyCount,
+        tierBreakdown,
+        totalEquivAcc,
+        buckets,
+      };
+    };
+
+    const fullPro = buildGroup(fullProAccs, [
+      { key: "gemini:5h", label: "Gemini 4 · 5h" },
+      { key: "gemini:weekly", label: "Gemini 4 · Weekly" },
+      { key: "claude:5h", label: "Claude 5.5 · 5h" },
+      { key: "claude:weekly", label: "Claude 5.5 · Weekly" },
+      { key: "argon:weekly", label: "Gemini 4 Argon (Weekly)" },
+      { key: "carbon:weekly", label: "Gemini 4 Carbon (Weekly)", optional: true },
+    ]);
+
+    const classicPro = buildGroup(classicProAccs, [
+      { key: "gemini:5h", label: "Gemini 3.8 · 5h" },
+      { key: "gemini:weekly", label: "Gemini 3.8 · Weekly" },
+      { key: "claude:5h", label: "Claude 4.6 · 5h" },
+      { key: "claude:weekly", label: "Claude 4.6 · Weekly" },
+    ]);
+
+    return {
+      fullPro,
+      classicPro,
+      otherCount: otherAccs.length,
+      otherFreeCount: otherAccs.filter(
+        (a) => normalizeTierBadge(a.quota?.subscriptionTier) === "FREE",
+      ).length,
+      otherUnscannedCount: otherAccs.filter((a) => (a.quota?.models?.length ?? 0) === 0).length,
+    };
+  }, [cooldownMap, poolAccounts]);
+
+  const handleOpenLanFirewall = async () => {
+    if (!status) return;
+    setBusyKey("lan-fw");
+    try {
+      const diag = await agxInvoke<LanDiagnostics>("api_service_open_lan_firewall", {
+        port: status.port,
+      });
+      setLanDiag(diag);
+      flash(
+        diag.firewallRuleExists ? "ok" : "err",
+        diag.firewallRuleExists
+          ? vi
+            ? `Đã mở Windows Firewall cho LAN (TCP ${status.port} + Ping ICMPv4)!`
+            : `Opened Windows Firewall for LAN (TCP ${status.port} + ICMPv4 Ping)!`
+          : vi
+            ? "Đã chạy lệnh mở Firewall nhưng chưa thấy rule — hãy chạy lệnh netsh bằng quyền Admin."
+            : "Firewall rule not detected yet — run the netsh command as Administrator.",
+      );
+    } catch (err) {
+      flash("err", err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyKey(null);
+    }
+  };
+
+  const handleRefreshPoolQuotas = async () => {
+    setBusyKey("refresh-pool-quota");
+    try {
+      const stats = await agxInvoke<RefreshStats>("refresh_all_quotas");
+      await onRefreshAccounts();
+      await loadAll();
+      flash(
+        "ok",
+        vi
+          ? `Đã quét lại quota ${stats.success}/${stats.total} tài khoản`
+          : `Refreshed quota for ${stats.success}/${stats.total} accounts`,
+      );
+    } catch (err) {
+      flash("err", err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyKey(null);
+    }
+  };
 
   // Actions
   const handleToggleServer = async () => {
@@ -613,6 +835,184 @@ print(resp.choices[0].message.content)`;
       {/* SUB-TAB 1: OVERVIEW, POOL & API KEYS */}
       {subTab === "overview" && status && cfgDraft ? (
         <div className="ag-api-overview-grid">
+          {/* Full-width Split Pro Pool Quota Summary */}
+          <section className="ag-api-card ag-api-quota-card">
+            <div className="ag-api-card__head">
+              <div className="ag-api-card__title-group">
+                <h3>
+                  <Layers size={15} />{" "}
+                  {vi
+                    ? "Tổng Quota Pool (Phân loại 2 nhóm Pro)"
+                    : "Total Pool Quota (Split by Pro Account Tier)"}
+                </h3>
+                <span className="ag-api-protocol-pill">
+                  {poolAccounts.length} acc trong pool
+                </span>
+              </div>
+              <button
+                type="button"
+                className="agx-btn agx-btn--secondary agx-btn--sm"
+                disabled={busyKey === "refresh-pool-quota"}
+                onClick={() => void handleRefreshPoolQuotas()}
+              >
+                {busyKey === "refresh-pool-quota" ? (
+                  <Loader2 size={13} className="spin" />
+                ) : (
+                  <RefreshCw size={13} />
+                )}
+                <span>{vi ? "Quét lại Quota Pool" : "Refresh Pool Quota"}</span>
+              </button>
+            </div>
+
+            <div className="ag-api-quota-groups">
+              {/* Group 1: Pro Full Next-Gen (Argon / G4 / C5.5) */}
+              <div className="ag-api-quota-group is-full">
+                <div className="ag-api-quota-group__head">
+                  <div className="ag-api-quota-group__title">
+                    <strong>
+                      <Sparkles size={14} />
+                      <span>Pro · Full Next-Gen (Argon / G4 / C5.5)</span>
+                    </strong>
+                    <span>
+                      {poolQuotaSummary.fullPro.accountCount > 0
+                        ? `${poolQuotaSummary.fullPro.readyCount}/${poolQuotaSummary.fullPro.accountCount} ${vi ? "acc sẵn sàng" : "ready"} · ${poolQuotaSummary.fullPro.tierBreakdown}`
+                        : vi
+                          ? "Chưa có acc Full Next-Gen trong pool"
+                          : "No Full Next-Gen accounts in pool"}
+                    </span>
+                  </div>
+                  <div className="ag-api-quota-group__total">
+                    <strong>
+                      {poolQuotaSummary.fullPro.totalEquivAcc.toFixed(2)} /{" "}
+                      {poolQuotaSummary.fullPro.accountCount} acc
+                    </strong>
+                    <span>
+                      {vi ? "Tổng dung lượng quy đổi" : "Total equiv. capacity"}
+                    </span>
+                  </div>
+                </div>
+
+                {poolQuotaSummary.fullPro.accountCount > 0 ? (
+                  <div className="ag-api-quota-buckets">
+                    {poolQuotaSummary.fullPro.buckets.map((b) => {
+                      const tone = getQuotaTone(b.avgPct);
+                      const resetText = formatResetCountdown(b.earliestReset, vi);
+                      return (
+                        <div key={b.key} className="ag-api-quota-row">
+                          <div className="ag-api-quota-row__top">
+                            <span className="ag-api-quota-row__label">
+                              <span>{b.label}</span>
+                              {resetText ? (
+                                <span className="ag-api-quota-row__reset">
+                                  · {resetText}
+                                </span>
+                              ) : null}
+                            </span>
+                            <span className="ag-api-quota-row__metrics">
+                              <span>
+                                {b.sumPct}% / {b.maxPct}% ({b.availableCount}/{b.totalCount} acc)
+                              </span>
+                              <span className={`ag-api-quota-row__pct is-${tone}`}>
+                                {b.avgPct}%
+                              </span>
+                            </span>
+                          </div>
+                          <div className="ag-api-quota-bar">
+                            <div
+                              className={`ag-api-quota-bar__fill is-${tone}`}
+                              style={{ width: `${Math.max(0, Math.min(100, b.avgPct))}%` }}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : null}
+              </div>
+
+              {/* Group 2: Pro Classic (G3.8 / Claude 4.6) */}
+              <div className="ag-api-quota-group is-classic">
+                <div className="ag-api-quota-group__head">
+                  <div className="ag-api-quota-group__title">
+                    <strong>
+                      <Cpu size={14} />
+                      <span>Pro · Classic (G3.8 / Claude 4.6)</span>
+                    </strong>
+                    <span>
+                      {poolQuotaSummary.classicPro.accountCount > 0
+                        ? `${poolQuotaSummary.classicPro.readyCount}/${poolQuotaSummary.classicPro.accountCount} ${vi ? "acc sẵn sàng" : "ready"} · ${poolQuotaSummary.classicPro.tierBreakdown}`
+                        : vi
+                          ? "Chưa có acc Classic trong pool"
+                          : "No Classic accounts in pool"}
+                    </span>
+                  </div>
+                  <div className="ag-api-quota-group__total">
+                    <strong>
+                      {poolQuotaSummary.classicPro.totalEquivAcc.toFixed(2)} /{" "}
+                      {poolQuotaSummary.classicPro.accountCount} acc
+                    </strong>
+                    <span>
+                      {vi ? "Tổng dung lượng quy đổi" : "Total equiv. capacity"}
+                    </span>
+                  </div>
+                </div>
+
+                {poolQuotaSummary.classicPro.accountCount > 0 ? (
+                  <div className="ag-api-quota-buckets">
+                    {poolQuotaSummary.classicPro.buckets.map((b) => {
+                      const tone = getQuotaTone(b.avgPct);
+                      const resetText = formatResetCountdown(b.earliestReset, vi);
+                      return (
+                        <div key={b.key} className="ag-api-quota-row">
+                          <div className="ag-api-quota-row__top">
+                            <span className="ag-api-quota-row__label">
+                              <span>{b.label}</span>
+                              {resetText ? (
+                                <span className="ag-api-quota-row__reset">
+                                  · {resetText}
+                                </span>
+                              ) : null}
+                            </span>
+                            <span className="ag-api-quota-row__metrics">
+                              <span>
+                                {b.sumPct}% / {b.maxPct}% ({b.availableCount}/{b.totalCount} acc)
+                              </span>
+                              <span className={`ag-api-quota-row__pct is-${tone}`}>
+                                {b.avgPct}%
+                              </span>
+                            </span>
+                          </div>
+                          <div className="ag-api-quota-bar">
+                            <div
+                              className={`ag-api-quota-bar__fill is-${tone}`}
+                              style={{ width: `${Math.max(0, Math.min(100, b.avgPct))}%` }}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : null}
+              </div>
+            </div>
+
+            {poolQuotaSummary.otherCount > 0 ? (
+              <div className="ag-api-quota-other-strip">
+                <span>
+                  {vi
+                    ? `Nhóm khác (tách riêng khỏi 2 loại Pro): ${poolQuotaSummary.otherCount} acc`
+                    : `Other accounts (excluded from Pro groups): ${poolQuotaSummary.otherCount}`}
+                  {poolQuotaSummary.otherFreeCount > 0
+                    ? ` · ${poolQuotaSummary.otherFreeCount} FREE`
+                    : ""}
+                  {poolQuotaSummary.otherUnscannedCount > 0
+                    ? ` · ${poolQuotaSummary.otherUnscannedCount} ${vi ? "chưa quét quota" : "unscanned"}`
+                    : ""}
+                </span>
+              </div>
+            ) : null}
+          </section>
+
           <section className="ag-api-card ag-api-hero-card">
             <div className="ag-api-card__head">
               <div className="ag-api-card__title-group">
@@ -663,17 +1063,70 @@ print(resp.choices[0].message.content)`;
             </div>
 
             {status.lanUrl ? (
-              <div className="ag-api-lan-note">
-                <span>LAN URL:</span>
-                <code>{status.lanUrl}</code>
-                <button
-                  type="button"
-                  className="ag-card-icon-btn"
-                  onClick={() => void copyText(status.lanUrl!, "lan-url")}
-                >
-                  {copiedKey === "lan-url" ? <Check size={13} /> : <Copy size={13} />}
-                </button>
-              </div>
+              <>
+                <div className="ag-api-lan-note">
+                  <span>LAN URL:</span>
+                  <code>{status.lanUrl}</code>
+                  <button
+                    type="button"
+                    className="ag-card-icon-btn"
+                    onClick={() => void copyText(status.lanUrl!, "lan-url")}
+                  >
+                    {copiedKey === "lan-url" ? <Check size={13} /> : <Copy size={13} />}
+                  </button>
+                </div>
+
+                {lanDiag ? (
+                  <div
+                    className={`ag-api-lan-fw-row ${
+                      lanDiag.firewallRuleExists ? "is-ok" : "is-warn"
+                    }`}
+                  >
+                    <div className="ag-api-lan-fw-info">
+                      {lanDiag.firewallRuleExists ? (
+                        <ShieldCheck size={14} style={{ color: "#10b981", flexShrink: 0 }} />
+                      ) : (
+                        <ShieldAlert size={14} style={{ color: "#f59e0b", flexShrink: 0 }} />
+                      )}
+                      <span>
+                        {lanDiag.firewallRuleExists
+                          ? vi
+                            ? `Firewall LAN đã mở (TCP ${lanDiag.port}${lanDiag.networkProfile ? ` · Mạng ${lanDiag.networkProfile}` : ""})`
+                            : `LAN Firewall open (TCP ${lanDiag.port}${lanDiag.networkProfile ? ` · ${lanDiag.networkProfile}` : ""})`
+                          : vi
+                            ? `Windows Firewall đang chặn LAN (Mạng: ${lanDiag.networkProfile || "Public"}) — máy khác ping/gọi sẽ bị timeout!`
+                            : `Windows Firewall is blocking LAN (${lanDiag.networkProfile || "Public"} profile) — remote ping/requests will time out!`}
+                      </span>
+                    </div>
+                    <div className="ag-api-lan-fw-actions">
+                      {!lanDiag.firewallRuleExists ? (
+                        <button
+                          type="button"
+                          className="agx-btn agx-btn--primary agx-btn--sm"
+                          disabled={busyKey === "lan-fw"}
+                          onClick={() => void handleOpenLanFirewall()}
+                        >
+                          {busyKey === "lan-fw" ? (
+                            <Loader2 size={13} className="spin" />
+                          ) : (
+                            <AlertTriangle size={13} />
+                          )}
+                          <span>{vi ? "Mở Firewall LAN" : "Open LAN Firewall"}</span>
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        className="agx-btn agx-btn--ghost agx-btn--sm"
+                        title={lanDiag.manualCommand}
+                        onClick={() => void copyText(lanDiag.manualCommand, "lan-fw-cmd")}
+                      >
+                        {copiedKey === "lan-fw-cmd" ? <Check size={12} /> : <Copy size={12} />}
+                        <span>netsh</span>
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+              </>
             ) : null}
 
             {/* Master Key Row */}

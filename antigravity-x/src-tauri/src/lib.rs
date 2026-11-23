@@ -667,6 +667,24 @@ async fn api_service_test_chat(
     api_service::test_chat_completion(model, prompt).await
 }
 
+#[tauri::command]
+async fn api_service_lan_diagnostics(
+    port: Option<u16>,
+) -> Result<api_service::LanDiagnostics, String> {
+    tokio::task::spawn_blocking(move || api_service::get_lan_diagnostics(port))
+        .await
+        .map_err(|e| format!("LAN diagnostics task failed: {e}"))?
+}
+
+#[tauri::command]
+async fn api_service_open_lan_firewall(
+    port: Option<u16>,
+) -> Result<api_service::LanDiagnostics, String> {
+    tokio::task::spawn_blocking(move || api_service::open_lan_firewall(port))
+        .await
+        .map_err(|e| format!("Open LAN firewall task failed: {e}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -773,6 +791,8 @@ pub fn run() {
             api_service_clear_logs,
             api_service_get_usage,
             api_service_test_chat,
+            api_service_lan_diagnostics,
+            api_service_open_lan_firewall,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

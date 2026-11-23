@@ -4420,12 +4420,237 @@
   background: rgba(239, 35, 40, 0.06);
   font-size: 12px;
   color: var(--agx-text-secondary);
+  flex-wrap: wrap;
 }
 
 .ag-api-lan-note code {
   flex: 1;
+  min-width: 180px;
   font-family: "JetBrains Mono", Consolas, monospace;
   color: var(--agx-primary);
+}
+
+.ag-api-lan-fw-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 7px 10px;
+  border-radius: 10px;
+  font-size: 12px;
+  border: 1px solid var(--agx-border);
+  background: var(--agx-bg-subtle);
+}
+
+.ag-api-lan-fw-row.is-warn {
+  border-color: rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.ag-api-lan-fw-row.is-ok {
+  border-color: rgba(16, 185, 129, 0.35);
+  background: rgba(16, 185, 129, 0.08);
+}
+
+.ag-api-lan-fw-info {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--agx-text-secondary);
+  flex: 1;
+  min-width: 180px;
+}
+
+.ag-api-lan-fw-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Split Pro Quota Pool Summary Card */
+.ag-api-quota-card {
+  grid-column: 1 / -1;
+}
+
+.ag-api-quota-groups {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+@media (max-width: 960px) {
+  .ag-api-quota-groups {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ag-api-quota-group {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 13px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--agx-border);
+  background: var(--agx-bg-subtle);
+}
+
+.ag-api-quota-group.is-full {
+  border-color: rgba(0, 175, 240, 0.32);
+  background: linear-gradient(180deg, rgba(0, 175, 240, 0.06) 0%, var(--agx-bg-subtle) 100%);
+}
+
+.ag-api-quota-group.is-classic {
+  border-color: rgba(245, 158, 11, 0.3);
+  background: linear-gradient(180deg, rgba(245, 158, 11, 0.05) 0%, var(--agx-bg-subtle) 100%);
+}
+
+.ag-api-quota-group__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.ag-api-quota-group__title {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.ag-api-quota-group__title strong {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--agx-text);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ag-api-quota-group__title span {
+  font-size: 11.5px;
+  color: var(--agx-muted);
+}
+
+.ag-api-quota-group__total {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+
+.ag-api-quota-group__total strong {
+  font-size: 14px;
+  font-weight: 760;
+  font-variant-numeric: tabular-nums;
+  color: var(--agx-text);
+}
+
+.ag-api-quota-group__total span {
+  font-size: 11px;
+  color: var(--agx-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.ag-api-quota-buckets {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ag-api-quota-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ag-api-quota-row__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.ag-api-quota-row__label {
+  font-weight: 600;
+  color: var(--agx-text);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ag-api-quota-row__reset {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--agx-muted);
+}
+
+.ag-api-quota-row__metrics {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+  color: var(--agx-text-secondary);
+}
+
+.ag-api-quota-row__pct {
+  font-weight: 740;
+  min-width: 38px;
+  text-align: right;
+}
+
+.ag-api-quota-row__pct.is-high {
+  color: #10b981;
+}
+
+.ag-api-quota-row__pct.is-medium {
+  color: #f59e0b;
+}
+
+.ag-api-quota-row__pct.is-low {
+  color: #ef4444;
+}
+
+.ag-api-quota-bar {
+  height: 7px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.16);
+  overflow: hidden;
+}
+
+.ag-api-quota-bar__fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 220ms ease;
+}
+
+.ag-api-quota-bar__fill.is-high {
+  background: linear-gradient(90deg, #10b981, #34d399);
+}
+
+.ag-api-quota-bar__fill.is-medium {
+  background: linear-gradient(90deg, #f59e0b, #fbbf24);
+}
+
+.ag-api-quota-bar__fill.is-low {
+  background: linear-gradient(90deg, #ef2328, #f87171);
+}
+
+.ag-api-quota-other-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px dashed var(--agx-border);
+  background: var(--agx-bg-subtle);
+  font-size: 12px;
+  color: var(--agx-text-secondary);
 }
 
 .ag-api-key-row {

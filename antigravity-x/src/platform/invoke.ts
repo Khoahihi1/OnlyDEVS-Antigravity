@@ -757,6 +757,24 @@ export async function agxInvoke<T>(command: string, args?: Record<string, unknow
       };
       return summary as T;
     }
+    case "api_service_lan_diagnostics":
+      return {
+        port: Number(args?.port ?? 57120),
+        lanIp: "192.168.1.107",
+        firewallRuleExists: false,
+        networkProfile: "Public",
+        manualCommand:
+          'netsh advfirewall firewall add rule name="OnlyDEVS Antigravity API Router (TCP 57120)" dir=in action=allow protocol=TCP localport=57120 profile=any',
+      } as T;
+    case "api_service_open_lan_firewall":
+      return {
+        port: Number(args?.port ?? 57120),
+        lanIp: "192.168.1.107",
+        firewallRuleExists: true,
+        networkProfile: "Public",
+        manualCommand:
+          'netsh advfirewall firewall add rule name="OnlyDEVS Antigravity API Router (TCP 57120)" dir=in action=allow protocol=TCP localport=57120 profile=any',
+      } as T;
     case "api_service_test_chat": {
       const res: ApiTestChatResult = {
         ok: true,

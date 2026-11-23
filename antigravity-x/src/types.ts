@@ -759,6 +759,14 @@ export type ApiServiceUsageSummary = {
   timeSeries: ApiUsageTimePoint[];
 };
 
+export type LanDiagnostics = {
+  port: number;
+  lanIp?: string | null;
+  firewallRuleExists: boolean;
+  networkProfile?: string | null;
+  manualCommand: string;
+};
+
 export type ApiTestChatResult = {
   ok: boolean;
   statusCode: number;

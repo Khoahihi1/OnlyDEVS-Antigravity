@@ -314,6 +314,16 @@ pub struct ApiServiceUsageSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LanDiagnostics {
+    pub port: u16,
+    pub lan_ip: Option<String>,
+    pub firewall_rule_exists: bool,
+    pub network_profile: Option<String>,
+    pub manual_command: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ApiTestChatResult {
     pub ok: bool,
     pub status_code: u16,
@@ -351,6 +361,13 @@ static COOLDOWNS: OnceLock<Mutex<HashMap<(String, String), CooldownEntry>>> = On
 /// Runtime-learned model incompatibilities: (account_id, lower_model_id) -> expires_at_ts
 static UNSUPPORTED_MODELS: OnceLock<Mutex<HashMap<(String, String), i64>>> = OnceLock::new();
 static STICKY_MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+/// Cached shared upstream HTTP/2+TLS connection pool keyed by (timeout_secs, proxy_url)
+static UPSTREAM_CLIENT_CACHE: OnceLock<Mutex<Option<((u64, String), reqwest::Client)>>> =
+    OnceLock::new();
+
+fn upstream_client_cache() -> &'static Mutex<Option<((u64, String), reqwest::Client)>> {
+    UPSTREAM_CLIENT_CACHE.get_or_init(|| Mutex::new(None))
+}
 
 fn server_lock() -> &'static Mutex<Option<RunningServer>> {
     SERVER_STATE.get_or_init(|| Mutex::new(None))
@@ -2178,22 +2195,44 @@ fn parse_antigravity_response_payload(val: &Value) -> ParsedUpstreamChunk {
 }
 
 fn build_upstream_client(cfg: &ApiServiceConfig) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(cfg.timeout_seconds.max(30)))
-        .user_agent(ANTIGRAVITY_IDE_USER_AGENT);
-    if let Some(proxy_str) = cfg
+    let timeout_secs = cfg.timeout_seconds.max(30);
+    let proxy_key = cfg
         .proxy_url
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        if let Ok(p) = reqwest::Proxy::all(proxy_str) {
+        .unwrap_or("")
+        .to_string();
+    let cache_key = (timeout_secs, proxy_key.clone());
+
+    if let Ok(guard) = upstream_client_cache().lock() {
+        if let Some((ref k, ref client)) = *guard {
+            if *k == cache_key {
+                return Ok(client.clone());
+            }
+        }
+    }
+
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .connect_timeout(Duration::from_secs(15))
+        .tcp_nodelay(true)
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(16)
+        .user_agent(ANTIGRAVITY_IDE_USER_AGENT);
+    if !proxy_key.is_empty() {
+        if let Ok(p) = reqwest::Proxy::all(&proxy_key) {
             builder = builder.proxy(p);
         }
     }
-    builder
+    let client = builder
         .build()
-        .map_err(|e| format!("Build upstream HTTP client: {e}"))
+        .map_err(|e| format!("Build upstream HTTP client: {e}"))?;
+
+    if let Ok(mut guard) = upstream_client_cache().lock() {
+        *guard = Some((cache_key, client.clone()));
+    }
+    Ok(client)
 }
 
 fn generate_fallback_project_id() -> String {
@@ -2458,14 +2497,15 @@ struct HttpRequest {
 }
 
 async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
-    let mut buf = Vec::with_capacity(4096);
-    let mut temp = [0u8; 4096];
+    const READ_TIMEOUT: Duration = Duration::from_secs(30);
+    let mut buf = Vec::with_capacity(8192);
+    let mut temp = [0u8; 8192];
     let header_end;
 
     loop {
-        let n = stream
-            .read(&mut temp)
+        let n = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut temp))
             .await
+            .map_err(|_| "Read header timeout".to_string())?
             .map_err(|e| format!("Read socket: {e}"))?;
         if n == 0 {
             return Err("EOF".into());
@@ -2515,9 +2555,9 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String
         let mut pos = 0usize;
         loop {
             while raw[pos..].windows(2).position(|w| w == b"\r\n").is_none() {
-                let n = stream
-                    .read(&mut temp)
+                let n = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut temp))
                     .await
+                    .map_err(|_| "Read chunked size timeout".to_string())?
                     .map_err(|e| format!("Read chunked size: {e}"))?;
                 if n == 0 {
                     break;
@@ -2538,9 +2578,9 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String
                 break;
             }
             while raw.len() < pos + chunk_size + 2 {
-                let n = stream
-                    .read(&mut temp)
+                let n = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut temp))
                     .await
+                    .map_err(|_| "Read chunked data timeout".to_string())?
                     .map_err(|e| format!("Read chunked data: {e}"))?;
                 if n == 0 {
                     break;
@@ -2567,9 +2607,9 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String
         }
         body = buf[header_end..].to_vec();
         while body.len() < content_length {
-            let n = stream
-                .read(&mut temp)
+            let n = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut temp))
                 .await
+                .map_err(|_| "Read body timeout".to_string())?
                 .map_err(|e| format!("Read body: {e}"))?;
             if n == 0 {
                 break;
@@ -2588,7 +2628,18 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String
     })
 }
 
-async fn write_json_response(stream: &mut TcpStream, status: u16, body: &Value) {
+fn record_api_log_async(item: ApiRequestLogItem) {
+    tokio::task::spawn_blocking(move || {
+        record_api_log(&item);
+    });
+}
+
+async fn write_json_response_ka(
+    stream: &mut TcpStream,
+    status: u16,
+    body: &Value,
+    keep_alive: bool,
+) -> bool {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -2601,6 +2652,11 @@ async fn write_json_response(stream: &mut TcpStream, status: u16, body: &Value) 
         _ => "Internal Server Error",
     };
     let payload = serde_json::to_string(body).unwrap_or_else(|_| "{}".into());
+    let conn_hdr = if keep_alive {
+        "Connection: keep-alive\r\nKeep-Alive: timeout=60, max=64"
+    } else {
+        "Connection: close"
+    };
     let resp = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: application/json; charset=utf-8\r\n\
@@ -2608,19 +2664,20 @@ async fn write_json_response(stream: &mut TcpStream, status: u16, body: &Value) 
          Access-Control-Allow-Headers: *\r\n\
          Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
          Content-Length: {}\r\n\
-         Connection: close\r\n\r\n\
+         {conn_hdr}\r\n\r\n\
          {payload}",
         payload.len()
     );
-    let _ = stream.write_all(resp.as_bytes()).await;
-    let _ = stream.flush().await;
+    stream.write_all(resp.as_bytes()).await.is_ok() && stream.flush().await.is_ok()
 }
 
 async fn write_sse_headers(stream: &mut TcpStream) -> Result<(), String> {
     let head = "HTTP/1.1 200 OK\r\n\
         Content-Type: text/event-stream; charset=utf-8\r\n\
-        Cache-Control: no-cache\r\n\
-        Connection: keep-alive\r\n\
+        Cache-Control: no-cache, no-transform\r\n\
+        X-Accel-Buffering: no\r\n\
+        Transfer-Encoding: chunked\r\n\
+        Connection: close\r\n\
         Access-Control-Allow-Origin: *\r\n\
         Access-Control-Allow-Headers: *\r\n\r\n";
     stream
@@ -2629,6 +2686,23 @@ async fn write_sse_headers(stream: &mut TcpStream) -> Result<(), String> {
         .map_err(|e| format!("Write SSE headers: {e}"))?;
     let _ = stream.flush().await;
     Ok(())
+}
+
+async fn write_sse_chunk(stream: &mut TcpStream, payload: &str) -> Result<(), ()> {
+    if payload.is_empty() {
+        return Ok(());
+    }
+    let bytes = payload.as_bytes();
+    let header = format!("{:x}\r\n", bytes.len());
+    stream.write_all(header.as_bytes()).await.map_err(|_| ())?;
+    stream.write_all(bytes).await.map_err(|_| ())?;
+    stream.write_all(b"\r\n").await.map_err(|_| ())?;
+    stream.flush().await.map_err(|_| ())
+}
+
+async fn write_sse_end(stream: &mut TcpStream) {
+    let _ = stream.write_all(b"0\r\n\r\n").await;
+    let _ = stream.flush().await;
 }
 
 fn extract_api_token(req: &HttpRequest) -> Option<String> {
@@ -2662,46 +2736,80 @@ fn extract_api_token(req: &HttpRequest) -> Option<String> {
 }
 
 async fn handle_connection(mut stream: TcpStream) {
-    let req = match read_http_request(&mut stream).await {
-        Ok(r) => r,
-        Err(_) => return,
-    };
+    let _ = stream.set_nodelay(true);
+    for _ in 0..64 {
+        let req = match tokio::time::timeout(Duration::from_secs(60), read_http_request(&mut stream))
+            .await
+        {
+            Ok(Ok(r)) => r,
+            _ => return,
+        };
+        let wants_keep_alive = !req
+            .headers
+            .get("connection")
+            .is_some_and(|v| v.to_ascii_lowercase().contains("close"));
+        let keep_open = handle_single_request(&mut stream, req, wants_keep_alive).await;
+        if !keep_open {
+            return;
+        }
+    }
+}
 
+async fn handle_single_request(
+    stream: &mut TcpStream,
+    req: HttpRequest,
+    keep_alive: bool,
+) -> bool {
     if req.method == "OPTIONS" {
-        let resp = "HTTP/1.1 204 No Content\r\n\
-            Access-Control-Allow-Origin: *\r\n\
-            Access-Control-Allow-Headers: *\r\n\
-            Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-            Content-Length: 0\r\n\
-            Connection: close\r\n\r\n";
-        let _ = stream.write_all(resp.as_bytes()).await;
-        return;
+        let conn_hdr = if keep_alive {
+            "Connection: keep-alive"
+        } else {
+            "Connection: close"
+        };
+        let resp = format!(
+            "HTTP/1.1 204 No Content\r\n\
+             Access-Control-Allow-Origin: *\r\n\
+             Access-Control-Allow-Headers: *\r\n\
+             Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+             Content-Length: 0\r\n\
+             {conn_hdr}\r\n\r\n"
+        );
+        return stream.write_all(resp.as_bytes()).await.is_ok()
+            && stream.flush().await.is_ok()
+            && keep_alive;
     }
 
     let norm_path = req.path.trim_end_matches('/');
     let norm_path = if norm_path.is_empty() { "/" } else { norm_path };
 
-    if norm_path == "/health" || norm_path == "/v1/health" {
-        let status = get_status().ok();
-        write_json_response(
-            &mut stream,
+    if req.method == "GET"
+        && (norm_path == "/"
+            || norm_path == "/v1"
+            || norm_path == "/health"
+            || norm_path == "/v1/health"
+            || norm_path == "/ping")
+    {
+        let active = ACTIVE_REQUESTS.load(Ordering::Relaxed);
+        return write_json_response_ka(
+            stream,
             200,
             &json!({
                 "status": "ok",
                 "service": "OnlyDEVS Antigravity API Router",
-                "poolTotal": status.as_ref().map(|s| s.pool_total).unwrap_or(0),
-                "poolHealthy": status.as_ref().map(|s| s.pool_healthy).unwrap_or(0),
+                "activeRequests": active,
+                "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/responses", "/v1/messages", "/health"],
             }),
+            keep_alive,
         )
-        .await;
-        return;
+        .await
+            && keep_alive;
     }
 
     // Authenticate API Key
     let token = extract_api_token(&req).unwrap_or_default();
     let Some(api_key) = find_valid_api_key(&token) else {
         if norm_path != "/" && norm_path != "/favicon.ico" {
-            record_api_log(&ApiRequestLogItem {
+            record_api_log_async(ApiRequestLogItem {
                 id: Uuid::new_v4().to_string(),
                 timestamp: Utc::now().timestamp(),
                 api_key_id: "invalid".into(),
@@ -2724,8 +2832,8 @@ async fn handle_connection(mut stream: TcpStream) {
                 response_preview: String::new(),
             });
         }
-        write_json_response(
-            &mut stream,
+        return write_json_response_ka(
+            stream,
             401,
             &json!({
                 "error": {
@@ -2733,9 +2841,10 @@ async fn handle_connection(mut stream: TcpStream) {
                     "type": "authentication_error"
                 }
             }),
+            keep_alive,
         )
-        .await;
-        return;
+        .await
+            && keep_alive;
     };
 
     if req.method == "GET" && (norm_path == "/v1/models" || norm_path == "/models") {
@@ -2756,8 +2865,14 @@ async fn handle_connection(mut stream: TcpStream) {
                 })
             })
             .collect();
-        write_json_response(&mut stream, 200, &json!({ "object": "list", "data": data })).await;
-        return;
+        return write_json_response_ka(
+            stream,
+            200,
+            &json!({ "object": "list", "data": data }),
+            keep_alive,
+        )
+        .await
+            && keep_alive;
     }
 
     let is_openai = req.method == "POST"
@@ -2772,7 +2887,7 @@ async fn handle_connection(mut stream: TcpStream) {
             "Unsupported endpoint: {} {}. Use /v1/models, /v1/chat/completions, /v1/responses, or /v1/messages.",
             req.method, norm_path
         );
-        record_api_log(&ApiRequestLogItem {
+        record_api_log_async(ApiRequestLogItem {
             id: Uuid::new_v4().to_string(),
             timestamp: Utc::now().timestamp(),
             api_key_id: api_key.id.clone(),
@@ -2794,8 +2909,8 @@ async fn handle_connection(mut stream: TcpStream) {
             request_preview: String::new(),
             response_preview: String::new(),
         });
-        write_json_response(
-            &mut stream,
+        return write_json_response_ka(
+            stream,
             404,
             &json!({
                 "error": {
@@ -2803,16 +2918,17 @@ async fn handle_connection(mut stream: TcpStream) {
                     "type": "not_found_error"
                 }
             }),
+            keep_alive,
         )
-        .await;
-        return;
+        .await
+            && keep_alive;
     }
 
     let raw_body: Value = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
         Err(e) => {
             let err_msg = format!("Invalid JSON body ({} bytes): {e}", req.body.len());
-            record_api_log(&ApiRequestLogItem {
+            record_api_log_async(ApiRequestLogItem {
                 id: Uuid::new_v4().to_string(),
                 timestamp: Utc::now().timestamp(),
                 api_key_id: api_key.id.clone(),
@@ -2834,13 +2950,14 @@ async fn handle_connection(mut stream: TcpStream) {
                 request_preview: String::from_utf8_lossy(&req.body).chars().take(200).collect(),
                 response_preview: String::new(),
             });
-            write_json_response(
-                &mut stream,
+            return write_json_response_ka(
+                stream,
                 400,
                 &json!({ "error": { "message": err_msg, "type": "invalid_request_error" } }),
+                keep_alive,
             )
-            .await;
-            return;
+            .await
+                && keep_alive;
         }
     };
 
@@ -2881,7 +2998,7 @@ async fn handle_connection(mut stream: TcpStream) {
             "API key '{}' is not allowed to call model '{}'",
             api_key.label, request_model
         );
-        record_api_log(&ApiRequestLogItem {
+        record_api_log_async(ApiRequestLogItem {
             id: Uuid::new_v4().to_string(),
             timestamp: Utc::now().timestamp(),
             api_key_id: api_key.id.clone(),
@@ -2903,8 +3020,8 @@ async fn handle_connection(mut stream: TcpStream) {
             request_preview: String::new(),
             response_preview: String::new(),
         });
-        write_json_response(
-            &mut stream,
+        return write_json_response_ka(
+            stream,
             403,
             &json!({
                 "error": {
@@ -2912,9 +3029,10 @@ async fn handle_connection(mut stream: TcpStream) {
                     "type": "permission_error"
                 }
             }),
+            keep_alive,
         )
-        .await;
-        return;
+        .await
+            && keep_alive;
     }
 
     ACTIVE_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -2927,7 +3045,7 @@ async fn handle_connection(mut stream: TcpStream) {
     match upstream_res {
         Err((status, err_msg, acc_id, acc_email, err_preview)) => {
             ACTIVE_REQUESTS.fetch_sub(1, Ordering::Relaxed);
-            record_api_log(&ApiRequestLogItem {
+            record_api_log_async(ApiRequestLogItem {
                 id: log_id,
                 timestamp: Utc::now().timestamp(),
                 api_key_id: api_key.id,
@@ -2949,8 +3067,8 @@ async fn handle_connection(mut stream: TcpStream) {
                 request_preview: err_preview,
                 response_preview: String::new(),
             });
-            write_json_response(
-                &mut stream,
+            write_json_response_ka(
+                stream,
                 status,
                 &json!({
                     "error": {
@@ -2958,8 +3076,10 @@ async fn handle_connection(mut stream: TcpStream) {
                         "type": "upstream_error"
                     }
                 }),
+                keep_alive,
             )
-            .await;
+            .await
+                && keep_alive
         }
         Ok((mut resp, acc, req_preview, tool_name_map)) => {
             let mut total_in = 0u64;
@@ -2974,15 +3094,33 @@ async fn handle_connection(mut stream: TcpStream) {
             let msg_id = format!("msg_{}", &Uuid::new_v4().to_string()[..16]);
             let created_ts = Utc::now().timestamp();
 
+            let mut keep_open = false;
             if is_stream {
-                if write_sse_headers(&mut stream).await.is_ok() {
+                if write_sse_headers(stream).await.is_ok() {
                     let mut sse_buf = String::new();
                     let mut anthropic_started = false;
                     let mut anthropic_block_idx = 0usize;
                     let mut anthropic_in_thinking = false;
                     let mut anthropic_in_text = false;
+                    let mut client_alive = true;
 
-                    while let Ok(Some(chunk)) = resp.chunk().await {
+                    while client_alive {
+                        let chunk = match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            resp.chunk(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(Some(c))) => c,
+                            Ok(Ok(None)) | Ok(Err(_)) => break,
+                            Err(_) => {
+                                // 10s upstream silence (e.g. long thinking): send SSE keepalive comment
+                                if write_sse_chunk(stream, ": keepalive\n\n").await.is_err() {
+                                    client_alive = false;
+                                }
+                                continue;
+                            }
+                        };
                         sse_buf.push_str(&String::from_utf8_lossy(&chunk));
                         while let Some(nl) = sse_buf.find('\n') {
                             let line = sse_buf[..nl].trim().to_string();
@@ -3063,13 +3201,16 @@ async fn handle_connection(mut stream: TcpStream) {
                                         }]
                                     });
                                     let msg = format!("data: {}\n\n", frame);
-                                    let _ = stream.write_all(msg.as_bytes()).await;
-                                    let _ = stream.flush().await;
+                                    if write_sse_chunk(stream, &msg).await.is_err() {
+                                        client_alive = false;
+                                        break;
+                                    }
                                 }
                             } else if is_responses {
                                 // OpenAI Responses API SSE stream
                                 let resp_id = format!("resp_{}", &completion_id[9..]);
                                 let item_id = format!("msg_{}", &completion_id[9..]);
+                                let mut out_batch = String::new();
                                 if !anthropic_started {
                                     anthropic_started = true;
                                     let ev_created = json!({
@@ -3094,9 +3235,9 @@ async fn handle_connection(mut stream: TcpStream) {
                                             "content": []
                                         }
                                     });
-                                    let _ = stream.write_all(
-                                        format!("event: response.created\ndata: {ev_created}\n\nevent: response.output_item.added\ndata: {ev_item}\n\n").as_bytes()
-                                    ).await;
+                                    out_batch.push_str(&format!(
+                                        "event: response.created\ndata: {ev_created}\n\nevent: response.output_item.added\ndata: {ev_item}\n\n"
+                                    ));
                                 }
                                 if !parsed.thinking.is_empty() {
                                     collected_think.push_str(&parsed.thinking);
@@ -3110,16 +3251,22 @@ async fn handle_connection(mut stream: TcpStream) {
                                         "content_index": 0,
                                         "delta": parsed.text
                                     });
-                                    let _ = stream
-                                        .write_all(format!("event: response.output_text.delta\ndata: {ev_delta}\n\n").as_bytes())
-                                        .await;
-                                    let _ = stream.flush().await;
+                                    out_batch.push_str(&format!(
+                                        "event: response.output_text.delta\ndata: {ev_delta}\n\n"
+                                    ));
                                 }
                                 for (id, name, args) in parsed.tool_calls {
                                     collected_tools.push((id, name, args));
                                 }
+                                if !out_batch.is_empty()
+                                    && write_sse_chunk(stream, &out_batch).await.is_err()
+                                {
+                                    client_alive = false;
+                                    break;
+                                }
                             } else {
                                 // Anthropic SSE stream
+                                let mut out_batch = String::new();
                                 if !anthropic_started {
                                     anthropic_started = true;
                                     let ev = json!({
@@ -3134,9 +3281,7 @@ async fn handle_connection(mut stream: TcpStream) {
                                             "usage": { "input_tokens": total_in, "output_tokens": 0 }
                                         }
                                     });
-                                    let _ = stream
-                                        .write_all(format!("event: message_start\ndata: {ev}\n\n").as_bytes())
-                                        .await;
+                                    out_batch.push_str(&format!("event: message_start\ndata: {ev}\n\n"));
                                 }
                                 if !parsed.thinking.is_empty() {
                                     collected_think.push_str(&parsed.thinking);
@@ -3147,20 +3292,20 @@ async fn handle_connection(mut stream: TcpStream) {
                                             "index": anthropic_block_idx,
                                             "content_block": { "type": "thinking", "thinking": "" }
                                         });
-                                        let _ = stream.write_all(format!("event: content_block_start\ndata: {ev}\n\n").as_bytes()).await;
+                                        out_batch.push_str(&format!("event: content_block_start\ndata: {ev}\n\n"));
                                     }
                                     let ev = json!({
                                         "type": "content_block_delta",
                                         "index": anthropic_block_idx,
                                         "delta": { "type": "thinking_delta", "thinking": parsed.thinking }
                                     });
-                                    let _ = stream.write_all(format!("event: content_block_delta\ndata: {ev}\n\n").as_bytes()).await;
+                                    out_batch.push_str(&format!("event: content_block_delta\ndata: {ev}\n\n"));
                                 }
                                 if !parsed.text.is_empty() {
                                     collected_text.push_str(&parsed.text);
                                     if anthropic_in_thinking {
                                         let ev = json!({ "type": "content_block_stop", "index": anthropic_block_idx });
-                                        let _ = stream.write_all(format!("event: content_block_stop\ndata: {ev}\n\n").as_bytes()).await;
+                                        out_batch.push_str(&format!("event: content_block_stop\ndata: {ev}\n\n"));
                                         anthropic_in_thinking = false;
                                         anthropic_block_idx += 1;
                                     }
@@ -3171,20 +3316,20 @@ async fn handle_connection(mut stream: TcpStream) {
                                             "index": anthropic_block_idx,
                                             "content_block": { "type": "text", "text": "" }
                                         });
-                                        let _ = stream.write_all(format!("event: content_block_start\ndata: {ev}\n\n").as_bytes()).await;
+                                        out_batch.push_str(&format!("event: content_block_start\ndata: {ev}\n\n"));
                                     }
                                     let ev = json!({
                                         "type": "content_block_delta",
                                         "index": anthropic_block_idx,
                                         "delta": { "type": "text_delta", "text": parsed.text }
                                     });
-                                    let _ = stream.write_all(format!("event: content_block_delta\ndata: {ev}\n\n").as_bytes()).await;
+                                    out_batch.push_str(&format!("event: content_block_delta\ndata: {ev}\n\n"));
                                 }
                                 for (id, name, args) in parsed.tool_calls {
                                     collected_tools.push((id.clone(), name.clone(), args.clone()));
                                     if anthropic_in_thinking || anthropic_in_text {
                                         let ev = json!({ "type": "content_block_stop", "index": anthropic_block_idx });
-                                        let _ = stream.write_all(format!("event: content_block_stop\ndata: {ev}\n\n").as_bytes()).await;
+                                        out_batch.push_str(&format!("event: content_block_stop\ndata: {ev}\n\n"));
                                         anthropic_in_thinking = false;
                                         anthropic_in_text = false;
                                         anthropic_block_idx += 1;
@@ -3200,112 +3345,112 @@ async fn handle_connection(mut stream: TcpStream) {
                                         "delta": { "type": "input_json_delta", "partial_json": serde_json::to_string(&args).unwrap_or_else(|_| "{}".into()) }
                                     });
                                     let ev3 = json!({ "type": "content_block_stop", "index": anthropic_block_idx });
-                                    let _ = stream.write_all(format!("event: content_block_start\ndata: {ev1}\n\nevent: content_block_delta\ndata: {ev2}\n\nevent: content_block_stop\ndata: {ev3}\n\n").as_bytes()).await;
+                                    out_batch.push_str(&format!("event: content_block_start\ndata: {ev1}\n\nevent: content_block_delta\ndata: {ev2}\n\nevent: content_block_stop\ndata: {ev3}\n\n"));
                                     anthropic_block_idx += 1;
                                     finish_reason = "tool_use".into();
                                 }
-                                let _ = stream.flush().await;
+                                if !out_batch.is_empty()
+                                    && write_sse_chunk(stream, &out_batch).await.is_err()
+                                {
+                                    client_alive = false;
+                                    break;
+                                }
                             }
                         }
                     }
 
                     // Send stream termination frames
-                    if is_openai {
-                        let done_frame = json!({
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created_ts,
-                            "model": request_model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": finish_reason
-                            }],
-                            "usage": {
-                                "prompt_tokens": total_in,
-                                "completion_tokens": total_out + total_think,
-                                "total_tokens": total_in + total_out + total_think
-                            }
-                        });
-                        let _ = stream
-                            .write_all(format!("data: {done_frame}\n\ndata: [DONE]\n\n").as_bytes())
-                            .await;
-                    } else if is_responses {
-                        let resp_id = format!("resp_{}", &completion_id[9..]);
-                        let item_id = format!("msg_{}", &completion_id[9..]);
-                        let mut output_items: Vec<Value> = Vec::new();
-                        if !collected_text.is_empty() {
-                            output_items.push(json!({
-                                "id": item_id,
-                                "type": "message",
-                                "status": "completed",
-                                "role": "assistant",
-                                "content": [{ "type": "output_text", "text": collected_text, "annotations": [] }]
-                            }));
-                        }
-                        for (id, name, args) in &collected_tools {
-                            output_items.push(json!({
-                                "id": id,
-                                "call_id": id,
-                                "type": "function_call",
-                                "status": "completed",
-                                "name": name,
-                                "arguments": serde_json::to_string(args).unwrap_or_else(|_| "{}".into())
-                            }));
-                        }
-                        let ev_text_done = json!({
-                            "type": "response.output_text.done",
-                            "item_id": item_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "text": collected_text
-                        });
-                        let ev_done = json!({
-                            "type": "response.completed",
-                            "response": {
-                                "id": resp_id,
-                                "object": "response",
-                                "created_at": created_ts,
-                                "status": "completed",
+                    if client_alive {
+                        let mut tail = String::new();
+                        if is_openai {
+                            let done_frame = json!({
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
                                 "model": request_model,
-                                "output": output_items,
-                                "output_text": collected_text,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": finish_reason
+                                }],
                                 "usage": {
-                                    "input_tokens": total_in,
-                                    "output_tokens": total_out + total_think,
+                                    "prompt_tokens": total_in,
+                                    "completion_tokens": total_out + total_think,
                                     "total_tokens": total_in + total_out + total_think
                                 }
+                            });
+                            tail.push_str(&format!("data: {done_frame}\n\ndata: [DONE]\n\n"));
+                        } else if is_responses {
+                            let resp_id = format!("resp_{}", &completion_id[9..]);
+                            let item_id = format!("msg_{}", &completion_id[9..]);
+                            let mut output_items: Vec<Value> = Vec::new();
+                            if !collected_text.is_empty() {
+                                output_items.push(json!({
+                                    "id": item_id,
+                                    "type": "message",
+                                    "status": "completed",
+                                    "role": "assistant",
+                                    "content": [{ "type": "output_text", "text": collected_text, "annotations": [] }]
+                                }));
                             }
-                        });
-                        let _ = stream.write_all(
-                            format!("event: response.output_text.done\ndata: {ev_text_done}\n\nevent: response.completed\ndata: {ev_done}\n\n").as_bytes()
-                        ).await;
-                    } else {
-                        if anthropic_in_thinking || anthropic_in_text {
-                            let ev = json!({ "type": "content_block_stop", "index": anthropic_block_idx });
-                            let _ = stream.write_all(format!("event: content_block_stop\ndata: {ev}\n\n").as_bytes()).await;
-                        }
-                        let stop_reason = if finish_reason == "tool_use" {
-                            "tool_use"
-                        } else if finish_reason == "length" {
-                            "max_tokens"
+                            for (id, name, args) in &collected_tools {
+                                output_items.push(json!({
+                                    "id": id,
+                                    "call_id": id,
+                                    "type": "function_call",
+                                    "status": "completed",
+                                    "name": name,
+                                    "arguments": serde_json::to_string(args).unwrap_or_else(|_| "{}".into())
+                                }));
+                            }
+                            let ev_text_done = json!({
+                                "type": "response.output_text.done",
+                                "item_id": item_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "text": collected_text
+                            });
+                            let ev_done = json!({
+                                "type": "response.completed",
+                                "response": {
+                                    "id": resp_id,
+                                    "object": "response",
+                                    "created_at": created_ts,
+                                    "status": "completed",
+                                    "model": request_model,
+                                    "output": output_items,
+                                    "output_text": collected_text,
+                                    "usage": {
+                                        "input_tokens": total_in,
+                                        "output_tokens": total_out + total_think,
+                                        "total_tokens": total_in + total_out + total_think
+                                    }
+                                }
+                            });
+                            tail.push_str(&format!("event: response.output_text.done\ndata: {ev_text_done}\n\nevent: response.completed\ndata: {ev_done}\n\n"));
                         } else {
-                            "end_turn"
-                        };
-                        let ev_delta = json!({
-                            "type": "message_delta",
-                            "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
-                            "usage": { "output_tokens": total_out + total_think }
-                        });
-                        let ev_stop = json!({ "type": "message_stop" });
-                        let _ = stream
-                            .write_all(
-                                format!("event: message_delta\ndata: {ev_delta}\n\nevent: message_stop\ndata: {ev_stop}\n\n")
-                                    .as_bytes(),
-                            )
-                            .await;
+                            if anthropic_in_thinking || anthropic_in_text {
+                                let ev = json!({ "type": "content_block_stop", "index": anthropic_block_idx });
+                                tail.push_str(&format!("event: content_block_stop\ndata: {ev}\n\n"));
+                            }
+                            let stop_reason = if finish_reason == "tool_use" {
+                                "tool_use"
+                            } else if finish_reason == "length" {
+                                "max_tokens"
+                            } else {
+                                "end_turn"
+                            };
+                            let ev_delta = json!({
+                                "type": "message_delta",
+                                "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
+                                "usage": { "output_tokens": total_out + total_think }
+                            });
+                            let ev_stop = json!({ "type": "message_stop" });
+                            tail.push_str(&format!("event: message_delta\ndata: {ev_delta}\n\nevent: message_stop\ndata: {ev_stop}\n\n"));
+                        }
+                        let _ = write_sse_chunk(stream, &tail).await;
+                        write_sse_end(stream).await;
                     }
-                    let _ = stream.flush().await;
                 }
             } else {
                 // Non-streaming JSON response
@@ -3375,7 +3520,8 @@ async fn handle_connection(mut stream: TcpStream) {
                             "total_tokens": total_in + total_out + total_think
                         }
                     });
-                    write_json_response(&mut stream, 200, &out_json).await;
+                    keep_open = write_json_response_ka(stream, 200, &out_json, keep_alive).await
+                        && keep_alive;
                 } else if is_responses {
                     let resp_id = format!("resp_{}", &completion_id[9..]);
                     let item_id = format!("msg_{}", &completion_id[9..]);
@@ -3413,7 +3559,8 @@ async fn handle_connection(mut stream: TcpStream) {
                             "total_tokens": total_in + total_out + total_think
                         }
                     });
-                    write_json_response(&mut stream, 200, &out_json).await;
+                    keep_open = write_json_response_ka(stream, 200, &out_json, keep_alive).await
+                        && keep_alive;
                 } else {
                     let mut blocks = Vec::new();
                     if !collected_think.is_empty() {
@@ -3450,14 +3597,15 @@ async fn handle_connection(mut stream: TcpStream) {
                             "cache_read_input_tokens": total_cache
                         }
                     });
-                    write_json_response(&mut stream, 200, &out_json).await;
+                    keep_open = write_json_response_ka(stream, 200, &out_json, keep_alive).await
+                        && keep_alive;
                 }
             }
 
             ACTIVE_REQUESTS.fetch_sub(1, Ordering::Relaxed);
             let total_tokens = total_in + total_out + total_think + total_cache;
             let resp_preview: String = collected_text.chars().take(260).collect();
-            record_api_log(&ApiRequestLogItem {
+            record_api_log_async(ApiRequestLogItem {
                 id: log_id,
                 timestamp: Utc::now().timestamp(),
                 api_key_id: api_key.id,
@@ -3479,6 +3627,7 @@ async fn handle_connection(mut stream: TcpStream) {
                 request_preview: req_preview,
                 response_preview: resp_preview,
             });
+            keep_open
         }
     }
 }
@@ -3491,6 +3640,128 @@ fn detect_local_lan_ip() -> Option<String> {
     let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect("8.8.8.8:80").ok()?;
     Some(sock.local_addr().ok()?.ip().to_string())
+}
+
+fn firewall_rule_name(port: u16) -> String {
+    format!("OnlyDEVS Antigravity API Router (TCP {port})")
+}
+
+pub fn get_lan_diagnostics(port: Option<u16>) -> Result<LanDiagnostics, String> {
+    let resolved_port = port.unwrap_or_else(|| load_config().map(|c| c.port).unwrap_or(57120));
+    let lan_ip = detect_local_lan_ip();
+    let rule_name = firewall_rule_name(resolved_port);
+    let manual_command = format!(
+        "netsh advfirewall firewall add rule name=\"{rule_name}\" dir=in action=allow protocol=TCP localport={resolved_port} profile=any"
+    );
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let fw_out = Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "show",
+                "rule",
+                &format!("name={rule_name}"),
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let firewall_rule_exists = fw_out
+            .map(|o| {
+                if !o.status.success() {
+                    return false;
+                }
+                let s = String::from_utf8_lossy(&o.stdout).to_ascii_lowercase();
+                s.contains("enabled:") && s.contains("yes") && s.contains("allow")
+            })
+            .unwrap_or(false);
+
+        let prof_out = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "(Get-NetConnectionProfile | Select-Object -First 1 -ExpandProperty NetworkCategory) -as [string]",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let network_profile = prof_out
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        Ok(LanDiagnostics {
+            port: resolved_port,
+            lan_ip,
+            firewall_rule_exists,
+            network_profile,
+            manual_command,
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(LanDiagnostics {
+            port: resolved_port,
+            lan_ip,
+            firewall_rule_exists: true,
+            network_profile: None,
+            manual_command,
+        })
+    }
+}
+
+pub fn open_lan_firewall(port: Option<u16>) -> Result<LanDiagnostics, String> {
+    let resolved_port = port.unwrap_or_else(|| load_config().map(|c| c.port).unwrap_or(57120));
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let rule_name = firewall_rule_name(resolved_port);
+        let ping_rule = "OnlyDEVS Antigravity LAN Ping (ICMPv4)";
+        let inner = format!(
+            "netsh advfirewall firewall delete rule name=\"{rule_name}\" >nul 2>&1 & \
+             netsh advfirewall firewall add rule name=\"{rule_name}\" dir=in action=allow protocol=TCP localport={resolved_port} profile=any & \
+             netsh advfirewall firewall delete rule name=\"{ping_rule}\" >nul 2>&1 & \
+             netsh advfirewall firewall add rule name=\"{ping_rule}\" dir=in action=allow protocol=icmpv4:8,any profile=any"
+        );
+        let ps = format!(
+            "$p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','{}' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode",
+            inner.replace('\'', "''")
+        );
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &ps])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("Không thể gọi UAC mở Firewall: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if stderr.is_empty() {
+                "Người dùng đã hủy UAC hoặc không đủ quyền Admin để mở Windows Firewall.".into()
+            } else {
+                format!("Mở Windows Firewall thất bại: {stderr}")
+            });
+        }
+    }
+    get_lan_diagnostics(Some(resolved_port))
+}
+
+async fn bind_listener_with_retry(addr: &str) -> Result<TcpListener, std::io::Error> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 pub async fn start_server() -> Result<ApiServiceStatus, String> {
@@ -3514,9 +3785,17 @@ pub async fn start_server() -> Result<ApiServiceStatus, String> {
     stop_server()?;
 
     let addr = format!("{bind_host}:{}", cfg.port);
-    let listener = TcpListener::bind(&addr)
-        .await
-        .map_err(|e| format!("Không thể mở cổng {addr}: {e}"))?;
+    let listener = bind_listener_with_retry(&addr).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse
+            || e.kind() == std::io::ErrorKind::PermissionDenied
+        {
+            format!(
+                "Không thể mở cổng {addr}: {e} (có thể cổng đang bị chiếm hoặc nằm trong Windows excludedportrange của Hyper-V/WSL — thử đổi sang cổng khác)."
+            )
+        } else {
+            format!("Không thể mở cổng {addr}: {e}")
+        }
+    })?;
 
     let mut shutdown_txs = Vec::new();
     let (tx4, mut rx4) = oneshot::channel::<()>();
@@ -4242,5 +4521,64 @@ mod tests {
         // Unsupported schema keywords stripped
         assert!(decls[0].pointer("/parameters/additionalProperties").is_none());
         assert!(decls[0].pointer("/parameters/properties/cmd/minLength").is_none());
+    }
+
+    #[tokio::test]
+    async fn http_keep_alive_and_v1_ping_reuse_same_socket_fast() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // 1st request: GET /v1 with keep-alive
+        client
+            .write_all(b"GET /v1 HTTP/1.1\r\nHost: 192.168.1.107:57120\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf1 = [0u8; 1024];
+        let n1 = client.read(&mut buf1).await.unwrap();
+        let resp1 = String::from_utf8_lossy(&buf1[..n1]);
+        assert!(resp1.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp1.contains("Connection: keep-alive"));
+        assert!(resp1.contains("\"status\":\"ok\""));
+
+        // 2nd request on the EXACT same TCP socket with Connection: close
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost: 192.168.1.107:57120\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf2 = [0u8; 1024];
+        let n2 = client.read(&mut buf2).await.unwrap();
+        let resp2 = String::from_utf8_lossy(&buf2[..n2]);
+        assert!(resp2.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp2.contains("Connection: close"));
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn sse_chunked_encoding_emits_rfc9112_frames_and_terminator() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            write_sse_headers(&mut stream).await.unwrap();
+            write_sse_chunk(&mut stream, "data: {\"ok\":true}\n\n")
+                .await
+                .unwrap();
+            write_sse_end(&mut stream).await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut raw = Vec::new();
+        client.read_to_end(&mut raw).await.unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.contains("Transfer-Encoding: chunked"));
+        assert!(text.contains("X-Accel-Buffering: no"));
+        assert!(text.contains("13\r\ndata: {\"ok\":true}\n\n\r\n"));
+        assert!(text.ends_with("0\r\n\r\n"));
+        let _ = server.await;
     }
 }
