@@ -53,7 +53,10 @@ fn read_mcp_config_value() -> Result<Value, String> {
         return Ok(serde_json::json!({ "mcpServers": {} }));
     }
     let raw = fs::read_to_string(&path).map_err(|e| format!("Đọc mcp_config.json: {e}"))?;
-    let trimmed = raw.trim_start_matches('\u{feff}');
+    let trimmed = raw.trim_start_matches('\u{feff}').trim();
+    if trimmed.is_empty() {
+        return Ok(serde_json::json!({ "mcpServers": {} }));
+    }
     serde_json::from_str(trimmed).map_err(|e| format!("Parse mcp_config.json: {e}"))
 }
 

@@ -33,7 +33,7 @@ import type {
   VersionJumpInfo,
 } from "./types";
 
-const APP_VERSION = "1.2.3";
+const APP_VERSION = "1.2.4";
 
 const VALID_LANGS: AppLanguage[] = ["vi", "en", "zh-CN", "zh-TW", "ja", "ko", "ru", "de"];
 const VALID_THEME_COLORS: AppThemeColor[] = [
@@ -108,35 +108,63 @@ export default function App() {
   const refreshAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [ov, accs, usage, hist, plug, pr, cats, cfg, agents, mode, sess, ms, apiSt] =
-        await Promise.all([
-          agxInvoke<OverviewState>("get_overview_state"),
-          agxInvoke<AntigravityAccount[]>("list_accounts"),
-          agxInvoke<TokenUsageSummary>("get_antigravity_token_usage"),
-          agxInvoke<SwitchHistoryItem[]>("get_switch_history"),
-          agxInvoke<PluginEntry[]>("list_plugins"),
-          agxInvoke<SavedPrompt[]>("list_prompts"),
-          agxInvoke<PromptCategory[]>("list_prompt_categories"),
-          agxInvoke<string>("get_config_raw"),
-          agxInvoke<string>("get_agents_md"),
-          agxInvoke<string>("get_instruction_mode"),
-          agxInvoke<SessionScanResult>("list_sessions"),
-          agxInvoke<McpSkillsState>("list_mcp_and_skills"),
-          agxInvoke<ApiServiceStatus>("api_service_get_status").catch(() => null),
-        ]);
-      setOverview(ov);
-      setAccounts(accs);
-      setTokenUsage(usage);
-      setSwitchHistory(hist);
-      setPlugins(plug);
-      setPrompts(pr);
-      setCategories(cats);
-      setConfigRaw(cfg);
-      setAgentsMd(agents);
-      setInstructionMode(mode === "append" ? "append" : "replace");
-      setSessionScan(sess);
-      setMcpSkills(ms);
-      setApiServiceStatus(apiSt);
+      const results = await Promise.allSettled([
+        agxInvoke<OverviewState>("get_overview_state"),
+        agxInvoke<AntigravityAccount[]>("list_accounts"),
+        agxInvoke<TokenUsageSummary>("get_antigravity_token_usage"),
+        agxInvoke<SwitchHistoryItem[]>("get_switch_history"),
+        agxInvoke<PluginEntry[]>("list_plugins"),
+        agxInvoke<SavedPrompt[]>("list_prompts"),
+        agxInvoke<PromptCategory[]>("list_prompt_categories"),
+        agxInvoke<string>("get_config_raw"),
+        agxInvoke<string>("get_agents_md"),
+        agxInvoke<string>("get_instruction_mode"),
+        agxInvoke<SessionScanResult>("list_sessions"),
+        agxInvoke<McpSkillsState>("list_mcp_and_skills"),
+        agxInvoke<ApiServiceStatus>("api_service_get_status"),
+      ]);
+
+      const [
+        ovRes,
+        accsRes,
+        usageRes,
+        histRes,
+        plugRes,
+        prRes,
+        catsRes,
+        cfgRes,
+        agentsRes,
+        modeRes,
+        sessRes,
+        msRes,
+        apiStRes,
+      ] = results;
+
+      if (ovRes.status === "fulfilled") setOverview(ovRes.value);
+      if (accsRes.status === "fulfilled") setAccounts(accsRes.value);
+      if (usageRes.status === "fulfilled") setTokenUsage(usageRes.value);
+      if (histRes.status === "fulfilled") setSwitchHistory(histRes.value);
+      if (plugRes.status === "fulfilled") setPlugins(plugRes.value);
+      if (prRes.status === "fulfilled") setPrompts(prRes.value);
+      if (catsRes.status === "fulfilled") setCategories(catsRes.value);
+      if (cfgRes.status === "fulfilled") setConfigRaw(cfgRes.value);
+      if (agentsRes.status === "fulfilled") setAgentsMd(agentsRes.value);
+      if (modeRes.status === "fulfilled") {
+        setInstructionMode(modeRes.value === "append" ? "append" : "replace");
+      }
+      if (sessRes.status === "fulfilled") setSessionScan(sessRes.value);
+      if (msRes.status === "fulfilled") setMcpSkills(msRes.value);
+      if (apiStRes.status === "fulfilled") setApiServiceStatus(apiStRes.value);
+      else setApiServiceStatus(null);
+
+      // Surface first non-API error without blocking any other tab/feature
+      const firstErr = results
+        .slice(0, 12)
+        .find((r): r is PromiseRejectedResult => r.status === "rejected");
+      if (firstErr) {
+        const err = firstErr.reason;
+        showToast(err instanceof Error ? err.message : String(err));
+      }
     } catch (error) {
       showToast(error instanceof Error ? error.message : String(error));
     } finally {

@@ -49,7 +49,11 @@ pub(crate) fn read_config_value() -> Result<Value, String> {
         return Ok(Value::Object(Map::new()));
     }
     let raw = fs::read_to_string(&path).map_err(|e| format!("Đọc config.json: {e}"))?;
-    serde_json::from_str(&raw).map_err(|e| format!("Parse config.json: {e}"))
+    let trimmed = raw.trim_start_matches('\u{feff}').trim();
+    if trimmed.is_empty() {
+        return Ok(Value::Object(Map::new()));
+    }
+    serde_json::from_str(trimmed).map_err(|e| format!("Parse config.json: {e}"))
 }
 
 pub(crate) fn write_config_value(value: &Value) -> Result<(), String> {
