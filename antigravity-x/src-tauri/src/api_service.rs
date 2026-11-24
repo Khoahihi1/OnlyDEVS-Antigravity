@@ -2375,7 +2375,7 @@ fn openai_body_to_antigravity_envelope(
                 (
                     t.get("name").and_then(Value::as_str).unwrap_or(""),
                     t.get("description").and_then(Value::as_str).unwrap_or(""),
-                    t.get("input_schema").cloned(),
+                    t.get("input_schema").or_else(|| t.get("parameters")).cloned(),
                 )
             };
             if name.is_empty() {
@@ -2416,9 +2416,44 @@ fn openai_body_to_antigravity_envelope(
                 }
             }
             req_obj.insert("tools".into(), json!([{ "functionDeclarations": decls }]));
+            let mut fc_cfg = Map::new();
+            let mut mode = "VALIDATED";
+            let mut forced_name: Option<String> = None;
+            if let Some(tc) = body.get("tool_choice") {
+                if let Some(s) = tc.as_str() {
+                    match s.to_ascii_lowercase().as_str() {
+                        "none" => mode = "NONE",
+                        "required" | "any" => mode = "ANY",
+                        _ => mode = "VALIDATED",
+                    }
+                } else if let Some(obj) = tc.as_object() {
+                    let t_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
+                    match t_type.to_ascii_lowercase().as_str() {
+                        "none" => mode = "NONE",
+                        "any" | "required" => mode = "ANY",
+                        "function" | "tool" => {
+                            if let Some(fn_name) = tc
+                                .pointer("/function/name")
+                                .or_else(|| obj.get("name"))
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                            {
+                                mode = "ANY";
+                                let sanitized = sanitize_function_name(fn_name);
+                                forced_name = Some(cloak_tool_name(&sanitized));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            fc_cfg.insert("mode".into(), json!(mode));
+            if let Some(fname) = forced_name {
+                fc_cfg.insert("allowedFunctionNames".into(), json!([fname]));
+            }
             req_obj.insert(
                 "toolConfig".into(),
-                json!({ "functionCallingConfig": { "mode": "VALIDATED" } }),
+                json!({ "functionCallingConfig": Value::Object(fc_cfg) }),
             );
         }
     }
@@ -2562,6 +2597,9 @@ fn responses_body_to_openai_body(body: &Value) -> Value {
     if let Some(tools) = body.get("tools") {
         out.insert("tools".into(), tools.clone());
     }
+    if let Some(tc) = body.get("tool_choice") {
+        out.insert("tool_choice".into(), tc.clone());
+    }
     if let Some(r) = body.get("reasoning") {
         out.insert("reasoning".into(), r.clone());
     }
@@ -2662,6 +2700,9 @@ fn anthropic_body_to_openai_body(body: &Value) -> Value {
     }
     if let Some(tools) = body.get("tools") {
         out.insert("tools".into(), tools.clone());
+    }
+    if let Some(tc) = body.get("tool_choice") {
+        out.insert("tool_choice".into(), tc.clone());
     }
     if let Some(r) = body.get("reasoning") {
         out.insert("reasoning".into(), r.clone());
@@ -3882,6 +3923,7 @@ async fn handle_single_request(
                 if write_sse_headers(stream).await.is_ok() {
                     let mut sse_buf = String::new();
                     let mut openai_tool_idx = 0usize;
+                    let mut responses_out_idx = 1usize;
                     let mut anthropic_started = false;
                     let mut anthropic_block_idx = 0usize;
                     let mut anthropic_in_thinking = false;
@@ -4048,7 +4090,49 @@ async fn handle_single_request(
                                     ));
                                 }
                                 for (id, name, args) in parsed.tool_calls {
-                                    collected_tools.push((id, name, args));
+                                    let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".into());
+                                    let out_idx = responses_out_idx;
+                                    responses_out_idx += 1;
+                                    collected_tools.push((id.clone(), name.clone(), args));
+                                    let ev_added = json!({
+                                        "type": "response.output_item.added",
+                                        "output_index": out_idx,
+                                        "item": {
+                                            "id": id,
+                                            "call_id": id,
+                                            "type": "function_call",
+                                            "status": "in_progress",
+                                            "name": name,
+                                            "arguments": ""
+                                        }
+                                    });
+                                    let ev_arg_delta = json!({
+                                        "type": "response.function_call_arguments.delta",
+                                        "item_id": id,
+                                        "output_index": out_idx,
+                                        "delta": args_str
+                                    });
+                                    let ev_arg_done = json!({
+                                        "type": "response.function_call_arguments.done",
+                                        "item_id": id,
+                                        "output_index": out_idx,
+                                        "arguments": args_str
+                                    });
+                                    let ev_item_done = json!({
+                                        "type": "response.output_item.done",
+                                        "output_index": out_idx,
+                                        "item": {
+                                            "id": id,
+                                            "call_id": id,
+                                            "type": "function_call",
+                                            "status": "completed",
+                                            "name": name,
+                                            "arguments": args_str
+                                        }
+                                    });
+                                    out_batch.push_str(&format!(
+                                        "event: response.output_item.added\ndata: {ev_added}\n\nevent: response.function_call_arguments.delta\ndata: {ev_arg_delta}\n\nevent: response.function_call_arguments.done\ndata: {ev_arg_done}\n\nevent: response.output_item.done\ndata: {ev_item_done}\n\n"
+                                    ));
                                 }
                                 if !out_batch.is_empty()
                                     && write_sse_chunk(stream, &out_batch).await.is_err()
