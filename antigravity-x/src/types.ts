@@ -701,6 +701,8 @@ export type ApiAvailableModel = {
   source: string;
   supportedAccountCount: number;
   poolAccountCount: number;
+  contextWindow: number;
+  maxOutputTokens: number;
 };
 
 export type ApiRequestLogItem = {

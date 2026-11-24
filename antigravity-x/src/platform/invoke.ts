@@ -721,6 +721,8 @@ export async function agxInvoke<T>(command: string, args?: Record<string, unknow
           source: "builtin",
           supportedAccountCount: 1,
           poolAccountCount: mockAccounts.length,
+          contextWindow: 1048576,
+          maxOutputTokens: 65536,
         },
         {
           id: "claude-sonnet-4-6",
@@ -730,6 +732,8 @@ export async function agxInvoke<T>(command: string, args?: Record<string, unknow
           source: "builtin",
           supportedAccountCount: 1,
           poolAccountCount: mockAccounts.length,
+          contextWindow: 250000,
+          maxOutputTokens: 64000,
         },
         {
           id: "claude-opus-4-6-thinking",
@@ -739,6 +743,8 @@ export async function agxInvoke<T>(command: string, args?: Record<string, unknow
           source: "builtin",
           supportedAccountCount: 1,
           poolAccountCount: mockAccounts.length,
+          contextWindow: 250000,
+          maxOutputTokens: 64000,
         },
       ];
       return list as T;

@@ -4876,6 +4876,30 @@
   word-break: break-all;
 }
 
+.ag-api-model-limits {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ag-api-model-limit-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 11px;
+  color: var(--agx-text-muted);
+  background: var(--agx-surface-2, rgba(148, 163, 184, 0.1));
+  border: 1px solid var(--agx-border);
+}
+
+.ag-api-model-limit-chip strong {
+  color: var(--agx-text);
+  font-weight: 600;
+}
+
 .ag-api-model-tile__foot {
   display: flex;
   align-items: center;

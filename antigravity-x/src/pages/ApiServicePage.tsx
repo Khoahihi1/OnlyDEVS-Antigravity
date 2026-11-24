@@ -6,6 +6,7 @@ import {
   BookOpen,
   Check,
   Clock,
+  Code2,
   Copy,
   Cpu,
   Eye,
@@ -1833,7 +1834,29 @@ print(resp.choices[0].message.content)`;
             </div>
 
             <div className="ag-api-model-grid">
-              {filteredModels.map((m) => (
+              {filteredModels.map((m) => {
+                const formatLimitShort = (val: number) => {
+                  if (val >= 1_000_000) return "1M";
+                  if (val === 131_072) return "128K";
+                  if (val === 65_536 || val === 65_535) return "64K";
+                  if (val === 32_768) return "32K";
+                  if (val >= 1_000) return `${Math.round(val / 1_000)}K`;
+                  return String(val);
+                };
+                const ideJsonSnippet = JSON.stringify(
+                  {
+                    [m.id]: {
+                      name: m.displayName,
+                      limit: {
+                        context: m.contextWindow,
+                        output: m.maxOutputTokens,
+                      },
+                    },
+                  },
+                  null,
+                  2,
+                );
+                return (
                 <div key={m.id} className="ag-api-model-tile">
                   <div className="ag-api-model-tile__top">
                     <strong>{m.displayName}</strong>
@@ -1842,6 +1865,21 @@ print(resp.choices[0].message.content)`;
                     </span>
                   </div>
                   <code className="ag-api-model-id">{m.id}</code>
+                  <div
+                    className="ag-api-model-limits"
+                    title={
+                      vi
+                        ? `Context Window: ${m.contextWindow.toLocaleString()} tokens | Max Output: ${m.maxOutputTokens.toLocaleString()} tokens`
+                        : `Context Window: ${m.contextWindow.toLocaleString()} tokens | Max Output: ${m.maxOutputTokens.toLocaleString()} tokens`
+                    }
+                  >
+                    <span className="ag-api-model-limit-chip">
+                      <strong>Ctx</strong> {m.contextWindow.toLocaleString()} ({formatLimitShort(m.contextWindow)})
+                    </span>
+                    <span className="ag-api-model-limit-chip">
+                      <strong>Out</strong> {m.maxOutputTokens.toLocaleString()} ({formatLimitShort(m.maxOutputTokens)})
+                    </span>
+                  </div>
                   <div className="ag-api-model-tile__foot">
                     <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                       <span
@@ -1872,6 +1910,14 @@ print(resp.choices[0].message.content)`;
                       <button
                         type="button"
                         className="ag-card-icon-btn"
+                        title={vi ? "Sao chép JSON cấu hình IDE (context/output)" : "Copy IDE JSON config (context/output)"}
+                        onClick={() => void copyText(ideJsonSnippet, `json-${m.id}`)}
+                      >
+                        {copiedKey === `json-${m.id}` ? <Check size={13} /> : <Code2 size={13} />}
+                      </button>
+                      <button
+                        type="button"
+                        className="ag-card-icon-btn"
                         title={vi ? "Test nhanh model này" : "Quick test this model"}
                         onClick={() => {
                           setTestModel(m.id);
@@ -1883,7 +1929,8 @@ print(resp.choices[0].message.content)`;
                     </div>
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
           </section>
 

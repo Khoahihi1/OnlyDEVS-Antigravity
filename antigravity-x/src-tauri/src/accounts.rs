@@ -81,6 +81,10 @@ pub struct ModelQuota {
     pub percentage: i32,
     pub reset_time: String,
     pub summary_exhausted: Option<bool>,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1307,12 +1311,17 @@ async fn fetch_cloud_code_quota(
                                 .get("displayName")
                                 .and_then(Value::as_str)
                                 .map(str::to_string);
+                            let max_tokens = info.get("maxTokens").and_then(Value::as_u64);
+                            let max_output_tokens =
+                                info.get("maxOutputTokens").and_then(Value::as_u64);
                             models.push(ModelQuota {
                                 name: name.clone(),
                                 display_name,
                                 percentage: (fraction * 100.0).round() as i32,
                                 reset_time,
                                 summary_exhausted: None,
+                                max_tokens,
+                                max_output_tokens,
                             });
                         }
                     }
@@ -1369,6 +1378,8 @@ async fn fetch_cloud_code_quota(
                                     percentage: (fraction * 100.0).round() as i32,
                                     reset_time,
                                     summary_exhausted: Some(fraction <= 0.0),
+                                    max_tokens: None,
+                                    max_output_tokens: None,
                                 });
                                 got_buckets += 1;
                             }

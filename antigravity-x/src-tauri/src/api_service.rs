@@ -285,6 +285,8 @@ pub struct ApiAvailableModel {
     pub source: String,
     pub supported_account_count: usize,
     pub pool_account_count: usize,
+    pub context_window: u64,
+    pub max_output_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1739,6 +1741,27 @@ fn resolve_model_alias(cfg: &ApiServiceConfig, requested: &str) -> String {
     clean.to_string()
 }
 
+fn resolve_model_limits(model_id: &str) -> (u64, u64) {
+    let lower = model_id.trim().to_ascii_lowercase();
+    if lower.contains("claude") {
+        // Verified via Cloud Code v1internal:fetchAvailableModels:
+        // Claude 5.5 (Opus / Sonnet) = 1,000,000 context / 128,000 output
+        // Claude 4.6 (Opus / Sonnet) = 250,000 context / 64,000 output
+        if lower.contains("5-5") || lower.contains("5.5") || lower.contains("5-") {
+            return (1_000_000, 128_000);
+        }
+        return (250_000, 64_000);
+    }
+    if lower.contains("gpt-oss") || lower.starts_with("gpt-") {
+        return (131_072, 32_768);
+    }
+    if lower.contains("image") {
+        return (65_536, 65_536);
+    }
+    // Gemini 4 (Argon / Neon / Hydrogen), 3.8, 3.x, 2.5 = 1,048,576 context / 65,536 output
+    (1_048_576, 65_536)
+}
+
 pub fn list_available_models() -> Result<Vec<ApiAvailableModel>, String> {
     let mut seen = HashSet::new();
     let mut models = Vec::new();
@@ -1746,6 +1769,30 @@ pub fn list_available_models() -> Result<Vec<ApiAvailableModel>, String> {
     let all_accs = accounts::list_accounts_sync().unwrap_or_default();
     let pool_accs = select_pool_members(all_accs.clone(), &cfg, None);
     let pool_count = pool_accs.len();
+
+    // Collect live maxTokens / maxOutputTokens reported by Cloud Code across fetched accounts
+    let mut live_limits: HashMap<String, (u64, u64)> = HashMap::new();
+    for acc in &all_accs {
+        if let Some(q) = &acc.quota {
+            for m in &q.models {
+                if let (Some(ctx), Some(out)) = (m.max_tokens, m.max_output_tokens) {
+                    if ctx > 0 && out > 0 {
+                        live_limits
+                            .entry(m.name.trim().to_ascii_lowercase())
+                            .or_insert((ctx, out));
+                    }
+                }
+            }
+        }
+    }
+
+    let lookup_limits = |target_model: &str| -> (u64, u64) {
+        let lower = target_model.trim().to_ascii_lowercase();
+        if let Some(&pair) = live_limits.get(&lower) {
+            return pair;
+        }
+        resolve_model_limits(target_model)
+    };
 
     let count_supporting = |target_model: &str| -> usize {
         pool_accs
@@ -1756,6 +1803,7 @@ pub fn list_available_models() -> Result<Vec<ApiAvailableModel>, String> {
 
     for (id, display, family, thinking) in BUILTIN_MODELS {
         seen.insert((*id).to_string());
+        let (context_window, max_output_tokens) = lookup_limits(id);
         models.push(ApiAvailableModel {
             id: (*id).to_string(),
             display_name: (*display).to_string(),
@@ -1764,6 +1812,8 @@ pub fn list_available_models() -> Result<Vec<ApiAvailableModel>, String> {
             source: "builtin".into(),
             supported_account_count: count_supporting(id),
             pool_account_count: pool_count,
+            context_window,
+            max_output_tokens,
         });
     }
 
@@ -1786,6 +1836,12 @@ pub fn list_available_models() -> Result<Vec<ApiAvailableModel>, String> {
                 } else {
                     "gemini"
                 };
+                let (fallback_ctx, fallback_out) = lookup_limits(n);
+                let context_window = m.max_tokens.filter(|&v| v > 0).unwrap_or(fallback_ctx);
+                let max_output_tokens = m
+                    .max_output_tokens
+                    .filter(|&v| v > 0)
+                    .unwrap_or(fallback_out);
                 models.push(ApiAvailableModel {
                     id: n.to_string(),
                     display_name: m.display_name.unwrap_or_else(|| n.to_string()),
@@ -1798,6 +1854,8 @@ pub fn list_available_models() -> Result<Vec<ApiAvailableModel>, String> {
                     source: "account-live".into(),
                     supported_account_count: count_supporting(n),
                     pool_account_count: pool_count,
+                    context_window,
+                    max_output_tokens,
                 });
             }
         }
@@ -1807,6 +1865,7 @@ pub fn list_available_models() -> Result<Vec<ApiAvailableModel>, String> {
     for rule in cfg.model_rules {
         if rule.enabled && !rule.pattern.contains('*') && !seen.contains(&rule.pattern) {
             seen.insert(rule.pattern.clone());
+            let (context_window, max_output_tokens) = lookup_limits(&rule.target_model);
             models.push(ApiAvailableModel {
                 id: rule.pattern.clone(),
                 display_name: format!("{} → {}", rule.pattern, rule.target_model),
@@ -1815,6 +1874,8 @@ pub fn list_available_models() -> Result<Vec<ApiAvailableModel>, String> {
                 source: "alias".into(),
                 supported_account_count: count_supporting(&rule.target_model),
                 pool_account_count: pool_count,
+                context_window,
+                max_output_tokens,
             });
         }
     }
@@ -3681,7 +3742,13 @@ async fn handle_single_request(
                     "object": "model",
                     "created": 1735689600,
                     "owned_by": format!("antigravity-{}", m.family),
-                    "display_name": m.display_name
+                    "display_name": m.display_name,
+                    "context_window": m.context_window,
+                    "max_output_tokens": m.max_output_tokens,
+                    "limit": {
+                        "context": m.context_window,
+                        "output": m.max_output_tokens
+                    }
                 })
             })
             .collect();
@@ -5330,6 +5397,8 @@ mod tests {
                         percentage: pct,
                         reset_time: String::new(),
                         summary_exhausted: Some(pct == 0),
+                        max_tokens: None,
+                        max_output_tokens: None,
                     })
                     .collect(),
                 last_updated: 1,
