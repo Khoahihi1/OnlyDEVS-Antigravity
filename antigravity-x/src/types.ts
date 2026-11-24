@@ -638,6 +638,9 @@ export type ApiServiceConfig = {
   autoStart: boolean;
   minimizeToTray: boolean;
   autoRefreshQuotaMinutes: number;
+  promptCacheAffinity: boolean;
+  fastMode: boolean;
+  priorityTier: boolean;
   timeoutSeconds: number;
   maxRetries: number;
   cooldownSeconds: number;

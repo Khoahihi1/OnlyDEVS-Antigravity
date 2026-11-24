@@ -151,6 +151,15 @@ pub struct ApiServiceConfig {
     /// Periodically refresh pool account quotas in background while API Router is running (0 = off)
     #[serde(default = "default_auto_refresh_minutes")]
     pub auto_refresh_quota_minutes: u64,
+    /// Stable sessionId + conversation-sticky account pinning for Google server-side KV Prompt Cache (90%+ cache hits)
+    #[serde(default = "default_true")]
+    pub prompt_cache_affinity: bool,
+    /// Low-Thinking Fast Mode: lowers thinkingConfig effort when client doesn't specify reasoning_effort
+    #[serde(default)]
+    pub fast_mode: bool,
+    /// Send Google Cloud Code Priority Tier (request.serviceTier = SERVICE_TIER_PRIORITY) with safe auto-fallback
+    #[serde(default = "default_true")]
+    pub priority_tier: bool,
     pub timeout_seconds: u64,
     pub max_retries: u32,
     pub cooldown_seconds: u64,
@@ -170,6 +179,9 @@ impl Default for ApiServiceConfig {
             auto_start: false,
             minimize_to_tray: true,
             auto_refresh_quota_minutes: 10,
+            prompt_cache_affinity: true,
+            fast_mode: false,
+            priority_tier: true,
             timeout_seconds: 180,
             max_retries: 2,
             cooldown_seconds: 60,
@@ -1570,15 +1582,127 @@ fn rank_pool_candidates(
     ordered
 }
 
+fn conv_sticky_lock() -> &'static Mutex<HashMap<String, (String, i64)>> {
+    static MAP: OnceLock<Mutex<HashMap<String, (String, i64)>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_conv_sticky_account(conv_cache_key: &str, account_id: &str) {
+    if conv_cache_key.is_empty() {
+        return;
+    }
+    let now = Utc::now().timestamp();
+    if let Ok(mut map) = conv_sticky_lock().lock() {
+        if map.len() > 512 {
+            map.retain(|_, (_, ts)| now - *ts < 1800);
+        }
+        map.insert(conv_cache_key.to_string(), (account_id.to_string(), now));
+    }
+}
+
+fn fnv1a_64(seed: u64, bytes: &[u8]) -> u64 {
+    let mut h = seed;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn compute_conversation_affinity(
+    session_seed: &str,
+    system_texts: &[String],
+    first_user_preview: &str,
+) -> (String, String) {
+    let mut basis = String::with_capacity(512);
+    basis.push_str(session_seed);
+    basis.push('|');
+    if let Some(sys) = system_texts.first() {
+        for ch in sys.chars().take(512) {
+            basis.push(ch);
+        }
+    }
+    basis.push('|');
+    for ch in first_user_preview.chars().take(256) {
+        basis.push(ch);
+    }
+    let h1 = fnv1a_64(0xcbf29ce484222325, basis.as_bytes());
+    let h2 = fnv1a_64(0x84222325cbf29ce4, basis.as_bytes());
+    let session_id = format!("{}", (h1 & 0x7fff_ffff_ffff_ffff).max(1));
+    let conv_id = format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        (h1 >> 32) as u32,
+        ((h1 >> 16) & 0xffff) as u16,
+        (h1 & 0x0fff) as u16,
+        ((h2 >> 48) as u16 & 0x3fff) | 0x8000,
+        h2 & 0xffff_ffff_ffff
+    );
+    (session_id, conv_id)
+}
+
+fn extract_conversation_cache_key(openai_body: &Value, key_id: &str, model: &str) -> String {
+    let mut sys_prefix = String::new();
+    let mut user_prefix = String::new();
+    if let Some(msgs) = openai_body.get("messages").and_then(Value::as_array) {
+        for m in msgs {
+            let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+            let content = m.get("content").unwrap_or(&Value::Null);
+            if (role == "system" || role == "developer") && sys_prefix.is_empty() {
+                sys_prefix = sanitize_antigravity_system_prompt(&extract_text_from_value(content));
+            } else if role == "user" && user_prefix.is_empty() {
+                let t = extract_text_from_value(content);
+                if !t.trim().is_empty() {
+                    user_prefix = t;
+                }
+            }
+            if !sys_prefix.is_empty() && !user_prefix.is_empty() {
+                break;
+            }
+        }
+    }
+    if sys_prefix.is_empty() && user_prefix.is_empty() {
+        return String::new();
+    }
+    let sys_arr = [sys_prefix];
+    let sys_slice: &[String] = if sys_arr[0].is_empty() { &[] } else { &sys_arr };
+    let (_, conv_id) = compute_conversation_affinity(key_id, sys_slice, &user_prefix);
+    format!("{conv_id}:{model}")
+}
+
 fn resolve_pool_accounts(
     cfg: &ApiServiceConfig,
     key: &ApiKeyRecord,
     model: &str,
     excluded: &HashSet<String>,
+    conv_cache_key: Option<&str>,
 ) -> Vec<AntigravityAccount> {
     let all = accounts::list_accounts_sync().unwrap_or_default();
     let members = select_pool_members(all, cfg, Some(key));
-    rank_pool_candidates(members, cfg, &key.id, model, excluded)
+    let mut ordered = rank_pool_candidates(members, cfg, &key.id, model, excluded);
+    // Pin the same healthy account for multi-turn KV Prompt Cache hits when enabled
+    if cfg.prompt_cache_affinity {
+        if let Some(ck) = conv_cache_key.filter(|s| !s.is_empty()) {
+            let now = Utc::now().timestamp();
+            let pinned_id = conv_sticky_lock()
+                .lock()
+                .ok()
+                .and_then(|map| map.get(ck).cloned())
+                .filter(|(_, ts)| now - *ts < 1800)
+                .map(|(id, _)| id);
+            if let Some(pid) = pinned_id {
+                if let Some(pos) = ordered
+                    .iter()
+                    .position(|a| a.id == pid && account_quota_score(a, model) > 0)
+                {
+                    if pos > 0 {
+                        let chosen = ordered.remove(pos);
+                        ordered.insert(0, chosen);
+                    }
+                }
+            }
+        }
+    }
+    ordered
 }
 
 // ============================================================================
@@ -1969,11 +2093,106 @@ fn merge_adjacent_contents(contents: Vec<Value>) -> Vec<Value> {
     merged
 }
 
+fn build_thinking_config(
+    body: &Value,
+    resolved_model: &str,
+    fast_mode: bool,
+) -> Option<Value> {
+    let lower_model = resolved_model.to_ascii_lowercase();
+    if lower_model.contains("image") {
+        return None;
+    }
+
+    // 1. Direct thinkingConfig object passthrough (Gemini style)
+    if let Some(tc) = body.get("thinkingConfig").and_then(Value::as_object) {
+        if !tc.is_empty() {
+            return Some(Value::Object(tc.clone()));
+        }
+    }
+
+    // 2. Anthropic thinking object: { type: "enabled" | "disabled", budget_tokens?: N }
+    if let Some(th) = body.get("thinking").and_then(Value::as_object) {
+        let t_type = th.get("type").and_then(Value::as_str).unwrap_or("");
+        if t_type.eq_ignore_ascii_case("disabled") {
+            return Some(json!({ "thinkingBudget": 0, "includeThoughts": false }));
+        }
+        if let Some(budget) = th.get("budget_tokens").and_then(Value::as_u64) {
+            return Some(json!({
+                "thinkingBudget": budget,
+                "includeThoughts": budget > 0
+            }));
+        }
+    }
+
+    // 3. Explicit numeric thinking_budget
+    if let Some(budget) = body.get("thinking_budget").and_then(Value::as_u64) {
+        return Some(json!({
+            "thinkingBudget": budget,
+            "includeThoughts": budget > 0
+        }));
+    }
+
+    // 4. OpenAI / Responses reasoning_effort: "none" | "minimal" | "low" | "medium" | "high"
+    let effort = body
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .or_else(|| body.pointer("/reasoning/effort").and_then(Value::as_str))
+        .map(|s| s.trim().to_ascii_lowercase());
+
+    if let Some(eff) = effort.as_deref() {
+        return match eff {
+            "none" | "off" | "disabled" => {
+                Some(json!({ "thinkingBudget": 0, "includeThoughts": false }))
+            }
+            "minimal" => {
+                if lower_model.contains("claude") {
+                    Some(json!({ "thinkingBudget": 1024, "includeThoughts": false }))
+                } else {
+                    Some(json!({ "thinkingLevel": "LOW", "includeThoughts": false }))
+                }
+            }
+            "low" => {
+                if lower_model.contains("claude") {
+                    Some(json!({ "thinkingBudget": 2048, "includeThoughts": true }))
+                } else {
+                    Some(json!({ "thinkingLevel": "LOW", "includeThoughts": true }))
+                }
+            }
+            "medium" => {
+                if lower_model.contains("claude") {
+                    Some(json!({ "thinkingBudget": 8192, "includeThoughts": true }))
+                } else {
+                    Some(json!({ "thinkingLevel": "MEDIUM", "includeThoughts": true }))
+                }
+            }
+            "high" => {
+                if lower_model.contains("claude") {
+                    Some(json!({ "thinkingBudget": 16384, "includeThoughts": true }))
+                } else {
+                    Some(json!({ "thinkingLevel": "HIGH", "includeThoughts": true }))
+                }
+            }
+            _ => None,
+        };
+    }
+
+    // 5. Router-level Fast Mode (Low-Thinking) when client didn't specify reasoning_effort
+    if fast_mode {
+        if lower_model.contains("claude") {
+            return Some(json!({ "thinkingBudget": 1024, "includeThoughts": false }));
+        }
+        return Some(json!({ "thinkingLevel": "LOW", "includeThoughts": false }));
+    }
+
+    None
+}
+
 fn openai_body_to_antigravity_envelope(
     body: &Value,
     resolved_model: &str,
     project_id: &str,
     session_seed: &str,
+    cfg: &ApiServiceConfig,
 ) -> (Value, String, HashMap<String, String>) {
     let mut system_texts: Vec<String> = Vec::new();
     let mut contents: Vec<Value> = Vec::new();
@@ -2121,10 +2340,16 @@ fn openai_body_to_antigravity_envelope(
         .unwrap_or(8192)
         .min(MAX_ANTIGRAVITY_OUTPUT_TOKENS);
     gen_cfg.insert("maxOutputTokens".into(), json!(max_out));
+    if let Some(thinking_cfg) = build_thinking_config(body, resolved_model, cfg.fast_mode) {
+        gen_cfg.insert("thinkingConfig".into(), thinking_cfg);
+    }
 
     let mut req_obj = Map::new();
     req_obj.insert("contents".into(), Value::Array(merged_contents.clone()));
     req_obj.insert("generationConfig".into(), Value::Object(gen_cfg));
+    if cfg.priority_tier && !resolved_model.to_ascii_lowercase().contains("image") {
+        req_obj.insert("serviceTier".into(), json!("SERVICE_TIER_PRIORITY"));
+    }
     if !system_texts.is_empty() {
         req_obj.insert(
             "systemInstruction".into(),
@@ -2201,10 +2426,16 @@ fn openai_body_to_antigravity_envelope(
     for k in BLACKLISTED_FIELDS {
         req_obj.remove(*k);
     }
-    let session_id = Utc::now().timestamp_millis().to_string();
+    let (session_id, conv_id) = if cfg.prompt_cache_affinity {
+        compute_conversation_affinity(session_seed, &system_texts, &first_user_preview)
+    } else {
+        (
+            Utc::now().timestamp_millis().to_string(),
+            Uuid::new_v4().to_string(),
+        )
+    };
     req_obj.insert("sessionId".into(), Value::String(session_id));
 
-    let conv_id = Uuid::new_v4();
     let traj_id = Uuid::new_v4();
     let step = (merged_contents.len() * 2).saturating_sub(1).max(1);
     let request_id = format!(
@@ -2214,7 +2445,6 @@ fn openai_body_to_antigravity_envelope(
         traj_id,
         step
     );
-    let _ = session_seed;
 
     // Official Antigravity client omits `requestType` on the chat/agent path.
     // Sending `requestType: "agent"` triggers Google's detail-free 429 RESOURCE_EXHAUSTED
@@ -2332,6 +2562,12 @@ fn responses_body_to_openai_body(body: &Value) -> Value {
     if let Some(tools) = body.get("tools") {
         out.insert("tools".into(), tools.clone());
     }
+    if let Some(r) = body.get("reasoning") {
+        out.insert("reasoning".into(), r.clone());
+    }
+    if let Some(re) = body.get("reasoning_effort") {
+        out.insert("reasoning_effort".into(), re.clone());
+    }
     Value::Object(out)
 }
 
@@ -2426,6 +2662,12 @@ fn anthropic_body_to_openai_body(body: &Value) -> Value {
     }
     if let Some(tools) = body.get("tools") {
         out.insert("tools".into(), tools.clone());
+    }
+    if let Some(r) = body.get("reasoning") {
+        out.insert("reasoning".into(), r.clone());
+    }
+    if let Some(re) = body.get("reasoning_effort") {
+        out.insert("reasoning_effort".into(), re.clone());
     }
     Value::Object(out)
 }
@@ -2639,8 +2881,24 @@ async fn send_upstream_with_failover(
         String::new(),
     );
 
+    let conv_cache_key = if cfg.prompt_cache_affinity {
+        extract_conversation_cache_key(openai_body, &key.id, resolved_model)
+    } else {
+        String::new()
+    };
+
     while real_attempts < max_real_attempts && total_hops < max_total_hops {
-        let candidates = resolve_pool_accounts(cfg, key, resolved_model, &tried);
+        let candidates = resolve_pool_accounts(
+            cfg,
+            key,
+            resolved_model,
+            &tried,
+            if conv_cache_key.is_empty() {
+                None
+            } else {
+                Some(conv_cache_key.as_str())
+            },
+        );
         let Some(candidate) = candidates.into_iter().next() else {
             break;
         };
@@ -2677,8 +2935,8 @@ async fn send_upstream_with_failover(
             .filter(|p| !p.trim().is_empty() && p != "aicode-consumers")
             .unwrap_or_else(generate_fallback_project_id);
 
-        let (envelope, preview, tool_name_map) =
-            openai_body_to_antigravity_envelope(openai_body, resolved_model, &project_id, &key.id);
+        let (mut envelope, preview, tool_name_map) =
+            openai_body_to_antigravity_envelope(openai_body, resolved_model, &project_id, &key.id, cfg);
 
         let force_non_stream = resolved_model.to_ascii_lowercase().contains("image");
         let action = if stream && !force_non_stream {
@@ -2710,10 +2968,61 @@ async fn send_upstream_with_failover(
                                 map.insert(format!("{}:{resolved_model}", key.id), acc.id.clone());
                             }
                         }
+                        if cfg.prompt_cache_affinity && !conv_cache_key.is_empty() {
+                            record_conv_sticky_account(&conv_cache_key, &acc.id);
+                        }
                         succeeded = Some((resp, acc.clone(), preview.clone(), tool_name_map.clone()));
                         break;
                     }
                     let err_body = resp.text().await.unwrap_or_default();
+                    // Safe fallback: if a specific model rejects optional serviceTier or thinkingConfig with HTTP 400,
+                    // strip those optional speed fields and retry once immediately on the same account.
+                    if status == 400 {
+                        let lower_err = err_body.to_ascii_lowercase();
+                        let mut stripped = false;
+                        if (lower_err.contains("service_tier") || lower_err.contains("servicetier"))
+                            && envelope
+                                .pointer_mut("/request")
+                                .and_then(Value::as_object_mut)
+                                .and_then(|r| r.remove("serviceTier"))
+                                .is_some()
+                        {
+                            stripped = true;
+                        }
+                        if (lower_err.contains("thinking") || lower_err.contains("thinking_level"))
+                            && envelope
+                                .pointer_mut("/request/generationConfig")
+                                .and_then(Value::as_object_mut)
+                                .and_then(|g| g.remove("thinkingConfig"))
+                                .is_some()
+                        {
+                            stripped = true;
+                        }
+                        if stripped {
+                            if let Ok(retry_resp) = client
+                                .post(&url)
+                                .bearer_auth(&acc.token.access_token)
+                                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                                .header(reqwest::header::USER_AGENT, ANTIGRAVITY_IDE_USER_AGENT)
+                                .json(&envelope)
+                                .send()
+                                .await
+                            {
+                                if retry_resp.status().is_success() {
+                                    if cfg.prompt_cache_affinity && !conv_cache_key.is_empty() {
+                                        record_conv_sticky_account(&conv_cache_key, &acc.id);
+                                    }
+                                    succeeded = Some((
+                                        retry_resp,
+                                        acc.clone(),
+                                        preview.clone(),
+                                        tool_name_map.clone(),
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     if status == 401 {
                         if let Ok(re_acc) =
                             accounts::ensure_fresh_access_token(&acc.id, true).await
@@ -5083,8 +5392,9 @@ mod tests {
             ]
         });
 
+        let cfg = ApiServiceConfig::default();
         let (env, preview, tool_map) =
-            openai_body_to_antigravity_envelope(&body, "gemini-4-neon-medium", "p1", "k1");
+            openai_body_to_antigravity_envelope(&body, "gemini-4-neon-medium", "p1", "k1", &cfg);
 
         // 1. Chat envelope MUST omit requestType (prevents Google fake 429)
         assert!(env.get("requestType").is_none());
@@ -5293,5 +5603,81 @@ mod tests {
         exp_key.expires_at = Some(Utc::now().timestamp() - 10);
         let err_exp = check_api_key_limits(&exp_key).unwrap_err();
         assert_eq!(err_exp.0, 401);
+    }
+
+    #[test]
+    fn speed_boost_kv_cache_thinking_and_priority_tier_work() {
+        let mut cfg = ApiServiceConfig::default();
+        cfg.prompt_cache_affinity = true;
+        cfg.priority_tier = true;
+        cfg.fast_mode = true;
+
+        let turn1 = json!({
+            "messages": [
+                { "role": "system", "content": "You are a coding assistant." },
+                { "role": "user", "content": "Explain Rust lifetimes" }
+            ]
+        });
+        let turn2 = json!({
+            "messages": [
+                { "role": "system", "content": "You are a coding assistant." },
+                { "role": "user", "content": "Explain Rust lifetimes" },
+                { "role": "assistant", "content": "Lifetimes ensure references are valid." },
+                { "role": "user", "content": "Give an example" }
+            ]
+        });
+        let other_conv = json!({
+            "messages": [
+                { "role": "system", "content": "You are a coding assistant." },
+                { "role": "user", "content": "Completely different topic" }
+            ]
+        });
+
+        let (env1, _, _) =
+            openai_body_to_antigravity_envelope(&turn1, "gemini-4-neon-medium", "p1", "k1", &cfg);
+        let (env2, _, _) =
+            openai_body_to_antigravity_envelope(&turn2, "gemini-4-neon-medium", "p1", "k1", &cfg);
+        let (env3, _, _) =
+            openai_body_to_antigravity_envelope(&other_conv, "gemini-4-neon-medium", "p1", "k1", &cfg);
+
+        // 1. Same conversation keeps identical sessionId and conv_id prefix for server-side KV Cache
+        let sid1 = env1.pointer("/request/sessionId").and_then(Value::as_str).unwrap();
+        let sid2 = env2.pointer("/request/sessionId").and_then(Value::as_str).unwrap();
+        let sid3 = env3.pointer("/request/sessionId").and_then(Value::as_str).unwrap();
+        assert_eq!(sid1, sid2);
+        assert_ne!(sid1, sid3);
+
+        let cid1 = env1.get("requestId").and_then(Value::as_str).unwrap().split('/').nth(1).unwrap();
+        let cid2 = env2.get("requestId").and_then(Value::as_str).unwrap().split('/').nth(1).unwrap();
+        let cid3 = env3.get("requestId").and_then(Value::as_str).unwrap().split('/').nth(1).unwrap();
+        assert_eq!(cid1, cid2);
+        assert_ne!(cid1, cid3);
+
+        // 2. Priority Tier is set on request
+        assert_eq!(
+            env1.pointer("/request/serviceTier").and_then(Value::as_str),
+            Some("SERVICE_TIER_PRIORITY")
+        );
+
+        // 3. Fast Mode emits LOW thinkingConfig when client didn't specify reasoning_effort
+        assert_eq!(
+            env1.pointer("/request/generationConfig/thinkingConfig/thinkingLevel")
+                .and_then(Value::as_str),
+            Some("LOW")
+        );
+
+        // 4. Explicit reasoning_effort overrides Fast Mode
+        let high_body = json!({
+            "reasoning_effort": "high",
+            "messages": [{ "role": "user", "content": "Deep proof" }]
+        });
+        let (env_high, _, _) =
+            openai_body_to_antigravity_envelope(&high_body, "gemini-4-neon-medium", "p1", "k1", &cfg);
+        assert_eq!(
+            env_high
+                .pointer("/request/generationConfig/thinkingConfig/thinkingLevel")
+                .and_then(Value::as_str),
+            Some("HIGH")
+        );
     }
 }

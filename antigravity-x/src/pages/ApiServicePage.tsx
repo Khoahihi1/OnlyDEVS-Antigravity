@@ -1518,6 +1518,60 @@ print(resp.choices[0].message.content)`;
               <label className="ag-select-all-label">
                 <input
                   type="checkbox"
+                  checked={cfgDraft.promptCacheAffinity ?? true}
+                  onChange={(e) =>
+                    setCfgDraft({
+                      ...cfgDraft,
+                      promptCacheAffinity: e.target.checked,
+                    })
+                  }
+                />
+                <span>
+                  {vi
+                    ? "Bật KV Prompt Cache (cố định sessionId & ghim acc theo hội thoại — giảm độ trễ 3–5x)"
+                    : "Enable KV Prompt Cache (stable sessionId & conversation account pinning — 3–5x faster TTFT)"}
+                </span>
+              </label>
+
+              <label className="ag-select-all-label">
+                <input
+                  type="checkbox"
+                  checked={cfgDraft.priorityTier ?? true}
+                  onChange={(e) =>
+                    setCfgDraft({
+                      ...cfgDraft,
+                      priorityTier: e.target.checked,
+                    })
+                  }
+                />
+                <span>
+                  {vi
+                    ? "Bật đường ưu tiên Priority Tier (SERVICE_TIER_PRIORITY — tự fallback an toàn nếu model không hỗ trợ)"
+                    : "Enable Priority Service Tier (SERVICE_TIER_PRIORITY with automatic safe fallback)"}
+                </span>
+              </label>
+
+              <label className="ag-select-all-label">
+                <input
+                  type="checkbox"
+                  checked={cfgDraft.fastMode ?? false}
+                  onChange={(e) =>
+                    setCfgDraft({
+                      ...cfgDraft,
+                      fastMode: e.target.checked,
+                    })
+                  }
+                />
+                <span>
+                  {vi
+                    ? "Chế độ Fast / Low-Thinking (ép thinkingLevel=LOW khi client không gửi reasoning_effort)"
+                    : "Fast / Low-Thinking Mode (default thinkingLevel=LOW unless client sets reasoning_effort)"}
+                </span>
+              </label>
+
+              <label className="ag-select-all-label">
+                <input
+                  type="checkbox"
                   checked={cfgDraft.preserveExclusiveAccounts ?? true}
                   onChange={(e) =>
                     setCfgDraft({
