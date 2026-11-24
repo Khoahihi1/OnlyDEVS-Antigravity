@@ -889,8 +889,15 @@ impl GoogleUserInfo {
 }
 
 fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(18))
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(25));
+    if let Ok(cfg) = crate::api_service::load_config() {
+        if let Some(proxy_url) = cfg.proxy_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Ok(proxy) = reqwest::Proxy::all(proxy_url) {
+                builder = builder.proxy(proxy);
+            }
+        }
+    }
+    builder
         .build()
         .map_err(|e| format!("Tạo HTTP client: {e}"))
 }
@@ -1439,10 +1446,24 @@ async fn build_or_update_account_from_token_response(
     fallback_refresh_token: Option<String>,
     mark_current: bool,
 ) -> Result<AntigravityAccount, String> {
+    let user_info = fetch_google_user_info(&token_res.access_token).await?;
+    let email = user_info.email.trim().to_lowercase();
+    let now = Utc::now().timestamp();
+
+    let conn = open_db()?;
+    ensure_accounts_schema(&conn)?;
+    let existing = find_account_by_email_db(&conn, &email)?;
+
     let effective_refresh = token_res
         .refresh_token
         .filter(|s| !s.trim().is_empty())
         .or_else(|| fallback_refresh_token.filter(|s| !s.trim().is_empty()))
+        .or_else(|| {
+            existing
+                .as_ref()
+                .map(|a| a.token.refresh_token.clone())
+                .filter(|s| !s.trim().is_empty())
+        })
         .ok_or_else(|| {
             "Google không trả về refresh_token (tài khoản này có thể đã cấp quyền trước đó).\n\
              Cách xử lý:\n\
@@ -1452,20 +1473,12 @@ async fn build_or_update_account_from_token_response(
                 .to_string()
         })?;
 
-    let user_info = fetch_google_user_info(&token_res.access_token).await?;
-    let email = user_info.email.trim().to_lowercase();
-    let now = Utc::now().timestamp();
-
     // Non-fatal quota fetch right after OAuth login so a transient quota glitch never drops valid tokens
     let (quota_opt, quota_error) =
         match fetch_cloud_code_quota(&token_res.access_token, &email, None).await {
             Ok((q, err)) => (Some(q), err),
             Err(_) => (None, None),
         };
-
-    let conn = open_db()?;
-    ensure_accounts_schema(&conn)?;
-    let existing = find_account_by_email_db(&conn, &email)?;
 
     let id = existing
         .as_ref()
@@ -2387,15 +2400,19 @@ pub fn cancel_oauth_login() {
     clear_oauth_flow_state();
 }
 
-fn oauth_success_html() -> &'static str {
-    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n\
-    <html>\
+fn oauth_success_html() -> String {
+    let body = "<html>\
     <body style='font-family:system-ui,-apple-system,sans-serif;text-align:center;padding:52px;background:#0d1117;color:#f3f4f6;'>\
         <h1 style='color:#4ade80;margin-bottom:10px;'>✅ OnlyDEVS — Ủy quyền OAuth thành công!</h1>\
         <p style='color:#9ca3af;'>Bạn có thể đóng tab này và quay lại ứng dụng OnlyDEVS.</p>\
         <script>setTimeout(function(){window.close();},1800);</script>\
     </body>\
-    </html>"
+    </html>";
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
 }
 
 fn oauth_fail_html(message: &str) -> String {
@@ -2403,19 +2420,23 @@ fn oauth_fail_html(message: &str) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;");
-    format!(
-        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n\
-        <html>\
+    let body = format!(
+        "<html>\
         <body style='font-family:system-ui,-apple-system,sans-serif;text-align:center;padding:52px;background:#0d1117;color:#f3f4f6;'>\
             <h1 style='color:#f87171;margin-bottom:10px;'>❌ Ủy quyền OAuth thất bại</h1>\
             <p style='color:#d1d5db;'>{escaped}</p>\
         </body>\
         </html>"
+    );
+    format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
     )
 }
 
 fn oauth_not_found_response() -> &'static str {
-    "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nNot Found"
+    "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found"
 }
 
 fn oauth_options_response() -> &'static str {
@@ -2577,29 +2598,28 @@ async fn process_oauth_callback_request(
     port: u16,
     expected_state: &str,
 ) -> Option<Result<String, String>> {
+    // Browsers (Chrome/Edge/Brave) frequently open speculative preconnect or Happy Eyeballs
+    // sockets that close with 0 bytes or sit idle. Ignore those cleanly instead of aborting OAuth!
     let request = match read_oauth_http_request(stream).await {
         Ok(req) => req,
-        Err(err) => {
-            let response = oauth_fail_html("Không đọc được callback từ trình duyệt, hãy thử lại.");
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.flush().await;
-            return Some(Err(err));
+        Err(_) => {
+            let _ = stream.shutdown().await;
+            return None;
         }
     };
 
     let (method, target) = match parse_oauth_request_target(&request) {
         Ok(parsed) => parsed,
-        Err(err) => {
-            let response = oauth_fail_html("Định dạng callback không hợp lệ, hãy thử lại.");
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.flush().await;
-            return Some(Err(err));
+        Err(_) => {
+            let _ = stream.shutdown().await;
+            return None;
         }
     };
 
     if method.eq_ignore_ascii_case("OPTIONS") {
         let _ = stream.write_all(oauth_options_response().as_bytes()).await;
         let _ = stream.flush().await;
+        let _ = stream.shutdown().await;
         return None;
     }
 
@@ -2613,6 +2633,7 @@ async fn process_oauth_callback_request(
             let response = oauth_fail_html("Không phân tích được URL callback, hãy thử lại.");
             let _ = stream.write_all(response.as_bytes()).await;
             let _ = stream.flush().await;
+            let _ = stream.shutdown().await;
             return Some(Err("OAuth callback URL không hợp lệ".to_string()));
         }
     };
@@ -2620,6 +2641,7 @@ async fn process_oauth_callback_request(
     if callback_url.path() != OAUTH_CALLBACK_PATH {
         let _ = stream.write_all(oauth_not_found_response().as_bytes()).await;
         let _ = stream.flush().await;
+        let _ = stream.shutdown().await;
         return None;
     }
 
@@ -2629,12 +2651,15 @@ async fn process_oauth_callback_request(
             let response = oauth_fail_html(&err);
             let _ = stream.write_all(response.as_bytes()).await;
             let _ = stream.flush().await;
+            let _ = stream.shutdown().await;
             return Some(Err(err));
         }
     };
 
-    let _ = stream.write_all(oauth_success_html().as_bytes()).await;
+    let success = oauth_success_html();
+    let _ = stream.write_all(success.as_bytes()).await;
     let _ = stream.flush().await;
+    let _ = stream.shutdown().await;
     Some(Ok(code))
 }
 
@@ -2655,31 +2680,45 @@ fn callback_redirect_uri(port: u16, has_ipv4: bool, has_ipv6: bool) -> String {
 }
 
 async fn bind_callback_listeners() -> Result<OAuthCallbackListeners, String> {
-    let (first, is_ipv6) = match TcpListener::bind("[::1]:0").await {
-        Ok(listener) => (listener, true),
-        Err(_) => (
-            TcpListener::bind("127.0.0.1:0")
-                .await
-                .map_err(|e| format!("Không thể mở cổng OAuth loopback: {e}"))?,
-            false,
-        ),
-    };
-    let port = first
+    // Prefer binding IPv4 127.0.0.1 first and matching [::1] on the same port (retry up to 10x)
+    // so Windows excluded/WSL IPv4 port ranges never leave us on IPv6-only [::1].
+    let mut fallback_v4: Option<(TcpListener, u16)> = None;
+    for _ in 0..10 {
+        if let Ok(v4) = TcpListener::bind("127.0.0.1:0").await {
+            if let Ok(addr) = v4.local_addr() {
+                let port = addr.port();
+                if let Ok(v6) = TcpListener::bind(format!("[::1]:{port}")).await {
+                    return Ok(OAuthCallbackListeners {
+                        ipv4: Some(v4),
+                        ipv6: Some(v6),
+                        port,
+                    });
+                }
+                if fallback_v4.is_none() {
+                    fallback_v4 = Some((v4, port));
+                }
+            }
+        }
+    }
+    if let Some((v4, port)) = fallback_v4 {
+        return Ok(OAuthCallbackListeners {
+            ipv4: Some(v4),
+            ipv6: None,
+            port,
+        });
+    }
+    let v6 = TcpListener::bind("[::1]:0")
+        .await
+        .map_err(|e| format!("Không thể mở cổng OAuth loopback: {e}"))?;
+    let port = v6
         .local_addr()
         .map_err(|e| format!("Không lấy được cổng local: {e}"))?
         .port();
-    let other_addr = if is_ipv6 {
-        format!("127.0.0.1:{port}")
-    } else {
-        format!("[::1]:{port}")
-    };
-    let other = TcpListener::bind(&other_addr).await.ok();
-    let (ipv4, ipv6) = if is_ipv6 {
-        (other, Some(first))
-    } else {
-        (Some(first), other)
-    };
-    Ok(OAuthCallbackListeners { ipv4, ipv6, port })
+    Ok(OAuthCallbackListeners {
+        ipv4: None,
+        ipv6: Some(v6),
+        port,
+    })
 }
 
 async fn accept_oauth_callback(
@@ -2716,6 +2755,7 @@ async fn ensure_oauth_flow_prepared(app_handle: &AppHandle) -> Result<OAuthPrepa
     let tx_clone = code_tx.clone();
     let app_clone = app_handle.clone();
     let expected_state = state_token.clone();
+    let done_tx = cancel_tx.clone();
 
     tokio::spawn(async move {
         loop {
@@ -2733,15 +2773,23 @@ async fn ensure_oauth_flow_prepared(app_handle: &AppHandle) -> Result<OAuthPrepa
                 continue;
             };
 
-            if let Some(result) =
-                process_oauth_callback_request(&mut stream, port, &expected_state).await
-            {
-                if let Some(sender) = tx_clone.lock().await.take() {
-                    let _ = app_clone.emit("oauth-callback-received", ());
-                    let _ = sender.send(result);
+            // Spawn each connection concurrently so speculative/idle browser sockets
+            // can never block or abort the real Google /oauth-callback connection.
+            let tx_conn = tx_clone.clone();
+            let app_conn = app_clone.clone();
+            let state_conn = expected_state.clone();
+            let done_conn = done_tx.clone();
+            tokio::spawn(async move {
+                if let Some(result) =
+                    process_oauth_callback_request(&mut stream, port, &state_conn).await
+                {
+                    if let Some(sender) = tx_conn.lock().await.take() {
+                        let _ = app_conn.emit("oauth-callback-received", ());
+                        let _ = sender.send(result);
+                        let _ = done_conn.send(true);
+                    }
                 }
-                break;
-            }
+            });
         }
     });
 
@@ -2807,15 +2855,33 @@ pub async fn prepare_oauth_session(app_handle: AppHandle) -> Result<OAuthPrepare
     ensure_oauth_flow_prepared(&app_handle).await
 }
 
+fn open_browser_url_with_fallback(app_handle: &AppHandle, url: &str) -> Result<(), String> {
+    if app_handle
+        .opener()
+        .open_url(url, None::<String>)
+        .is_ok()
+    {
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        if std::process::Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    Err("Không thể tự mở trình duyệt mặc định. Hãy bấm nút Copy link OAuth bên dưới và dán vào Chrome/Edge (phiên chờ callback vẫn đang hoạt động).".to_string())
+}
+
 pub async fn start_oauth_login(app_handle: AppHandle) -> Result<AntigravityAccount, String> {
     let prep = ensure_oauth_flow_prepared(&app_handle).await?;
-    app_handle
-        .opener()
-        .open_url(&prep.auth_url, None::<String>)
-        .map_err(|e| {
-            clear_oauth_flow_state();
-            format!("Không thể mở trình duyệt cho OAuth: {e}")
-        })?;
+    open_browser_url_with_fallback(&app_handle, &prep.auth_url)?;
     let tok_res = await_oauth_code_and_exchange().await?;
     build_or_update_account_from_token_response(tok_res, None, false).await
 }
@@ -3506,6 +3572,79 @@ mod oauth_tests {
         assert_eq!(received, "4/0GoodCode");
         // Second consumer cannot double-consume the authorization code
         assert!(code_tx.lock().await.take().is_none());
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn loopback_survives_speculative_empty_and_idle_preconnect_sockets() {
+        let listeners = bind_callback_listeners().await.unwrap();
+        let port = listeners.port;
+        let expected_state = "state-happy-eyeballs".to_string();
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let (code_tx, code_rx) = oneshot::channel::<Result<String, String>>();
+        let code_tx = Arc::new(tokio::sync::Mutex::new(Some(code_tx)));
+        let tx_clone = code_tx.clone();
+        let st_clone = expected_state.clone();
+        let done_tx = cancel_tx.clone();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let accept_result = tokio::select! {
+                    res = accept_oauth_callback(&listeners.ipv4) => Some(res),
+                    res = accept_oauth_callback(&listeners.ipv6) => Some(res),
+                    _ = cancel_rx.changed() => None,
+                };
+                let Some(accept_result) = accept_result else {
+                    break;
+                };
+                let Ok((mut stream, _)) = accept_result else {
+                    continue;
+                };
+                let tx_conn = tx_clone.clone();
+                let state_conn = st_clone.clone();
+                let done_conn = done_tx.clone();
+                tokio::spawn(async move {
+                    if let Some(res) =
+                        process_oauth_callback_request(&mut stream, port, &state_conn).await
+                    {
+                        if let Some(sender) = tx_conn.lock().await.take() {
+                            let _ = sender.send(res);
+                            let _ = done_conn.send(true);
+                        }
+                    }
+                });
+            }
+        });
+
+        let addr = format!("127.0.0.1:{port}");
+        // 1. Immediate-close 0-byte socket (Happy Eyeballs loser) must NOT kill listener
+        {
+            let s_empty = tokio::net::TcpStream::connect(&addr).await.unwrap();
+            drop(s_empty);
+        }
+        // 2. Idle preconnect socket held open without sending anything must NOT block real callback
+        let _s_idle = tokio::net::TcpStream::connect(&addr).await.unwrap();
+
+        // 3. Real Google callback arrives concurrently and succeeds immediately with Content-Length
+        let mut s_real = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        s_real
+            .write_all(
+                b"GET /oauth-callback?code=4%2F0RealCode&state=state-happy-eyeballs HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut resp = [0u8; 512];
+        let n = s_real.read(&mut resp).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp[..n]);
+        assert!(resp_str.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp_str.contains("Content-Length:"));
+
+        let received = timeout(Duration::from_secs(2), code_rx)
+            .await
+            .expect("must not be blocked by idle preconnect socket")
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, "4/0RealCode");
         let _ = server.await;
     }
 }

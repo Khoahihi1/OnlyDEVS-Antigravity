@@ -921,6 +921,11 @@ export function AccountsPage({
     try {
       await onSubmitOAuthCallback(trimmed);
       setOauthCallbackUrl("");
+      // If start_oauth_login / complete_oauth_login isn't already waiting, finish immediately
+      // instead of relying solely on the async Tauri event listener.
+      if (!oauthWorkingRef.current) {
+        void handleCompleteOAuth();
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setOauthError(msg);
@@ -1979,7 +1984,9 @@ export function AccountsPage({
       {addModalOpen ? (
         <div
           className="agx-modal-backdrop"
-          onClick={() => setAddModalOpen(false)}
+          onClick={() => {
+            if (!oauthWorking) setAddModalOpen(false);
+          }}
         >
           <div
             className="agx-modal od-add-modal"
