@@ -3881,6 +3881,7 @@ async fn handle_single_request(
             if is_stream {
                 if write_sse_headers(stream).await.is_ok() {
                     let mut sse_buf = String::new();
+                    let mut openai_tool_idx = 0usize;
                     let mut anthropic_started = false;
                     let mut anthropic_block_idx = 0usize;
                     let mut anthropic_in_thinking = false;
@@ -3961,11 +3962,12 @@ async fn handle_single_request(
                                     let tc_json: Vec<Value> = parsed
                                         .tool_calls
                                         .iter()
-                                        .enumerate()
-                                        .map(|(i, (id, name, args))| {
+                                        .map(|(id, name, args)| {
+                                            let idx = openai_tool_idx;
+                                            openai_tool_idx += 1;
                                             collected_tools.push((id.clone(), name.clone(), args.clone()));
                                             json!({
-                                                "index": i,
+                                                "index": idx,
                                                 "id": id,
                                                 "type": "function",
                                                 "function": {
