@@ -34,11 +34,13 @@ export function isClassicProLiteModels(models?: ModelQuota[] | null): boolean {
     if (
       n === "gemini-argon-wtu-weekly" ||
       n === "argon:weekly" ||
+      n === "gemini-carbon-wtu-weekly" ||
+      n === "carbon:weekly" ||
       n.startsWith("gemini-4-argon") ||
       n.startsWith("gemini-4-neon") ||
+      n.startsWith("gemini-4-carbon") ||
       n.startsWith("claude-sonnet-5-5") ||
-      n.startsWith("claude-opus-5-5") ||
-      (n.startsWith("gemini-4-hydrogen") && !n.endsWith("sonar"))
+      n.startsWith("claude-opus-5-5")
     ) {
       isNextgen = true;
     }

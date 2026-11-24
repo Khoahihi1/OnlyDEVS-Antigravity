@@ -1055,9 +1055,9 @@ fn record_api_log(item: &ApiRequestLogItem) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AccountProfile {
-    /// Next-Gen / Full model accounts (Gemini 4 Argon / Neon / Hydrogen, Claude 5.5)
+    /// Next-Gen / Full model accounts (Gemini 4 Argon / Neon / Carbon, Claude 5.5)
     FullNextgen,
-    /// Classic accounts (Gemini 3.8 + Claude 4.6, no Argon / G4 / Claude 5.5)
+    /// ProLite / Classic accounts (Gemini 4 Hydrogen + Gemini 3.8 + Claude 4.6, no Argon / Neon / Carbon / Claude 5.5)
     Classic,
     /// Quota not yet fetched (no model inventory known)
     Unknown,
@@ -1109,11 +1109,13 @@ fn classify_account_profile(acc: &AntigravityAccount) -> AccountProfile {
         let lower = m.name.trim().to_ascii_lowercase();
         if lower == "gemini-argon-wtu-weekly"
             || lower == "argon:weekly"
+            || lower == "gemini-carbon-wtu-weekly"
+            || lower == "carbon:weekly"
             || lower.starts_with("gemini-4-argon")
             || lower.starts_with("gemini-4-neon")
+            || lower.starts_with("gemini-4-carbon")
             || lower.starts_with("claude-sonnet-5-5")
             || lower.starts_with("claude-opus-5-5")
-            || (lower.starts_with("gemini-4-hydrogen") && !lower.ends_with("sonar"))
         {
             return AccountProfile::FullNextgen;
         }

@@ -111,11 +111,13 @@ function classifyAccountModelProfile(acc: AntigravityAccount): {
     if (
       n === "gemini-argon-wtu-weekly" ||
       n === "argon:weekly" ||
+      n === "gemini-carbon-wtu-weekly" ||
+      n === "carbon:weekly" ||
       n.startsWith("gemini-4-argon") ||
       n.startsWith("gemini-4-neon") ||
+      n.startsWith("gemini-4-carbon") ||
       n.startsWith("claude-sonnet-5-5") ||
-      n.startsWith("claude-opus-5-5") ||
-      (n.startsWith("gemini-4-hydrogen") && !n.endsWith("sonar"))
+      n.startsWith("claude-opus-5-5")
     ) {
       isNextgen = true;
     }
@@ -946,13 +948,13 @@ print(resp.choices[0].message.content)`;
                 ) : null}
               </div>
 
-              {/* Group 2: ProLite Classic (G3.8 / Claude 4.6) */}
+              {/* Group 2: ProLite Classic (G4 Hydrogen / G3.8 / Claude 4.6) */}
               <div className="ag-api-quota-group is-classic">
                 <div className="ag-api-quota-group__head">
                   <div className="ag-api-quota-group__title">
                     <strong>
                       <Cpu size={14} />
-                      <span>ProLite · Classic (G3.8 / Claude 4.6)</span>
+                      <span>ProLite (Hydrogen / G3.8 / Claude 4.6)</span>
                     </strong>
                     <span>
                       {poolQuotaSummary.classicPro.accountCount > 0
@@ -1203,7 +1205,7 @@ print(resp.choices[0].message.content)`;
                       PRO · G4/Argon/C5.5: {status.poolFullNextgen}
                     </span>
                     <span className="ag-api-profile-pill is-classic">
-                      ProLite · 3.8/C4.6: {status.poolClassic}
+                      ProLite · Hydrogen/C4.6: {status.poolClassic}
                     </span>
                     {status.poolUnknown > 0 ? (
                       <span className="ag-api-profile-pill is-unknown">
@@ -1261,7 +1263,7 @@ print(resp.choices[0].message.content)`;
                               {profile.kind === "full_nextgen"
                                 ? "PRO · Argon/G4"
                                 : profile.kind === "classic"
-                                  ? "ProLite · 3.8/C4.6"
+                                  ? "ProLite · Hydrogen/C4.6"
                                   : vi
                                     ? "Chưa quét"
                                     : "Unscanned"}
@@ -2595,7 +2597,7 @@ print(resp.choices[0].message.content)`;
                         {prof.kind === "full_nextgen"
                           ? "PRO · Argon"
                           : prof.kind === "classic"
-                            ? "ProLite · 3.8/C4.6"
+                            ? "ProLite · Hydrogen/C4.6"
                             : vi
                               ? "Chưa quét"
                               : "Unscanned"}
@@ -2669,8 +2671,8 @@ print(resp.choices[0].message.content)`;
                     </option>
                     <option value="classic">
                       {vi
-                        ? "Chỉ ProLite · Classic (G3.8 / Claude 4.6 — giữ nguyên Argon/G4)"
-                        : "ProLite · Classic only (G3.8 / Claude 4.6)"}
+                        ? "Chỉ ProLite (Hydrogen / G3.8 / Claude 4.6 — giữ nguyên Argon/Carbon)"
+                        : "ProLite only (Hydrogen / G3.8 / Claude 4.6)"}
                     </option>
                     <option value="full_nextgen">
                       {vi

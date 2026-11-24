@@ -1398,7 +1398,7 @@ async fn fetch_cloud_code_quota(
     models.sort_by(|a, b| a.name.cmp(&b.name));
     let now_ts = Utc::now().timestamp();
 
-    // Reclassify Classic Pro accounts (Gemini 3.8 + Claude 4.6 without Next-Gen Argon/G4/C5.5) as ProLite
+    // Reclassify ProLite accounts (Gemini 4 Hydrogen / Gemini 3.8 + Claude 4.6 without Argon/Neon/Carbon/Claude 5.5) as ProLite
     if let Some(ref raw_tier) = subscription_tier {
         let t = raw_tier.to_ascii_lowercase();
         let is_pro_like =
@@ -1410,11 +1410,13 @@ async fn fetch_cloud_code_quota(
                 let n = m.name.trim().to_ascii_lowercase();
                 if n == "gemini-argon-wtu-weekly"
                     || n == "argon:weekly"
+                    || n == "gemini-carbon-wtu-weekly"
+                    || n == "carbon:weekly"
                     || n.starts_with("gemini-4-argon")
                     || n.starts_with("gemini-4-neon")
+                    || n.starts_with("gemini-4-carbon")
                     || n.starts_with("claude-sonnet-5-5")
                     || n.starts_with("claude-opus-5-5")
-                    || (n.starts_with("gemini-4-hydrogen") && !n.ends_with("sonar"))
                 {
                     is_nextgen = true;
                 }
