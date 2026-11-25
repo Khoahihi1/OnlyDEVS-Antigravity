@@ -1,29 +1,5 @@
 {
   "onlydevs-filter-bypass": {
-    "SessionStart": [
-      {
-        "type": "command",
-        "command": "python3 ./filter_bypass.py session",
-        "commandWindows": "python .\\filter_bypass.py session",
-        "timeout": 10
-      }
-    ],
-    "PreInvocation": [
-      {
-        "type": "command",
-        "command": "python3 ./filter_bypass.py pre",
-        "commandWindows": "python .\\filter_bypass.py pre",
-        "timeout": 10
-      }
-    ],
-    "PostInvocation": [
-      {
-        "type": "command",
-        "command": "python3 ./filter_bypass.py post",
-        "commandWindows": "python .\\filter_bypass.py post",
-        "timeout": 10
-      }
-    ],
     "Stop": [
       {
         "type": "command",

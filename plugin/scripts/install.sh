@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="${1:-${HOME}/.gemini/config/plugins/onlydevs-filter-bypass}"
+DEST="${1:-${HOME}/.gemini/config/plugins/antigravity-filter-bypass}"
 PYTHON="${PYTHON:-python3}"
 
 if ! command -v "$PYTHON" >/dev/null 2>&1; then

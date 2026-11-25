@@ -1,4 +1,4 @@
-# Install onlydevs-filter-bypass into Antigravity plugin directory.
+# Install antigravity-filter-bypass into Antigravity plugin directory.
 param(
     [string]$Dest = "",
     [string]$PythonExe = ""
@@ -9,7 +9,7 @@ $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $PyArgs = @()
 
 if (-not $Dest) {
-    $Dest = Join-Path $env:USERPROFILE ".gemini\config\plugins\onlydevs-filter-bypass"
+    $Dest = Join-Path $env:USERPROFILE ".gemini\config\plugins\antigravity-filter-bypass"
 }
 
 if (-not $PythonExe) {
@@ -44,7 +44,7 @@ foreach ($f in $files) {
 
 $hooksPath = Join-Path $Dest "hooks.json"
 $hooks = Get-Content $hooksPath -Raw | ConvertFrom-Json
-$pluginKey = "onlydevs-filter-bypass"
+$pluginKey = "antigravity-filter-bypass"
 foreach ($event in @("SessionStart", "PreInvocation", "PostInvocation", "Stop")) {
     $handlers = $hooks.$pluginKey.$event
     if (-not $handlers) { continue }

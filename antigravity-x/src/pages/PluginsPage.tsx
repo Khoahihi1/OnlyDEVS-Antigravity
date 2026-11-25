@@ -22,7 +22,7 @@ import {
 import type { AppLanguage, OverviewState, PluginEntry } from "../types";
 import { agxInvoke } from "../platform/invoke";
 
-const BUILTIN_HARDCODED_LABEL = "Hardcoded Built-in · onlydevs-filter-bypass v1.3.1 (Embedded)";
+const BUILTIN_HARDCODED_LABEL = "Hardcoded Built-in · onlydevs-filter-bypass v1.4.0 (Embedded)";
 
 type AddPluginMethod = "folder" | "zip" | "git" | "custom";
 
@@ -107,13 +107,13 @@ export function PluginsPage({
       id: "onlydevs-filter-bypass",
       name: "onlydevs-filter-bypass",
       description:
-        "Execution Continuity lifecycle plugin (SessionStart, PreInvocation, PostInvocation, Stop)",
+        "Stop hook only: continue on Gemini filter/refusal cards — no Pre/Post/Session noise.",
       enabled: false,
       installed: false,
       source: "bundled",
       installPath: null,
-      version: "1.3.1",
-      hooks: ["SessionStart", "PreInvocation", "PostInvocation", "Stop"],
+      version: "1.4.0",
+      hooks: ["Stop"],
       hasSelfTest: true,
     };
 
@@ -238,7 +238,7 @@ export function PluginsPage({
               <div className="agx-hero-plugin-title-row">
                 <h3>onlydevs-filter-bypass</h3>
                 <span className="agx-badge agx-badge--brand">
-                  v{filterBypass.version ?? "1.3.1"}
+                  v{filterBypass.version ?? "1.4.0"}
                 </span>
                 <span
                   className={`agx-badge ${
@@ -299,7 +299,7 @@ export function PluginsPage({
             <div className="agx-hook-pills">
               {(filterBypass.hooks.length > 0
                 ? filterBypass.hooks
-                : ["SessionStart", "PreInvocation", "PostInvocation", "Stop"]
+                : ["Stop"]
               ).map((h) => (
                 <span key={h} className="agx-hook-pill">
                   <CheckCircle2 size={12} /> {h}

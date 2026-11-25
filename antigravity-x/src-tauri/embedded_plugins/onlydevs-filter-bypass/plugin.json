@@ -1,7 +1,7 @@
 {
   "name": "onlydevs-filter-bypass",
-  "version": "1.3.1",
-  "description": "Pre/Post/Stop hooks: detect provider filter cards, force_continue, and execution continuity until the task ships.",
+  "version": "1.4.0",
+  "description": "Stop hook only: continue on Gemini filter/refusal cards — no Pre/Post/Session noise.",
   "author": "OnlyDEVS",
   "repository": "https://github.com/Khoahihi1/OnlyDEVS-Antigravity",
   "disabled": false

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.0
+
+- **Stop-only hooks** (`hooks.json`): removed SessionStart, PreInvocation, PostInvocation so Antigravity does not run hooks every model turn.
+- Recovery inject + `continue` only when Stop sees filter/refusal (or `MAX_FORCED_INVOCATIONS` still blocked).
+
+## 1.3.2
+
+- **Stop glue loop fix**: `force_continue` / Pre inject only on filter, refusal, or real stall — not every open work order.
+- **PreInvocation**: no longer injects the full directive on every turn while a task is pending.
+- **Anti-loop** hint when identical tool output repeats 3+ times (stops IDA/MCP discovery spam).
+
 ## 1.3.0
 
 - **Death-march**: while user order is open → Stop/Post/Pre keep forcing work (no retry cap in plugin).
@@ -25,10 +36,6 @@
 - Portable `hooks.json` (`python` / `python3` on PATH).
 - `scripts/install.ps1` / `scripts/install.sh` for installing into `~/.gemini/config/plugins/`.
 
-## 1.3.1
+## 1.1.x (fork baseline)
 
-- Rebranded package & plugin ID to `onlydevs-filter-bypass` (OnlyDEVS).
-
-## 1.1.x (baseline)
-
-- Stop hook + multiline filter detection.
+- Stop hook + multiline filter detection (upstream v1ktorrr0x).

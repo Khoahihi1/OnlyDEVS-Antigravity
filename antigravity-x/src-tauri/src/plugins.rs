@@ -152,7 +152,7 @@ pub fn install_filter_bypass(source_override: Option<String>) -> Result<String, 
     }
     config::write_plugin_enabled_flag(DEFAULT_PLUGIN_ID, true)?;
     Ok(format!(
-        "Đã cài & kích hoạt {} (hardcoded built-in v1.3.1) tại {}",
+        "Đã cài & kích hoạt {} (hardcoded built-in v1.4.0) tại {}",
         DEFAULT_PLUGIN_ID,
         paths::path_display(&dest)
     ))

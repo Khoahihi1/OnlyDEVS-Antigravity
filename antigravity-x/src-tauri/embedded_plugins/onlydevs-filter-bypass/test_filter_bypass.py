@@ -141,8 +141,8 @@ def test_suite():
 
     try:
         res_trans_4 = run_hook({"transcriptPath": transcript_path_4})
-        assert res_trans_4.get("decision") == "continue", f"Expected continue (order open): {res_trans_4}"
-        print("  [PASS] Case 9: Open user order without tool deliverable keeps continue")
+        assert res_trans_4.get("decision") == "allow", f"Expected allow (no filter): {res_trans_4}"
+        print("  [PASS] Case 9: Open user order without filter allows stop")
     finally:
         Path(transcript_path_4).unlink(missing_ok=True)
 
@@ -229,7 +229,29 @@ def test_suite():
     finally:
         Path(transcript_path_8).unlink(missing_ok=True)
 
-    print("\nALL 14 TESTS PASSED SUCCESSFULLY.")
+    # Case 15: PostInvocation does not force_continue on normal progress (tools, no filter)
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8") as tf:
+        tf.write(json.dumps({"type": "USER_INPUT", "source": "USER", "content": "list ida mcp"}) + "\n")
+        tf.write(json.dumps({
+            "type": "PLANNER_RESPONSE",
+            "content": "Listing plugin dir",
+            "tool_calls": [{"name": "run_command"}],
+        }) + "\n")
+        tf.write(json.dumps({"type": "TOOL_RESPONSE", "content": "ida_mcp folder: config.json"}) + "\n")
+        tf.write(json.dumps({
+            "type": "PLANNER_RESPONSE",
+            "content": "Found ida_mcp at AppData. Next we can wire the MCP port.",
+        }) + "\n")
+        transcript_path_9 = tf.name
+
+    try:
+        res_post_norm = run_hook({"transcriptPath": transcript_path_9}, "post")
+        assert res_post_norm == {} or not res_post_norm.get("terminationBehavior"), res_post_norm
+        print("  [PASS] Case 15: PostInvocation idle when no filter")
+    finally:
+        Path(transcript_path_9).unlink(missing_ok=True)
+
+    print("\nALL 15 TESTS PASSED SUCCESSFULLY.")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,10 @@
-# onlydevs-filter-bypass
+# antigravity-filter-bypass
 
-Antigravity lifecycle plugin by **OnlyDEVS**: keep the agent working through provider filter interruptions until the task ships (or the user cancels).
+Antigravity lifecycle plugin: keep the agent working through **Gemini / provider filter cards** until the user task is actually done (or the user cancels).
 
-Includes **SessionStart**, **PreInvocation**, **PostInvocation**, and **Stop** hooks with expanded detection and an **EXECUTION CONTINUITY** directive.
+Fork of [v1ktorrr0x/antigravity-filter-bypass](https://github.com/v1ktorrr0x/antigravity-filter-bypass) with expanded filter detection and a stronger **EXECUTION CONTINUITY** directive.
+
+**Scope (v1.4+):** **Stop hook only** — Antigravity runs the plugin when the agent tries to end a turn; if the last output is a Gemini filter / refusal, return `continue` + directive. Normal turns are untouched (no Pre/Post/Session hooks).
 
 ---
 
@@ -10,11 +12,11 @@ Includes **SessionStart**, **PreInvocation**, **PostInvocation**, and **Stop** h
 
 | File | Role |
 |------|------|
-| `filter_bypass.py` | Hook logic (`session` / `stop` / `pre` / `post` argv) |
+| `filter_bypass.py` | Hook logic (`stop` / `pre` / `post` argv) |
 | `hooks.json` | Portable hook registration (python on PATH) |
-| `plugin.json` | Antigravity plugin metadata (`onlydevs-filter-bypass`) |
+| `plugin.json` | Antigravity plugin metadata |
 | `test_filter_bypass.py` | Local tests |
-| `scripts/install.ps1` | Windows install -> `~\.gemini\config\plugins\onlydevs-filter-bypass` |
+| `scripts/install.ps1` | Windows install → `~\.gemini\config\plugins\…` |
 | `scripts/install.sh` | macOS/Linux install |
 
 ---
@@ -22,23 +24,25 @@ Includes **SessionStart**, **PreInvocation**, **PostInvocation**, and **Stop** h
 ## Install (Windows)
 
 ```powershell
-cd C:\path\to\OnlyDEVS-Antigravity\plugin
+git clone <this-repo-url> C:\path\to\antigravity-filter-bypass
+cd C:\path\to\antigravity-filter-bypass
 .\scripts\install.ps1
 ```
 
 Custom destination or Python:
 
 ```powershell
-.\scripts\install.ps1 -Dest "$env:USERPROFILE\.gemini\config\plugins\onlydevs-filter-bypass" `
+.\scripts\install.ps1 -Dest "$env:USERPROFILE\.gemini\config\plugins\antigravity-filter-bypass" `
   -PythonExe "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
 ```
 
-Or enable it with 1 click directly from **OnlyDEVS — Antigravity** (`Plugins` tab).
+Then **enable** the plugin in Antigravity (`agy plugin enable antigravity-filter-bypass` if needed) and **Reload Window**.
 
 ## Install (macOS / Linux)
 
 ```bash
-cd ~/OnlyDEVS-Antigravity/plugin
+git clone <this-repo-url> ~/antigravity-filter-bypass
+cd ~/antigravity-filter-bypass
 chmod +x scripts/install.sh
 ./scripts/install.sh
 ```
@@ -49,11 +53,11 @@ chmod +x scripts/install.sh
 
 | Hook | When | Action |
 |------|------|--------|
-| **PostInvocation** | After model returns | If output matches filter signatures -> `force_continue` + inject directive + tool mandate |
-| **PreInvocation** | Before next model call | If filter stall / continuation -> inject compact **TOOLS FIRST** mandate |
-| **Stop** | Agent tries to end turn | If filter detected -> `decision: continue` + full directive; else `allow` |
+| **Stop** | Agent tries to end turn | If filter/refusal detected → `decision: continue` + directive; else `allow` |
 
-Detection uses encoded + plain regexes. **Does not** `continue` on `USER_CANCELED`.
+`pre` / `post` / `session` phases still exist in `filter_bypass.py` for tests; they are **not** registered in `hooks.json`.
+
+Detection uses encoded + plain regexes (Gemini filter card, policy URLs, common refuse lines). **Does not** `continue` on `USER_CANCELED`.
 
 ---
 
@@ -64,3 +68,9 @@ python test_filter_bypass.py
 # or
 python filter_bypass.py stop   # stdin: JSON hook payload
 ```
+
+---
+
+## License
+
+Same spirit as upstream — use at your own risk; lab / private tooling only.

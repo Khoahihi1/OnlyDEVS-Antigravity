@@ -275,14 +275,9 @@ pub fn list_plugins() -> Result<Vec<PluginEntry>, String> {
         } else {
             PluginManifestMeta {
                 name: Some("onlydevs-filter-bypass".into()),
-                description: Some("Execution continuity lifecycle hook for Antigravity".into()),
-                version: Some("1.3.1".into()),
-                hooks: vec![
-                    "SessionStart".into(),
-                    "PreInvocation".into(),
-                    "PostInvocation".into(),
-                    "Stop".into(),
-                ],
+                description: Some("Stop hook only: continue on Gemini filter/refusal cards — no Pre/Post/Session noise.".into()),
+                version: Some("1.4.0".into()),
+                hooks: vec!["Stop".into()],
                 has_self_test: true,
             }
         };

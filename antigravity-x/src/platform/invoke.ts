@@ -72,13 +72,13 @@ let mockPlugins: PluginEntry[] = [
     id: "onlydevs-filter-bypass",
     name: "onlydevs-filter-bypass",
     description:
-      "Execution Continuity lifecycle hook (SessionStart, PreInvocation, PostInvocation, Stop) giữ agent thực thi xuyên qua filter card.",
+      "Stop hook only: continue on Gemini filter/refusal cards — no Pre/Post/Session noise.",
     enabled: true,
     installed: true,
     source: "bundled",
     installPath: "C:/Users/KhoaHihi/.gemini/config/plugins/onlydevs-filter-bypass",
-    version: "1.3.1",
-    hooks: ["SessionStart", "PreInvocation", "PostInvocation", "Stop"],
+    version: "1.4.0",
+    hooks: ["Stop"],
     hasSelfTest: true,
   },
   {
