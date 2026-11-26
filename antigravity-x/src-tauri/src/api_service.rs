@@ -163,6 +163,9 @@ pub struct ApiServiceConfig {
     /// Clean Tool Schema (default OFF): when true, send exact IDE tool names without _ide cloaking or 21 decoy tools
     #[serde(default)]
     pub clean_tool_schema: bool,
+    /// Compact older tool outputs (keep last 4 verbatim) to prevent context bloat & IDE auto-compact
+    #[serde(default = "default_true")]
+    pub compact_tool_history: bool,
     pub timeout_seconds: u64,
     pub max_retries: u32,
     pub cooldown_seconds: u64,
@@ -186,6 +189,7 @@ impl Default for ApiServiceConfig {
             fast_mode: false,
             priority_tier: true,
             clean_tool_schema: false,
+            compact_tool_history: true,
             timeout_seconds: 180,
             max_retries: 2,
             cooldown_seconds: 60,
@@ -2355,6 +2359,17 @@ fn openai_body_to_antigravity_envelope(
         .and_then(Value::as_array)
         .is_some_and(|a| !a.is_empty());
 
+    let total_tool_msgs = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|msgs| {
+            msgs.iter()
+                .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+                .count()
+        })
+        .unwrap_or(0);
+    let mut seen_tool_msgs = 0usize;
+
     if let Some(msgs) = body.get("messages").and_then(Value::as_array) {
         for m in msgs {
             if m.get("role").and_then(Value::as_str) == Some("assistant") {
@@ -2462,6 +2477,8 @@ fn openai_body_to_antigravity_envelope(
                     }
                 }
                 "tool" => {
+                    let is_recent_tool = seen_tool_msgs + 4 >= total_tool_msgs;
+                    seen_tool_msgs += 1;
                     let tc_id = m.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
                     let name = tool_id_to_name
                         .get(tc_id)
@@ -2478,8 +2495,20 @@ fn openai_body_to_antigravity_envelope(
                         sanitized
                     };
                     let raw_text = extract_text_from_value(content);
-                    let parsed = serde_json::from_str::<Value>(&raw_text)
-                        .unwrap_or_else(|_| json!({ "result": raw_text }));
+                    let parsed = if cfg.compact_tool_history && !is_recent_tool && raw_text.len() > 2_000 {
+                        let line_count = raw_text.lines().count();
+                        let char_count = raw_text.chars().count();
+                        let preview: String = raw_text.chars().take(360).collect();
+                        json!({
+                            "compacted": true,
+                            "summary": format!(
+                                "[Earlier tool output ({name}, {line_count} lines / {char_count} chars) compacted — re-read if needed]\n{preview}..."
+                            )
+                        })
+                    } else {
+                        serde_json::from_str::<Value>(&raw_text)
+                            .unwrap_or_else(|_| json!({ "result": raw_text }))
+                    };
                     let resp_obj = json!({ "result": parsed });
                     contents.push(json!({
                         "role": "user",
@@ -4463,7 +4492,10 @@ async fn handle_single_request(
                                 "usage": {
                                     "prompt_tokens": total_in,
                                     "completion_tokens": total_out + total_think,
-                                    "total_tokens": total_in + total_out + total_think
+                                    "total_tokens": total_in + total_out + total_think,
+                                    "prompt_tokens_details": {
+                                        "cached_tokens": total_cache
+                                    }
                                 }
                             });
                             tail.push_str(&format!("data: {done_frame}\n\ndata: [DONE]\n\n"));
@@ -4611,7 +4643,10 @@ async fn handle_single_request(
                         "usage": {
                             "prompt_tokens": total_in,
                             "completion_tokens": total_out + total_think,
-                            "total_tokens": total_in + total_out + total_think
+                            "total_tokens": total_in + total_out + total_think,
+                            "prompt_tokens_details": {
+                                "cached_tokens": total_cache
+                            }
                         }
                     });
                     keep_open = write_json_response_ka(stream, 200, &out_json, keep_alive).await
@@ -6074,6 +6109,40 @@ mod tests {
             env.pointer("/request/generationConfig/maxOutputTokens")
                 .and_then(Value::as_u64),
             Some(32_768)
+        );
+    }
+
+    #[test]
+    fn compacts_older_large_tool_outputs_while_keeping_last_four_verbatim() {
+        let big = "line\n".repeat(700); // > 2000 chars
+        let body = json!({
+            "messages": [
+                { "role": "user", "content": "Review" },
+                { "role": "tool", "tool_call_id": "t1", "name": "read", "content": big },
+                { "role": "tool", "tool_call_id": "t2", "name": "read", "content": "recent 2" },
+                { "role": "tool", "tool_call_id": "t3", "name": "read", "content": "recent 3" },
+                { "role": "tool", "tool_call_id": "t4", "name": "read", "content": "recent 4" },
+                { "role": "tool", "tool_call_id": "t5", "name": "read", "content": big }
+            ]
+        });
+        let cfg = ApiServiceConfig::default();
+        assert!(cfg.compact_tool_history);
+        let (env, _, _) =
+            openai_body_to_antigravity_envelope(&body, "gemini-4-argon-high", "p1", "k1", &cfg);
+        let parts = env
+            .pointer("/request/contents/0/parts")
+            .and_then(Value::as_array)
+            .unwrap();
+        // parts[0] = "Review", parts[1] = t1 (oldest, >2000 chars) is compacted
+        assert_eq!(
+            parts[1].pointer("/functionResponse/response/result/compacted").and_then(Value::as_bool),
+            Some(true)
+        );
+        // parts[5] = t5 (within last 4) stays verbatim even though >2000 chars
+        assert!(parts[5].pointer("/functionResponse/response/result/compacted").is_none());
+        assert_eq!(
+            parts[5].pointer("/functionResponse/response/result/result").and_then(Value::as_str),
+            Some(big.as_str())
         );
     }
 }

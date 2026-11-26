@@ -1593,6 +1593,24 @@ print(resp.choices[0].message.content)`;
               <label className="ag-select-all-label">
                 <input
                   type="checkbox"
+                  checked={cfgDraft.compactToolHistory ?? true}
+                  onChange={(e) =>
+                    setCfgDraft({
+                      ...cfgDraft,
+                      compactToolHistory: e.target.checked,
+                    })
+                  }
+                />
+                <span>
+                  {vi
+                    ? "Nén lịch sử Tool cũ (giữ nguyên 4 lượt tool gần nhất — giảm 50–80% context & tránh auto-compact)"
+                    : "Compact Older Tool Outputs (keep last 4 verbatim — cuts 50–80% context & avoids auto-compact)"}
+                </span>
+              </label>
+
+              <label className="ag-select-all-label">
+                <input
+                  type="checkbox"
                   checked={cfgDraft.preserveExclusiveAccounts ?? true}
                   onChange={(e) =>
                     setCfgDraft({

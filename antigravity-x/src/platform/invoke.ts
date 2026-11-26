@@ -306,6 +306,7 @@ let mockApiConfig: ApiServiceConfig = {
   fastMode: false,
   priorityTier: true,
   cleanToolSchema: false,
+  compactToolHistory: true,
   timeoutSeconds: 180,
   maxRetries: 3,
   cooldownSeconds: 60,

@@ -642,6 +642,7 @@ export type ApiServiceConfig = {
   fastMode: boolean;
   priorityTier: boolean;
   cleanToolSchema: boolean;
+  compactToolHistory: boolean;
   timeoutSeconds: number;
   maxRetries: number;
   cooldownSeconds: number;
