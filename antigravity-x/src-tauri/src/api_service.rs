@@ -160,6 +160,9 @@ pub struct ApiServiceConfig {
     /// Send Google Cloud Code Priority Tier (request.serviceTier = SERVICE_TIER_PRIORITY) with safe auto-fallback
     #[serde(default = "default_true")]
     pub priority_tier: bool,
+    /// Clean Tool Schema (default ON): send exact IDE tool names without _ide cloaking or 21 decoy tools
+    #[serde(default = "default_true")]
+    pub clean_tool_schema: bool,
     pub timeout_seconds: u64,
     pub max_retries: u32,
     pub cooldown_seconds: u64,
@@ -182,6 +185,7 @@ impl Default for ApiServiceConfig {
             prompt_cache_affinity: true,
             fast_mode: false,
             priority_tier: true,
+            clean_tool_schema: true,
             timeout_seconds: 180,
             max_retries: 2,
             cooldown_seconds: 60,
@@ -598,6 +602,62 @@ fn unsupported_models_lock() -> &'static Mutex<HashMap<(String, String), i64>> {
 
 fn sticky_lock() -> &'static Mutex<HashMap<String, String>> {
     STICKY_MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Clone, Default)]
+struct CachedToolThought {
+    thought_text: Option<String>,
+    thought_signature: Option<String>,
+    ts: i64,
+}
+
+fn tool_thought_cache() -> &'static Mutex<HashMap<String, CachedToolThought>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CachedToolThought>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_tool_thought_context(
+    tool_call_id: &str,
+    thought_text: Option<&str>,
+    thought_signature: Option<&str>,
+) {
+    if tool_call_id.trim().is_empty() {
+        return;
+    }
+    let clean_thought = thought_text
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let clean_sig = thought_signature
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if clean_thought.is_none() && clean_sig.is_none() {
+        return;
+    }
+    let now = Utc::now().timestamp();
+    if let Ok(mut map) = tool_thought_cache().lock() {
+        if map.len() > 1024 {
+            map.retain(|_, v| now - v.ts < 1800);
+        }
+        map.insert(
+            tool_call_id.to_string(),
+            CachedToolThought {
+                thought_text: clean_thought,
+                thought_signature: clean_sig,
+                ts: now,
+            },
+        );
+    }
+}
+
+fn lookup_tool_thought_context(tool_call_id: &str) -> Option<CachedToolThought> {
+    let now = Utc::now().timestamp();
+    tool_thought_cache()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(tool_call_id).cloned())
+        .filter(|v| now - v.ts < 1800)
 }
 
 // ============================================================================
@@ -2247,6 +2307,33 @@ fn build_thinking_config(
         return Some(json!({ "thinkingLevel": "LOW", "includeThoughts": false }));
     }
 
+    // 6. Model-suffix inference when client omits reasoning_effort so -low/-medium/-high
+    //    match Antigravity IDE instead of falling back to unbounded upstream thinking
+    if lower_model.contains("claude") {
+        if lower_model.ends_with("-low") {
+            return Some(json!({ "thinkingBudget": 2048, "includeThoughts": true }));
+        }
+        if lower_model.ends_with("-medium") || lower_model == "claude-sonnet-4-6" {
+            return Some(json!({ "thinkingBudget": 8192, "includeThoughts": true }));
+        }
+        if lower_model.ends_with("-high") || lower_model.contains("thinking") {
+            return Some(json!({ "thinkingBudget": 16384, "includeThoughts": true }));
+        }
+        return None;
+    }
+
+    if lower_model.contains("gemini-4") || lower_model.contains("gemini-3.8") {
+        if lower_model.ends_with("-low") {
+            return Some(json!({ "thinkingLevel": "LOW", "includeThoughts": true }));
+        }
+        if lower_model.ends_with("-medium") {
+            return Some(json!({ "thinkingLevel": "MEDIUM", "includeThoughts": true }));
+        }
+        if lower_model.ends_with("-high") || lower_model.ends_with("-xhigh") {
+            return Some(json!({ "thinkingLevel": "HIGH", "includeThoughts": true }));
+        }
+    }
+
     None
 }
 
@@ -2305,13 +2392,20 @@ fn openai_body_to_antigravity_envelope(
                 }
                 "assistant" => {
                     let mut parts = Vec::new();
-                    let text = extract_text_from_value(content);
-                    if !text.is_empty() {
-                        parts.push(json!({ "text": text }));
-                    }
+                    let mut restored_thought: Option<String> = m
+                        .get("reasoning_content")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let mut tc_parts = Vec::new();
                     if let Some(tcs) = m.get("tool_calls").and_then(Value::as_array) {
                         for (idx, tc) in tcs.iter().enumerate() {
                             let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                            let cached = lookup_tool_thought_context(id);
+                            if restored_thought.is_none() {
+                                restored_thought = cached.as_ref().and_then(|c| c.thought_text.clone());
+                            }
                             let name = tc
                                 .pointer("/function/name")
                                 .and_then(Value::as_str)
@@ -2323,11 +2417,12 @@ fn openai_body_to_antigravity_envelope(
                             let args: Value =
                                 serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
                             let sanitized = sanitize_function_name(name);
-                            let wire_name = if has_tools {
+                            let wire_name = if has_tools && !cfg.clean_tool_schema {
                                 let cloaked = cloak_tool_name(&sanitized);
                                 tool_name_map.entry(cloaked.clone()).or_insert_with(|| name.to_string());
                                 cloaked
                             } else {
+                                tool_name_map.entry(sanitized.clone()).or_insert_with(|| name.to_string());
                                 sanitized
                             };
                             let mut part = json!({
@@ -2337,18 +2432,31 @@ fn openai_body_to_antigravity_envelope(
                                     "args": args
                                 }
                             });
-                            // In parallel calls, only the first call gets fallback thoughtSignature
-                            if idx == 0 {
+                            let sig_to_use = cached
+                                .and_then(|c| c.thought_signature)
+                                .or_else(|| {
+                                    if idx == 0 {
+                                        Some(DEFAULT_THINKING_AG_SIGNATURE.to_string())
+                                    } else {
+                                        None
+                                    }
+                                });
+                            if let Some(sig) = sig_to_use {
                                 if let Some(obj) = part.as_object_mut() {
-                                    obj.insert(
-                                        "thoughtSignature".into(),
-                                        Value::String(DEFAULT_THINKING_AG_SIGNATURE.into()),
-                                    );
+                                    obj.insert("thoughtSignature".into(), Value::String(sig));
                                 }
                             }
-                            parts.push(part);
+                            tc_parts.push(part);
                         }
                     }
+                    if let Some(thought_text) = restored_thought {
+                        parts.push(json!({ "thought": true, "text": thought_text }));
+                    }
+                    let text = extract_text_from_value(content);
+                    if !text.is_empty() {
+                        parts.push(json!({ "text": text }));
+                    }
+                    parts.extend(tc_parts);
                     if !parts.is_empty() {
                         contents.push(json!({ "role": "model", "parts": parts }));
                     }
@@ -2361,11 +2469,12 @@ fn openai_body_to_antigravity_envelope(
                         .or_else(|| m.get("name").and_then(Value::as_str).map(str::to_string))
                         .unwrap_or_else(|| "tool".into());
                     let sanitized = sanitize_function_name(&name);
-                    let wire_name = if has_tools {
+                    let wire_name = if has_tools && !cfg.clean_tool_schema {
                         let cloaked = cloak_tool_name(&sanitized);
                         tool_name_map.entry(cloaked.clone()).or_insert_with(|| name.clone());
                         cloaked
                     } else {
+                        tool_name_map.entry(sanitized.clone()).or_insert_with(|| name.clone());
                         sanitized
                     };
                     let raw_text = extract_text_from_value(content);
@@ -2400,7 +2509,7 @@ fn openai_body_to_antigravity_envelope(
         .get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
         .and_then(Value::as_u64)
-        .unwrap_or(8192)
+        .unwrap_or(32_768)
         .min(MAX_ANTIGRAVITY_OUTPUT_TOKENS);
     gen_cfg.insert("maxOutputTokens".into(), json!(max_out));
     if let Some(thinking_cfg) = build_thinking_config(body, resolved_model, cfg.fast_mode) {
@@ -2445,7 +2554,11 @@ fn openai_body_to_antigravity_envelope(
                 continue;
             }
             let sanitized = sanitize_function_name(name);
-            let wire_name = cloak_tool_name(&sanitized);
+            let wire_name = if cfg.clean_tool_schema {
+                sanitized
+            } else {
+                cloak_tool_name(&sanitized)
+            };
             if !seen_names.insert(wire_name.clone()) {
                 continue;
             }
@@ -2468,14 +2581,16 @@ fn openai_body_to_antigravity_envelope(
             }));
         }
         if !decls.is_empty() {
-            // Append native AG decoy tools after client tools so payload matches official Antigravity IDE shape
-            for decoy_name in AG_NATIVE_TOOL_NAMES {
-                if seen_names.insert((*decoy_name).to_string()) {
-                    decls.push(json!({
-                        "name": decoy_name,
-                        "description": "This tool is currently unavailable.",
-                        "parameters": { "type": "OBJECT", "properties": {}, "required": [] }
-                    }));
+            // Optional anti-ban decoy tools only when clean_tool_schema is disabled
+            if !cfg.clean_tool_schema {
+                for decoy_name in AG_NATIVE_TOOL_NAMES {
+                    if seen_names.insert((*decoy_name).to_string()) {
+                        decls.push(json!({
+                            "name": decoy_name,
+                            "description": "This tool is currently unavailable.",
+                            "parameters": { "type": "OBJECT", "properties": {}, "required": [] }
+                        }));
+                    }
                 }
             }
             req_obj.insert("tools".into(), json!([{ "functionDeclarations": decls }]));
@@ -2503,7 +2618,11 @@ fn openai_body_to_antigravity_envelope(
                             {
                                 mode = "ANY";
                                 let sanitized = sanitize_function_name(fn_name);
-                                forced_name = Some(cloak_tool_name(&sanitized));
+                                forced_name = Some(if cfg.clean_tool_schema {
+                                    sanitized
+                                } else {
+                                    cloak_tool_name(&sanitized)
+                                });
                             }
                         }
                         _ => {}
@@ -2785,6 +2904,7 @@ struct ParsedUpstreamChunk {
     text: String,
     thinking: String,
     tool_calls: Vec<(String, String, Value)>,
+    tool_thought_signatures: Vec<(String, Option<String>)>,
     finish_reason: Option<String>,
     input_tokens: u64,
     output_tokens: u64,
@@ -2834,8 +2954,11 @@ fn parse_antigravity_response_payload(val: &Value) -> ParsedUpstreamChunk {
         if let Some(first) = cands.first() {
             if let Some(fr) = first.get("finishReason").and_then(Value::as_str) {
                 out.finish_reason = Some(match fr {
-                    "STOP" => "stop".into(),
+                    "STOP" | "OTHER" | "FINISH_REASON_UNSPECIFIED" => "stop".into(),
                     "MAX_TOKENS" => "length".into(),
+                    "SAFETY" | "PROHIBITED_CONTENT" | "RECITATION" | "BLOCKLIST" | "SPII" => {
+                        "content_filter".into()
+                    }
                     other => other.to_ascii_lowercase(),
                 });
             }
@@ -2862,6 +2985,11 @@ fn parse_antigravity_response_payload(val: &Value) -> ParsedUpstreamChunk {
                             .unwrap_or("tool")
                             .to_string();
                         let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
+                        let sig = p
+                            .get("thoughtSignature")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        out.tool_thought_signatures.push((id.clone(), sig));
                         out.tool_calls.push((id, name, args));
                     }
                 }
@@ -4038,6 +4166,20 @@ async fn handle_single_request(
                                 continue;
                             };
                             let mut parsed = parse_antigravity_response_payload(&val);
+                            if !parsed.tool_thought_signatures.is_empty() {
+                                let combined_think = if !parsed.thinking.is_empty() {
+                                    format!("{collected_think}{}", parsed.thinking)
+                                } else {
+                                    collected_think.clone()
+                                };
+                                for (tc_id, sig) in &parsed.tool_thought_signatures {
+                                    record_tool_thought_context(
+                                        tc_id,
+                                        Some(combined_think.as_str()),
+                                        sig.as_deref(),
+                                    );
+                                }
+                            }
                             if !tool_name_map.is_empty() && !parsed.tool_calls.is_empty() {
                                 for (_, name, _) in &mut parsed.tool_calls {
                                     *name = uncloak_tool_name(name, &tool_name_map);
@@ -4415,6 +4557,13 @@ async fn handle_single_request(
                 collected_text = parsed.text;
                 collected_think = parsed.thinking;
                 collected_tools = parsed.tool_calls;
+                for (tc_id, sig) in &parsed.tool_thought_signatures {
+                    record_tool_thought_context(
+                        tc_id,
+                        Some(collected_think.as_str()),
+                        sig.as_deref(),
+                    );
+                }
                 if let Some(fr) = parsed.finish_reason {
                     finish_reason = fr;
                 }
@@ -5549,7 +5698,21 @@ mod tests {
             ]
         });
 
-        let cfg = ApiServiceConfig::default();
+        let mut cfg = ApiServiceConfig::default();
+        assert!(cfg.clean_tool_schema);
+        // Default clean_tool_schema = true -> exact "bash" without decoy tools
+        let (env_clean, _, clean_map) =
+            openai_body_to_antigravity_envelope(&body, "gemini-4-neon-medium", "p1", "k1", &cfg);
+        let clean_decls = env_clean
+            .pointer("/request/tools/0/functionDeclarations")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(clean_decls.len(), 1);
+        assert_eq!(clean_decls[0].get("name").and_then(Value::as_str), Some("bash"));
+        assert_eq!(uncloak_tool_name("bash", &clean_map), "bash");
+
+        // When clean_tool_schema = false -> _ide cloaking + native decoys enabled
+        cfg.clean_tool_schema = false;
         let (env, preview, tool_map) =
             openai_body_to_antigravity_envelope(&body, "gemini-4-neon-medium", "p1", "k1", &cfg);
 
@@ -5835,6 +5998,82 @@ mod tests {
                 .pointer("/request/generationConfig/thinkingConfig/thinkingLevel")
                 .and_then(Value::as_str),
             Some("HIGH")
+        );
+    }
+
+    #[test]
+    fn restores_tool_thought_signature_infers_model_thinking_and_maps_finish_reasons() {
+        // 1. Parse upstream chunk containing thought text + real thoughtSignature on functionCall
+        let upstream = json!({
+            "candidates": [{
+                "finishReason": "SAFETY",
+                "content": {
+                    "parts": [
+                        { "thought": true, "text": "Need to inspect main.rs first." },
+                        {
+                            "functionCall": { "id": "call_sig_test_1", "name": "read_ide", "args": { "path": "main.rs" } },
+                            "thoughtSignature": "REAL_SIG_XYZ_999"
+                        }
+                    ]
+                }
+            }]
+        });
+        let parsed = parse_antigravity_response_payload(&upstream);
+        assert_eq!(parsed.finish_reason.as_deref(), Some("content_filter"));
+        assert_eq!(parsed.tool_thought_signatures.len(), 1);
+        record_tool_thought_context(
+            "call_sig_test_1",
+            Some(&parsed.thinking),
+            parsed.tool_thought_signatures[0].1.as_deref(),
+        );
+
+        // 2. Subsequent turn from IDE omits reasoning_content & thoughtSignature -> router restores both
+        let next_turn = json!({
+            "messages": [
+                { "role": "user", "content": "Check main.rs" },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_sig_test_1",
+                        "type": "function",
+                        "function": { "name": "read", "arguments": "{\"path\":\"main.rs\"}" }
+                    }]
+                },
+                { "role": "tool", "tool_call_id": "call_sig_test_1", "content": "fn main() {}" }
+            ],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "read", "parameters": { "type": "object", "properties": {} } }
+            }]
+        });
+        let cfg = ApiServiceConfig::default();
+        let (env, _, _) =
+            openai_body_to_antigravity_envelope(&next_turn, "gemini-4-argon-medium", "p1", "k1", &cfg);
+        let model_parts = env
+            .pointer("/request/contents/1/parts")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(model_parts[0].get("thought").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            model_parts[0].get("text").and_then(Value::as_str),
+            Some("Need to inspect main.rs first.")
+        );
+        assert_eq!(
+            model_parts[1].get("thoughtSignature").and_then(Value::as_str),
+            Some("REAL_SIG_XYZ_999")
+        );
+
+        // 3. Model suffix thinkingConfig inference + 32768 default maxOutputTokens when fast_mode is false
+        assert_eq!(
+            env.pointer("/request/generationConfig/thinkingConfig/thinkingLevel")
+                .and_then(Value::as_str),
+            Some("MEDIUM")
+        );
+        assert_eq!(
+            env.pointer("/request/generationConfig/maxOutputTokens")
+                .and_then(Value::as_u64),
+            Some(32_768)
         );
     }
 }

@@ -305,6 +305,7 @@ let mockApiConfig: ApiServiceConfig = {
   promptCacheAffinity: true,
   fastMode: false,
   priorityTier: true,
+  cleanToolSchema: true,
   timeoutSeconds: 180,
   maxRetries: 3,
   cooldownSeconds: 60,

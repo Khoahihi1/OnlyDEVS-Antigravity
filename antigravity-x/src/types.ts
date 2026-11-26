@@ -641,6 +641,7 @@ export type ApiServiceConfig = {
   promptCacheAffinity: boolean;
   fastMode: boolean;
   priorityTier: boolean;
+  cleanToolSchema: boolean;
   timeoutSeconds: number;
   maxRetries: number;
   cooldownSeconds: number;

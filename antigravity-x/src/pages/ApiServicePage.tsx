@@ -1575,6 +1575,24 @@ print(resp.choices[0].message.content)`;
               <label className="ag-select-all-label">
                 <input
                   type="checkbox"
+                  checked={cfgDraft.cleanToolSchema ?? true}
+                  onChange={(e) =>
+                    setCfgDraft({
+                      ...cfgDraft,
+                      cleanToolSchema: e.target.checked,
+                    })
+                  }
+                />
+                <span>
+                  {vi
+                    ? "Clean Tool Schema (giữ nguyên tên tool IDE & bỏ 21 Decoy Tools — gọi tool chuẩn, ít token hơn; tắt nếu gặp 429 giả)"
+                    : "Clean Tool Schema (keep native IDE tool names & skip 21 decoy tools — cleaner tool calls; turn off if fake 429 occurs)"}
+                </span>
+              </label>
+
+              <label className="ag-select-all-label">
+                <input
+                  type="checkbox"
                   checked={cfgDraft.preserveExclusiveAccounts ?? true}
                   onChange={(e) =>
                     setCfgDraft({
