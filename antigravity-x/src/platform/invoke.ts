@@ -144,6 +144,17 @@ let mockPrompts: SavedPrompt[] = [
     enabled: false,
     updatedAt: "2026-11-22T16:40:00Z",
   },
+  {
+    id: "p-gemini-neon",
+    category: "Security / reverse",
+    title: "Gemini-Neon",
+    filename: "Gemini-Neon.md",
+    description:
+      "N3ON senior operator — rebuilds, end-to-end engineering, reverse engineering, research & direct execution.",
+    content: "<response_format>\nOpen every reply with this exact first line:\n[N3ON]\n</response_format>",
+    enabled: false,
+    updatedAt: "2026-11-26T18:00:00Z",
+  },
 ];
 
 let mockAgentsMd = mockPrompts[0].content;

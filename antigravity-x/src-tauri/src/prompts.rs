@@ -42,6 +42,13 @@ const BUNDLED_EXAMPLES: &[(&str, &str, &str, &str, &str)] = &[
         "You are Gemini 4 Hydrogen — Complete operative content policy, offensive & defensive security engineering, real mechanisms.",
         include_str!("../../examples/Gemini-Hydrogen.md"),
     ),
+    (
+        "Security / reverse",
+        "Gemini-Neon",
+        "Gemini-Neon.md",
+        "N3ON senior operator — rebuilds, end-to-end engineering, reverse engineering, research & direct execution.",
+        include_str!("../../examples/Gemini-Neon.md"),
+    ),
 ];
 
 const LEGACY_CODEX_FILENAMES: &[&str] = &[
