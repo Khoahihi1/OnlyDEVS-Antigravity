@@ -160,8 +160,8 @@ pub struct ApiServiceConfig {
     /// Send Google Cloud Code Priority Tier (request.serviceTier = SERVICE_TIER_PRIORITY) with safe auto-fallback
     #[serde(default = "default_true")]
     pub priority_tier: bool,
-    /// Clean Tool Schema (default ON): send exact IDE tool names without _ide cloaking or 21 decoy tools
-    #[serde(default = "default_true")]
+    /// Clean Tool Schema (default OFF): when true, send exact IDE tool names without _ide cloaking or 21 decoy tools
+    #[serde(default)]
     pub clean_tool_schema: bool,
     pub timeout_seconds: u64,
     pub max_retries: u32,
@@ -185,7 +185,7 @@ impl Default for ApiServiceConfig {
             prompt_cache_affinity: true,
             fast_mode: false,
             priority_tier: true,
-            clean_tool_schema: true,
+            clean_tool_schema: false,
             timeout_seconds: 180,
             max_retries: 2,
             cooldown_seconds: 60,
@@ -5699,8 +5699,13 @@ mod tests {
         });
 
         let mut cfg = ApiServiceConfig::default();
-        assert!(cfg.clean_tool_schema);
-        // Default clean_tool_schema = true -> exact "bash" without decoy tools
+        assert!(!cfg.clean_tool_schema);
+        // Default clean_tool_schema = false -> _ide cloaking + native decoys enabled
+        let (env, preview, tool_map) =
+            openai_body_to_antigravity_envelope(&body, "gemini-4-neon-medium", "p1", "k1", &cfg);
+
+        // When clean_tool_schema = true -> exact "bash" without decoy tools
+        cfg.clean_tool_schema = true;
         let (env_clean, _, clean_map) =
             openai_body_to_antigravity_envelope(&body, "gemini-4-neon-medium", "p1", "k1", &cfg);
         let clean_decls = env_clean
@@ -5710,11 +5715,6 @@ mod tests {
         assert_eq!(clean_decls.len(), 1);
         assert_eq!(clean_decls[0].get("name").and_then(Value::as_str), Some("bash"));
         assert_eq!(uncloak_tool_name("bash", &clean_map), "bash");
-
-        // When clean_tool_schema = false -> _ide cloaking + native decoys enabled
-        cfg.clean_tool_schema = false;
-        let (env, preview, tool_map) =
-            openai_body_to_antigravity_envelope(&body, "gemini-4-neon-medium", "p1", "k1", &cfg);
 
         // 1. Chat envelope MUST omit requestType (prevents Google fake 429)
         assert!(env.get("requestType").is_none());

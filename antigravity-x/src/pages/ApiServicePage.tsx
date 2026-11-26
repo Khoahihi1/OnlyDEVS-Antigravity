@@ -1575,18 +1575,18 @@ print(resp.choices[0].message.content)`;
               <label className="ag-select-all-label">
                 <input
                   type="checkbox"
-                  checked={cfgDraft.cleanToolSchema ?? true}
+                  checked={!(cfgDraft.cleanToolSchema ?? false)}
                   onChange={(e) =>
                     setCfgDraft({
                       ...cfgDraft,
-                      cleanToolSchema: e.target.checked,
+                      cleanToolSchema: !e.target.checked,
                     })
                   }
                 />
                 <span>
                   {vi
-                    ? "Clean Tool Schema (giữ nguyên tên tool IDE & bỏ 21 Decoy Tools — gọi tool chuẩn, ít token hơn; tắt nếu gặp 429 giả)"
-                    : "Clean Tool Schema (keep native IDE tool names & skip 21 decoy tools — cleaner tool calls; turn off if fake 429 occurs)"}
+                    ? "Ngụy trang Tool chống 429 (kèm 21 Decoy Tools & _ide — mặc định BẬT; tắt để gửi tên tool IDE gốc)"
+                    : "Tool Cloaking Anti-429 (21 decoy tools & _ide — default ON; turn off for clean native IDE tool names)"}
                 </span>
               </label>
 
