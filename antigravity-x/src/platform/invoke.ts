@@ -9,6 +9,8 @@ import type {
   ApiServiceStatus,
   ApiServiceUsageSummary,
   ApiTestChatResult,
+  AutoSwitchConfig,
+  AutoSwitchEvalResult,
   InstructionMode,
   McpSkillsState,
   OAuthPrepareResult,
@@ -337,6 +339,24 @@ let mockApiKeys: ApiKeyRecord[] = [
     totalTokens: 0,
   },
 ];
+let mockAutoSwitchConfig: AutoSwitchConfig = {
+  enabled: false,
+  threshold: 5,
+  splitWindowThresholds: false,
+  fiveHourThreshold: 5,
+  weeklyThreshold: 5,
+  creditsEnabled: false,
+  creditsThreshold: 100,
+  scopeMode: "any_group",
+  selectedGroupIds: ["gemini-5h", "gemini-weekly", "claude-5h", "claude-weekly"],
+  accountScopeMode: "all_accounts",
+  selectedAccountIds: [],
+  quotaAlertEnabled: false,
+  quotaAlertThreshold: 20,
+  pollIntervalMinutes: 3,
+  switchTarget: "ide",
+};
+
 let mockApiLogs: ApiRequestLogItem[] = [];
 
 function buildMockApiStatus(): ApiServiceStatus {
@@ -497,6 +517,20 @@ export async function agxInvoke<T>(command: string, args?: Record<string, unknow
       return mockAccounts[0] as T;
     case "refresh_all_quotas":
       return { total: mockAccounts.length, success: mockAccounts.length, failed: 0, details: [] } as RefreshStats as T;
+    case "get_auto_switch_config":
+      return mockAutoSwitchConfig as T;
+    case "save_auto_switch_config":
+      mockAutoSwitchConfig = (args?.config as AutoSwitchConfig) ?? mockAutoSwitchConfig;
+      return mockAutoSwitchConfig as T;
+    case "run_auto_switch_check":
+      return {
+        switched: false,
+        fromEmail: mockAccounts[0]?.email ?? null,
+        toEmail: null,
+        reason: "Mock check ok",
+        alertTriggered: false,
+        alertMessage: null,
+      } as AutoSwitchEvalResult as T;
     case "detect_launch_targets":
       return [
         { id: "antigravity_ide", label: "Antigravity IDE", available: true, resolvedPath: "C:\\Users\\KhoaHihi\\AppData\\Local\\Programs\\Antigravity IDE\\Antigravity IDE.exe" },

@@ -38,6 +38,7 @@ import {
   UserCheck,
   Users,
   X,
+  Zap,
 } from "lucide-react";
 import type {
   AccountGroup,
@@ -45,6 +46,8 @@ import type {
   AntigravityAccount,
   ApiServiceStatus,
   AppLanguage,
+  AutoSwitchConfig,
+  AutoSwitchEvalResult,
   DashboardBundleResponse,
   LaunchTargetInfo,
   OAuthPrepareResult,
@@ -374,6 +377,29 @@ export function AccountsPage({
   // Switch History modal
   const [historyModalOpen, setHistoryModalOpen] = useState(false);
 
+  // Auto-Switch config & modal state
+  const [autoSwitchModalOpen, setAutoSwitchModalOpen] = useState(false);
+  const [autoSwitchScopeOpen, setAutoSwitchScopeOpen] = useState(false);
+  const [autoSwitchSaving, setAutoSwitchSaving] = useState(false);
+  const [autoSwitchChecking, setAutoSwitchChecking] = useState(false);
+  const [autoSwitchCfg, setAutoSwitchCfg] = useState<AutoSwitchConfig>({
+    enabled: false,
+    threshold: 5,
+    splitWindowThresholds: false,
+    fiveHourThreshold: 5,
+    weeklyThreshold: 5,
+    creditsEnabled: false,
+    creditsThreshold: 100,
+    scopeMode: "any_group",
+    selectedGroupIds: ["gemini-5h", "gemini-weekly", "claude-5h", "claude-weekly"],
+    accountScopeMode: "all_accounts",
+    selectedAccountIds: [],
+    quotaAlertEnabled: false,
+    quotaAlertThreshold: 20,
+    pollIntervalMinutes: 3,
+    switchTarget: "ide",
+  });
+
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const flashMsg = (tone: "ok" | "err", text: string) => {
@@ -408,6 +434,42 @@ export function AccountsPage({
   useEffect(() => {
     void loadGroupsAndSort();
   }, [loadGroupsAndSort]);
+
+  useEffect(() => {
+    void agxInvoke<AutoSwitchConfig>("get_auto_switch_config")
+      .then((cfg) => {
+        if (cfg) setAutoSwitchCfg(cfg);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlistenSwitched: (() => void) | null = null;
+    let unlistenAlert: (() => void) | null = null;
+    void import("@tauri-apps/api/event").then(async ({ listen }) => {
+      unlistenSwitched = await listen<AutoSwitchEvalResult>(
+        "auto-switch-executed",
+        (ev) => {
+          const p = ev.payload;
+          flashMsg(
+            "ok",
+            vi
+              ? `Tự động chuyển sang ${p.toEmail ?? "tài khoản mới"} (${p.reason})`
+              : `Auto-switched to ${p.toEmail ?? "next account"} (${p.reason})`,
+          );
+          void onRefreshAllData();
+        },
+      );
+      unlistenAlert = await listen<string>("auto-switch-alert", (ev) => {
+        flashMsg("err", vi ? `Cảnh báo hạn mức: ${ev.payload}` : `Quota alert: ${ev.payload}`);
+      });
+    });
+    return () => {
+      unlistenSwitched?.();
+      unlistenAlert?.();
+    };
+  }, [onRefreshAllData, vi]);
 
   // Load Local Token Summary Strip for active range
   const loadTokenSummary = useCallback(
@@ -1769,6 +1831,19 @@ export function AccountsPage({
                 onClick={() => setPrivacyMode((p) => !p)}
               >
                 {privacyMode ? <EyeOff size={15} /> : <Eye size={15} />}
+              </button>
+
+              <button
+                type="button"
+                className={`ag-toolbar-icon-btn${autoSwitchCfg.enabled ? " is-active" : ""}`}
+                title={
+                  vi
+                    ? `Tự động chuyển đổi tài khoản (${autoSwitchCfg.enabled ? `BẬT · ${autoSwitchCfg.threshold}%` : "TẮT"})`
+                    : `Auto Switch Accounts (${autoSwitchCfg.enabled ? `ON · ${autoSwitchCfg.threshold}%` : "OFF"})`
+                }
+                onClick={() => setAutoSwitchModalOpen(true)}
+              >
+                <Zap size={15} />
               </button>
 
               <button
@@ -3164,6 +3239,446 @@ export function AccountsPage({
                 onClick={() => setHistoryModalOpen(false)}
               >
                 {vi ? "Đóng" : "Close"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {autoSwitchModalOpen ? (
+        <div
+          className="agx-modal-backdrop"
+          onClick={() => setAutoSwitchModalOpen(false)}
+        >
+          <div
+            className="agx-modal agx-modal--wide"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="agx-modal-head">
+              <h3>
+                <Zap size={16} />{" "}
+                {vi ? "Tự động chuyển đổi tài khoản" : "Auto Switch Accounts"}
+              </h3>
+              <button
+                type="button"
+                className="agx-icon-btn"
+                onClick={() => setAutoSwitchModalOpen(false)}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="agx-modal-body">
+              <div className="ag-autoswitch-list">
+                <label className="ag-autoswitch-row">
+                  <span>{vi ? "Tự động chuyển đổi" : "Enable Auto Switch"}</span>
+                  <input
+                    type="checkbox"
+                    checked={autoSwitchCfg.enabled}
+                    onChange={(e) =>
+                      setAutoSwitchCfg({ ...autoSwitchCfg, enabled: e.target.checked })
+                    }
+                  />
+                </label>
+
+                <div className="ag-autoswitch-row">
+                  <span>{vi ? "Ngưỡng chuyển đổi" : "Switch Threshold"}</span>
+                  <select
+                    className="agx-select"
+                    value={autoSwitchCfg.threshold}
+                    onChange={(e) =>
+                      setAutoSwitchCfg({
+                        ...autoSwitchCfg,
+                        threshold: Number(e.target.value),
+                      })
+                    }
+                  >
+                    {[0, 5, 10, 15, 20, 30, 40].map((v) => (
+                      <option key={v} value={v}>
+                        {v}%
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <label className="ag-autoswitch-row">
+                  <span>
+                    {vi
+                      ? "Tách ngưỡng 5 giờ và hằng tuần"
+                      : "Split 5-hour and Weekly thresholds"}
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={autoSwitchCfg.splitWindowThresholds}
+                    onChange={(e) =>
+                      setAutoSwitchCfg({
+                        ...autoSwitchCfg,
+                        splitWindowThresholds: e.target.checked,
+                      })
+                    }
+                  />
+                </label>
+
+                {autoSwitchCfg.splitWindowThresholds ? (
+                  <div className="ag-autoswitch-subgrid">
+                    <label className="agx-field">
+                      <span>{vi ? "Ngưỡng cửa sổ 5 giờ" : "5-Hour Threshold"}</span>
+                      <select
+                        className="agx-select"
+                        value={autoSwitchCfg.fiveHourThreshold}
+                        onChange={(e) =>
+                          setAutoSwitchCfg({
+                            ...autoSwitchCfg,
+                            fiveHourThreshold: Number(e.target.value),
+                          })
+                        }
+                      >
+                        {[0, 5, 10, 15, 20, 30].map((v) => (
+                          <option key={v} value={v}>
+                            {v}%
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="agx-field">
+                      <span>{vi ? "Ngưỡng hằng tuần" : "Weekly Threshold"}</span>
+                      <select
+                        className="agx-select"
+                        value={autoSwitchCfg.weeklyThreshold}
+                        onChange={(e) =>
+                          setAutoSwitchCfg({
+                            ...autoSwitchCfg,
+                            weeklyThreshold: Number(e.target.value),
+                          })
+                        }
+                      >
+                        {[0, 5, 10, 15, 20, 30].map((v) => (
+                          <option key={v} value={v}>
+                            {v}%
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                ) : null}
+
+                <label className="ag-autoswitch-row">
+                  <span>{vi ? "Theo dõi credits" : "Monitor Credits"}</span>
+                  <input
+                    type="checkbox"
+                    checked={autoSwitchCfg.creditsEnabled}
+                    onChange={(e) =>
+                      setAutoSwitchCfg({
+                        ...autoSwitchCfg,
+                        creditsEnabled: e.target.checked,
+                      })
+                    }
+                  />
+                </label>
+
+                {autoSwitchCfg.creditsEnabled ? (
+                  <div className="ag-autoswitch-row">
+                    <span>{vi ? "Ngưỡng credits tối thiểu" : "Min Credits Threshold"}</span>
+                    <input
+                      type="number"
+                      className="agx-input"
+                      style={{ width: 120 }}
+                      min={0}
+                      value={autoSwitchCfg.creditsThreshold}
+                      onChange={(e) =>
+                        setAutoSwitchCfg({
+                          ...autoSwitchCfg,
+                          creditsThreshold: Number(e.target.value) || 0,
+                        })
+                      }
+                    />
+                  </div>
+                ) : null}
+
+                <div className="ag-autoswitch-row">
+                  <span>{vi ? "Mô hình kích hoạt" : "Trigger Model Scope"}</span>
+                  <select
+                    className="agx-select"
+                    value={autoSwitchCfg.scopeMode}
+                    onChange={(e) =>
+                      setAutoSwitchCfg({
+                        ...autoSwitchCfg,
+                        scopeMode: e.target.value,
+                      })
+                    }
+                  >
+                    <option value="any_group">
+                      {vi ? "Bất kỳ nhóm mô hình nào" : "Any model group"}
+                    </option>
+                    <option value="all_groups">
+                      {vi ? "Tất cả nhóm mô hình" : "All model groups"}
+                    </option>
+                    <option value="selected_groups">
+                      {vi ? "Chọn nhóm mô hình cụ thể" : "Selected model groups"}
+                    </option>
+                  </select>
+                </div>
+
+                {autoSwitchCfg.scopeMode === "selected_groups" ? (
+                  <div className="ag-autoswitch-pills">
+                    {[
+                      { id: "gemini-5h", label: "Gemini 5h" },
+                      { id: "gemini-weekly", label: "Gemini Weekly" },
+                      { id: "claude-5h", label: "Claude 5h" },
+                      { id: "claude-weekly", label: "Claude Weekly" },
+                    ].map((g) => {
+                      const active = autoSwitchCfg.selectedGroupIds.includes(g.id);
+                      return (
+                        <button
+                          key={g.id}
+                          type="button"
+                          className={`agx-btn agx-btn--sm ${
+                            active ? "agx-btn--primary" : "agx-btn--secondary"
+                          }`}
+                          onClick={() => {
+                            const next = active
+                              ? autoSwitchCfg.selectedGroupIds.filter((x) => x !== g.id)
+                              : [...autoSwitchCfg.selectedGroupIds, g.id];
+                            setAutoSwitchCfg({
+                              ...autoSwitchCfg,
+                              selectedGroupIds: next.length > 0 ? next : [g.id],
+                            });
+                          }}
+                        >
+                          {g.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : null}
+
+                <div className="ag-autoswitch-row">
+                  <div>
+                    <div>
+                      {vi ? "Phạm vi chuyển tài khoản tự động" : "Auto-Switch Account Scope"}
+                    </div>
+                    <small className="agx-muted">
+                      {autoSwitchCfg.accountScopeMode === "all_accounts"
+                        ? vi
+                          ? `Phạm vi hiện tại: tất cả tài khoản (tổng ${accounts.length})`
+                          : `Current scope: all accounts (${accounts.length} total)`
+                        : vi
+                          ? `Đã chọn ${autoSwitchCfg.selectedAccountIds.length}/${accounts.length} tài khoản`
+                          : `Selected ${autoSwitchCfg.selectedAccountIds.length}/${accounts.length} accounts`}
+                    </small>
+                  </div>
+                  <button
+                    type="button"
+                    className="agx-btn agx-btn--secondary agx-btn--sm"
+                    onClick={() => setAutoSwitchScopeOpen((v) => !v)}
+                  >
+                    {vi ? "Chọn tài khoản" : "Select Accounts"}
+                  </button>
+                </div>
+
+                {autoSwitchScopeOpen ? (
+                  <div className="ag-autoswitch-scope-box">
+                    <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                      <button
+                        type="button"
+                        className={`agx-btn agx-btn--sm ${
+                          autoSwitchCfg.accountScopeMode === "all_accounts"
+                            ? "agx-btn--primary"
+                            : "agx-btn--secondary"
+                        }`}
+                        onClick={() =>
+                          setAutoSwitchCfg({
+                            ...autoSwitchCfg,
+                            accountScopeMode: "all_accounts",
+                          })
+                        }
+                      >
+                        {vi ? "Tất cả tài khoản" : "All Accounts"}
+                      </button>
+                      <button
+                        type="button"
+                        className={`agx-btn agx-btn--sm ${
+                          autoSwitchCfg.accountScopeMode === "selected_accounts"
+                            ? "agx-btn--primary"
+                            : "agx-btn--secondary"
+                        }`}
+                        onClick={() =>
+                          setAutoSwitchCfg({
+                            ...autoSwitchCfg,
+                            accountScopeMode: "selected_accounts",
+                          })
+                        }
+                      >
+                        {vi ? "Chỉ tài khoản đã chọn" : "Selected Only"}
+                      </button>
+                    </div>
+                    {autoSwitchCfg.accountScopeMode === "selected_accounts" ? (
+                      <div className="ag-autoswitch-acc-list">
+                        {accounts.map((acc) => {
+                          const checked = autoSwitchCfg.selectedAccountIds.includes(acc.id);
+                          return (
+                            <label key={acc.id} className="ag-select-all-label">
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={(e) => {
+                                  const next = e.target.checked
+                                    ? [...autoSwitchCfg.selectedAccountIds, acc.id]
+                                    : autoSwitchCfg.selectedAccountIds.filter(
+                                        (id) => id !== acc.id,
+                                      );
+                                  setAutoSwitchCfg({
+                                    ...autoSwitchCfg,
+                                    selectedAccountIds: next,
+                                  });
+                                }}
+                              />
+                              <span>{maskEmail(acc.email, privacyMode)}</span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                <div className="ag-autoswitch-subgrid">
+                  <label className="agx-field">
+                    <span>{vi ? "Đích chuyển tài khoản" : "Switch Target"}</span>
+                    <select
+                      className="agx-select"
+                      value={autoSwitchCfg.switchTarget}
+                      onChange={(e) =>
+                        setAutoSwitchCfg({
+                          ...autoSwitchCfg,
+                          switchTarget: e.target.value,
+                        })
+                      }
+                    >
+                      <option value="ide">Antigravity IDE</option>
+                      <option value="cli">Antigravity CLI</option>
+                      <option value="both">{vi ? "Cả hai (IDE + CLI)" : "Both (IDE + CLI)"}</option>
+                    </select>
+                  </label>
+                  <label className="agx-field">
+                    <span>{vi ? "Chu kỳ quét nền" : "Background Check Interval"}</span>
+                    <select
+                      className="agx-select"
+                      value={autoSwitchCfg.pollIntervalMinutes}
+                      onChange={(e) =>
+                        setAutoSwitchCfg({
+                          ...autoSwitchCfg,
+                          pollIntervalMinutes: Number(e.target.value),
+                        })
+                      }
+                    >
+                      {[1, 3, 5, 10, 15].map((m) => (
+                        <option key={m} value={m}>
+                          {m} {vi ? "phút" : "min"}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+
+                <div className="ag-autoswitch-note">
+                  {vi
+                    ? "Tự động chuyển khi các nhóm mô hình đang theo dõi chạm ngưỡng; nếu bật theo dõi credits, hệ thống cũng chuyển khi credits còn lại thấp hơn ngưỡng."
+                    : "Automatically switches when monitored model groups hit the threshold; if credit monitoring is enabled, also triggers when remaining credits drop below the threshold."}
+                </div>
+
+                <label className="ag-autoswitch-row">
+                  <span>{vi ? "Bật cảnh báo hạn mức" : "Enable Quota Alert"}</span>
+                  <input
+                    type="checkbox"
+                    checked={autoSwitchCfg.quotaAlertEnabled}
+                    onChange={(e) =>
+                      setAutoSwitchCfg({
+                        ...autoSwitchCfg,
+                        quotaAlertEnabled: e.target.checked,
+                      })
+                    }
+                  />
+                </label>
+
+                {autoSwitchCfg.quotaAlertEnabled ? (
+                  <div className="ag-autoswitch-row">
+                    <span>{vi ? "Ngưỡng cảnh báo hạn mức" : "Quota Alert Threshold"}</span>
+                    <select
+                      className="agx-select"
+                      value={autoSwitchCfg.quotaAlertThreshold}
+                      onChange={(e) =>
+                        setAutoSwitchCfg({
+                          ...autoSwitchCfg,
+                          quotaAlertThreshold: Number(e.target.value),
+                        })
+                      }
+                    >
+                      {[5, 10, 15, 20, 30, 50].map((v) => (
+                        <option key={v} value={v}>
+                          {v}%
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+            <div className="agx-modal-foot">
+              <button
+                type="button"
+                className="agx-btn agx-btn--secondary"
+                disabled={autoSwitchChecking}
+                onClick={async () => {
+                  setAutoSwitchChecking(true);
+                  try {
+                    const res = await agxInvoke<AutoSwitchEvalResult>("run_auto_switch_check");
+                    flashMsg(
+                      res.switched ? "ok" : "err",
+                      res.switched
+                        ? vi
+                          ? `Đã chuyển sang ${res.toEmail}: ${res.reason}`
+                          : `Switched to ${res.toEmail}: ${res.reason}`
+                        : res.reason,
+                    );
+                    if (res.switched) {
+                      await onRefreshAllData();
+                    }
+                  } catch (e) {
+                    flashMsg("err", e instanceof Error ? e.message : String(e));
+                  } finally {
+                    setAutoSwitchChecking(false);
+                  }
+                }}
+              >
+                <RefreshCw size={14} className={autoSwitchChecking ? "spin" : undefined} />
+                <span>{vi ? "Kiểm tra ngay" : "Check Now"}</span>
+              </button>
+              <button
+                type="button"
+                className="agx-btn agx-btn--primary"
+                disabled={autoSwitchSaving}
+                onClick={async () => {
+                  setAutoSwitchSaving(true);
+                  try {
+                    const saved = await agxInvoke<AutoSwitchConfig>(
+                      "save_auto_switch_config",
+                      { config: autoSwitchCfg },
+                    );
+                    setAutoSwitchCfg(saved);
+                    setAutoSwitchModalOpen(false);
+                    flashMsg(
+                      "ok",
+                      vi ? "Đã lưu cấu hình Tự động chuyển đổi" : "Saved Auto Switch settings",
+                    );
+                  } catch (e) {
+                    flashMsg("err", e instanceof Error ? e.message : String(e));
+                  } finally {
+                    setAutoSwitchSaving(false);
+                  }
+                }}
+              >
+                <Save size={14} />
+                <span>{vi ? "Lưu cấu hình" : "Save Settings"}</span>
               </button>
             </div>
           </div>

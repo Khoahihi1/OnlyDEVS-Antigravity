@@ -5407,3 +5407,55 @@
 .agx-about-link-icon--discord {
   background: linear-gradient(135deg, #ef2328, #dc2626);
 }
+
+.ag-autoswitch-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ag-autoswitch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 2px;
+  font-size: 13px;
+}
+
+.ag-autoswitch-subgrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.ag-autoswitch-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ag-autoswitch-scope-box {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--agx-border);
+  background: var(--agx-bg-subtle);
+}
+
+.ag-autoswitch-acc-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.ag-autoswitch-note {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--agx-border);
+  background: var(--agx-bg-subtle);
+  color: var(--agx-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}

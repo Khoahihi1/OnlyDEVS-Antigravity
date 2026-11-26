@@ -1,6 +1,7 @@
 mod accounts;
 mod antigravity_token_usage;
 mod api_service;
+mod auto_switch;
 mod config;
 mod mcp_skills;
 mod paths;
@@ -324,13 +325,46 @@ fn export_accounts(account_ids: Vec<String>, include_sensitive: bool) -> Result<
 }
 
 #[tauri::command]
-async fn fetch_account_quota(account_id: String) -> Result<accounts::AntigravityAccount, String> {
-    accounts::refresh_single_account_quota(account_id).await
+async fn fetch_account_quota(
+    app: tauri::AppHandle,
+    account_id: String,
+) -> Result<accounts::AntigravityAccount, String> {
+    let acc = accounts::refresh_single_account_quota(account_id).await?;
+    if acc.is_current {
+        let _ = auto_switch::evaluate_and_run_if_enabled(Some(&app), false).await;
+    }
+    Ok(acc)
 }
 
 #[tauri::command]
-async fn refresh_all_quotas() -> Result<accounts::RefreshStats, String> {
-    accounts::refresh_all_account_quotas().await
+async fn refresh_all_quotas(app: tauri::AppHandle) -> Result<accounts::RefreshStats, String> {
+    let stats = accounts::refresh_all_account_quotas().await?;
+    let _ = auto_switch::evaluate_and_run_if_enabled(Some(&app), false).await;
+    Ok(stats)
+}
+
+#[tauri::command]
+fn get_auto_switch_config() -> auto_switch::AutoSwitchConfig {
+    auto_switch::load_config()
+}
+
+#[tauri::command]
+async fn save_auto_switch_config(
+    app: tauri::AppHandle,
+    config: auto_switch::AutoSwitchConfig,
+) -> Result<auto_switch::AutoSwitchConfig, String> {
+    let saved = auto_switch::save_config(config)?;
+    if saved.enabled || saved.quota_alert_enabled {
+        let _ = auto_switch::evaluate_and_run_if_enabled(Some(&app), false).await;
+    }
+    Ok(saved)
+}
+
+#[tauri::command]
+async fn run_auto_switch_check(
+    app: tauri::AppHandle,
+) -> Result<auto_switch::AutoSwitchEvalResult, String> {
+    auto_switch::evaluate_and_run_if_enabled(Some(&app), true).await
 }
 
 #[tauri::command]
@@ -733,6 +767,7 @@ pub fn run() {
         .setup(|app| {
             api_service::spawn_auto_start_if_enabled();
             api_service::spawn_background_quota_worker(app.handle().clone());
+            auto_switch::spawn_auto_switch_watcher(app.handle().clone());
 
             // Native System Tray so API Router keeps running when closing the window
             if let Ok(item_show) = MenuItem::with_id(
@@ -882,6 +917,9 @@ pub fn run() {
             export_accounts,
             fetch_account_quota,
             refresh_all_quotas,
+            get_auto_switch_config,
+            save_auto_switch_config,
+            run_auto_switch_check,
             detect_launch_targets,
             switch_account,
             update_account_metadata,

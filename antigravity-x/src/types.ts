@@ -794,3 +794,30 @@ export type ApiTestChatResult = {
   thinkingTokens: number;
   error?: string | null;
 };
+
+export type AutoSwitchConfig = {
+  enabled: boolean;
+  threshold: number;
+  splitWindowThresholds: boolean;
+  fiveHourThreshold: number;
+  weeklyThreshold: number;
+  creditsEnabled: boolean;
+  creditsThreshold: number;
+  scopeMode: "any_group" | "all_groups" | "selected_groups" | string;
+  selectedGroupIds: string[];
+  accountScopeMode: "all_accounts" | "selected_accounts" | string;
+  selectedAccountIds: string[];
+  quotaAlertEnabled: boolean;
+  quotaAlertThreshold: number;
+  pollIntervalMinutes: number;
+  switchTarget: "ide" | "cli" | "both" | string;
+};
+
+export type AutoSwitchEvalResult = {
+  switched: boolean;
+  fromEmail?: string | null;
+  toEmail?: string | null;
+  reason: string;
+  alertTriggered: boolean;
+  alertMessage?: string | null;
+};
