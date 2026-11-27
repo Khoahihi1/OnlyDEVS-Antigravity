@@ -3078,6 +3078,7 @@ fn generate_fallback_project_id() -> String {
 async fn send_upstream_with_failover(
     cfg: &ApiServiceConfig,
     key: &ApiKeyRecord,
+    session_seed: &str,
     resolved_model: &str,
     openai_body: &Value,
     stream: bool,
@@ -3143,7 +3144,7 @@ async fn send_upstream_with_failover(
     );
 
     let conv_cache_key = if cfg.prompt_cache_affinity {
-        extract_conversation_cache_key(openai_body, &key.id, resolved_model)
+        extract_conversation_cache_key(openai_body, session_seed, resolved_model)
     } else {
         String::new()
     };
@@ -3197,7 +3198,7 @@ async fn send_upstream_with_failover(
             .unwrap_or_else(generate_fallback_project_id);
 
         let (mut envelope, preview, tool_name_map) =
-            openai_body_to_antigravity_envelope(openai_body, resolved_model, &project_id, &key.id, cfg);
+            openai_body_to_antigravity_envelope(openai_body, resolved_model, &project_id, session_seed, cfg);
 
         let force_non_stream = resolved_model.to_ascii_lowercase().contains("image");
         let action = if stream && !force_non_stream {
@@ -3871,6 +3872,49 @@ async fn handle_single_request(
             && keep_alive;
     }
 
+    if req.method == "GET" && (norm_path == "/v1/node/health" || norm_path == "/node/health") {
+        let cfg_snap = load_config().unwrap_or_default();
+        let all_accs = accounts::list_accounts_sync().unwrap_or_default();
+        let pool_accs = select_pool_members(all_accs, &cfg_snap, Some(&api_key));
+        let mut healthy = 0usize;
+        let mut full_nextgen = 0usize;
+        let mut classic = 0usize;
+        let mut unknown = 0usize;
+        for acc in &pool_accs {
+            if !acc.disabled
+                && !acc.pending_oauth
+                && acc.quota_error.is_none()
+                && !acc.quota.as_ref().is_some_and(|q| q.is_forbidden)
+            {
+                healthy += 1;
+            }
+            match classify_account_profile(acc) {
+                AccountProfile::FullNextgen => full_nextgen += 1,
+                AccountProfile::Classic => classic += 1,
+                AccountProfile::Unknown => unknown += 1,
+            }
+        }
+        let cooldown_count = active_cooldowns().len();
+        return write_json_response_ka(
+            stream,
+            200,
+            &json!({
+                "status": "ok",
+                "running": is_server_running(),
+                "activeRequests": ACTIVE_REQUESTS.load(Ordering::Relaxed),
+                "poolTotal": pool_accs.len(),
+                "poolHealthy": healthy,
+                "poolFullNextgen": full_nextgen,
+                "poolClassic": classic,
+                "poolUnknown": unknown,
+                "cooldownCount": cooldown_count,
+            }),
+            keep_alive,
+        )
+        .await
+            && keep_alive;
+    }
+
     if req.method == "GET" && (norm_path == "/v1/models" || norm_path == "/models") {
         let models = list_available_models().unwrap_or_default();
         let profile_members = if api_key.allowed_profile != "all" {
@@ -4084,12 +4128,31 @@ async fn handle_single_request(
             && keep_alive;
     }
 
+    let tenant_header = req
+        .headers
+        .get("x-tenant-id")
+        .or_else(|| req.headers.get("x-end-user"))
+        .or_else(|| req.headers.get("x-session-user"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let session_seed = match tenant_header {
+        Some(t) => format!("{}:{t}", api_key.id),
+        None => api_key.id.clone(),
+    };
+
     ACTIVE_REQUESTS.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
     let log_id = Uuid::new_v4().to_string();
 
-    let upstream_res =
-        send_upstream_with_failover(&cfg, &api_key, &resolved_model, &openai_body, is_stream).await;
+    let upstream_res = send_upstream_with_failover(
+        &cfg,
+        &api_key,
+        &session_seed,
+        &resolved_model,
+        &openai_body,
+        is_stream,
+    )
+    .await;
 
     match upstream_res {
         Err((status, err_msg, acc_id, acc_email, err_preview)) => {
@@ -4541,6 +4604,9 @@ async fn handle_single_request(
                                     "output_text": collected_text,
                                     "usage": {
                                         "input_tokens": total_in,
+                                        "input_tokens_details": {
+                                            "cached_tokens": total_cache
+                                        },
                                         "output_tokens": total_out + total_think,
                                         "total_tokens": total_in + total_out + total_think
                                     }
@@ -4562,7 +4628,11 @@ async fn handle_single_request(
                             let ev_delta = json!({
                                 "type": "message_delta",
                                 "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
-                                "usage": { "output_tokens": total_out + total_think }
+                                "usage": {
+                                    "input_tokens": total_in,
+                                    "cache_read_input_tokens": total_cache,
+                                    "output_tokens": total_out + total_think
+                                }
                             });
                             let ev_stop = json!({ "type": "message_stop" });
                             tail.push_str(&format!("event: message_delta\ndata: {ev_delta}\n\nevent: message_stop\ndata: {ev_stop}\n\n"));
@@ -4684,6 +4754,9 @@ async fn handle_single_request(
                         "output_text": collected_text,
                         "usage": {
                             "input_tokens": total_in,
+                            "input_tokens_details": {
+                                "cached_tokens": total_cache
+                            },
                             "output_tokens": total_out + total_think,
                             "total_tokens": total_in + total_out + total_think
                         }
@@ -5401,7 +5474,7 @@ pub async fn test_chat_completion(
     });
 
     let started = Instant::now();
-    match send_upstream_with_failover(&cfg, &key, &resolved_model, &body, false).await {
+    match send_upstream_with_failover(&cfg, &key, &key.id, &resolved_model, &body, false).await {
         Ok((resp, acc, req_preview, _tool_name_map)) => {
             let raw_text = resp.text().await.unwrap_or_default();
             let parsed = serde_json::from_str::<Value>(&raw_text)
