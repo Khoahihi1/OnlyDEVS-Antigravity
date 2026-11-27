@@ -49,6 +49,8 @@ import type {
   AutoSwitchConfig,
   AutoSwitchEvalResult,
   DashboardBundleResponse,
+  IdeBridgeSettings,
+  IdeBridgeStatus,
   LaunchTargetInfo,
   OAuthPrepareResult,
   RefreshStats,
@@ -73,6 +75,25 @@ import {
   formatExactNumber,
   formatTokensShort,
 } from "../components/AntigravityUsageTrend";
+
+function DoubleZapIcon({ size = 15 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M10.5 2 3 12.5h5.5L7 22l7-10.5H8.8L10.5 2Z" />
+      <path d="M18 4.5 12.5 12.5h4.3L15.5 20l6-9.5h-4.3L18 4.5Z" />
+    </svg>
+  );
+}
 
 type AccountsPageProps = {
   lang: AppLanguage;
@@ -400,6 +421,49 @@ export function AccountsPage({
     switchTarget: "ide",
   });
 
+  // Seamless IDE Bridge (Extension + Local WebSocket) state
+  const [bridgeModalOpen, setBridgeModalOpen] = useState(false);
+  const [bridgeStatus, setBridgeStatus] = useState<IdeBridgeStatus | null>(null);
+  const [bridgeBusy, setBridgeBusy] = useState<string | null>(null);
+
+  const refreshBridgeStatus = useCallback(async () => {
+    try {
+      const st = await agxInvoke<IdeBridgeStatus>("get_ide_bridge_status");
+      if (st) setBridgeStatus(st);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const saveBridgeSettingsPatch = useCallback(
+    async (patch: Partial<IdeBridgeSettings>) => {
+      const base: IdeBridgeSettings = bridgeStatus?.settings ?? {
+        seamlessAutoSwitch: false,
+        seamlessPriority: true,
+        autoHealInject: false,
+        fallbackRelaunch: false,
+      };
+      const nextSettings: IdeBridgeSettings = {
+        ...base,
+        ...patch,
+        ...(patch.seamlessAutoSwitch ? { seamlessPriority: true } : {}),
+      };
+      try {
+        const saved = await agxInvoke<IdeBridgeSettings>("save_ide_bridge_settings", {
+          settings: nextSettings,
+        });
+        setBridgeStatus((prev) => (prev ? { ...prev, settings: saved } : prev));
+        if (saved.seamlessAutoSwitch) {
+          setAutoSwitchCfg((prev) => ({ ...prev, enabled: false }));
+        }
+        await refreshBridgeStatus();
+      } catch (err) {
+        flashMsg("err", err instanceof Error ? err.message : String(err));
+      }
+    },
+    [bridgeStatus, refreshBridgeStatus],
+  );
+
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const flashMsg = (tone: "ok" | "err", text: string) => {
@@ -441,12 +505,15 @@ export function AccountsPage({
         if (cfg) setAutoSwitchCfg(cfg);
       })
       .catch(() => {});
-  }, []);
+    void refreshBridgeStatus();
+  }, [refreshBridgeStatus]);
 
   useEffect(() => {
     if (!isTauri()) return;
     let unlistenSwitched: (() => void) | null = null;
     let unlistenAlert: (() => void) | null = null;
+    let unlistenBridge: (() => void) | null = null;
+    let unlistenAutoCfg: (() => void) | null = null;
     void import("@tauri-apps/api/event").then(async ({ listen }) => {
       unlistenSwitched = await listen<AutoSwitchEvalResult>(
         "auto-switch-executed",
@@ -464,10 +531,28 @@ export function AccountsPage({
       unlistenAlert = await listen<string>("auto-switch-alert", (ev) => {
         flashMsg("err", vi ? `Cảnh báo hạn mức: ${ev.payload}` : `Quota alert: ${ev.payload}`);
       });
+      unlistenBridge = await listen<IdeBridgeStatus>(
+        "ide-bridge-status-changed",
+        (ev) => {
+          if (ev.payload) {
+            setBridgeStatus(ev.payload);
+          }
+        },
+      );
+      unlistenAutoCfg = await listen<AutoSwitchConfig>(
+        "auto-switch-config-changed",
+        (ev) => {
+          if (ev.payload) {
+            setAutoSwitchCfg(ev.payload);
+          }
+        },
+      );
     });
     return () => {
       unlistenSwitched?.();
       unlistenAlert?.();
+      unlistenBridge?.();
+      unlistenAutoCfg?.();
     };
   }, [onRefreshAllData, vi]);
 
@@ -1838,12 +1923,59 @@ export function AccountsPage({
                 className={`ag-toolbar-icon-btn${autoSwitchCfg.enabled ? " is-active" : ""}`}
                 title={
                   vi
-                    ? `Tự động chuyển đổi tài khoản (${autoSwitchCfg.enabled ? `BẬT · ${autoSwitchCfg.threshold}%` : "TẮT"})`
-                    : `Auto Switch Accounts (${autoSwitchCfg.enabled ? `ON · ${autoSwitchCfg.threshold}%` : "OFF"})`
+                    ? `Tự động chuyển đổi (Tia sét đơn · ${autoSwitchCfg.enabled ? `BẬT · ${autoSwitchCfg.threshold}%` : "TẮT"})`
+                    : `Auto Switch Standard (${autoSwitchCfg.enabled ? `ON · ${autoSwitchCfg.threshold}%` : "OFF"})`
                 }
                 onClick={() => setAutoSwitchModalOpen(true)}
               >
                 <Zap size={15} />
+              </button>
+
+              <button
+                type="button"
+                className={`ag-toolbar-icon-btn od-double-zap-btn${
+                  bridgeStatus?.settings.seamlessAutoSwitch ? " is-active" : ""
+                }`}
+                title={
+                  vi
+                    ? `Seamless Auto Switch (Tia sét gấp đôi · ${
+                        bridgeStatus?.settings.seamlessAutoSwitch
+                          ? `BẬT · ${autoSwitchCfg.threshold}%`
+                          : "TẮT"
+                      }) · ${
+                        bridgeStatus?.connectedCount
+                          ? `Đã nối ${bridgeStatus.connectedCount} IDE`
+                          : bridgeStatus?.extensionInjected
+                            ? "Đã bơm · chờ reload IDE 1 lần"
+                            : "Chưa bơm Extension"
+                      }`
+                    : `Seamless Auto Switch (Double Zap · ${
+                        bridgeStatus?.settings.seamlessAutoSwitch
+                          ? `ON · ${autoSwitchCfg.threshold}%`
+                          : "OFF"
+                      }) · ${
+                        bridgeStatus?.connectedCount
+                          ? `Connected (${bridgeStatus.connectedCount} IDE)`
+                          : bridgeStatus?.extensionInjected
+                            ? "Injected · reload IDE once"
+                            : "Not injected"
+                      }`
+                }
+                onClick={() => {
+                  void refreshBridgeStatus();
+                  setBridgeModalOpen(true);
+                }}
+              >
+                <DoubleZapIcon size={15} />
+                <span
+                  className={`od-bridge-dot ${
+                    bridgeStatus?.connectedCount
+                      ? "is-online"
+                      : bridgeStatus?.extensionInjected
+                        ? "is-injected"
+                        : "is-idle"
+                  }`}
+                />
               </button>
 
               <button
@@ -2538,6 +2670,18 @@ export function AccountsPage({
                 );
               })()}
 
+              {selectedLaunchTarget !== "cli" && bridgeStatus?.connectedCount ? (
+                <div className="od-banner is-ok" style={{ marginTop: 10 }}>
+                  <span>
+                    {vi
+                      ? `Seamless Bridge đang kết nối (${bridgeStatus.connectedCount} IDE) — bấm "${
+                          bridgeStatus.settings.seamlessPriority ? "Chuyển nóng (Không restart)" : "Chỉ chuyển"
+                        }" để đổi acc ngay trong RAM IDE.`
+                      : `Seamless Bridge connected (${bridgeStatus.connectedCount} IDE) — switches directly in IDE RAM without restarting.`}
+                  </span>
+                </div>
+              ) : null}
+
               {launchError ? (
                 <div className="od-banner is-err">
                   <span>{launchError}</span>
@@ -2562,8 +2706,18 @@ export function AccountsPage({
               >
                 {busyKey === `switch-${launchAccount.id}` ? (
                   <Loader2 size={14} className="spin" />
+                ) : selectedLaunchTarget !== "cli" && bridgeStatus?.connectedCount ? (
+                  <DoubleZapIcon size={14} />
                 ) : null}
-                <span>{vi ? "Chỉ chuyển" : "Switch Only"}</span>
+                <span>
+                  {selectedLaunchTarget !== "cli" && bridgeStatus?.connectedCount
+                    ? vi
+                      ? "Chuyển nóng (Không restart)"
+                      : "Hot Switch (No Restart)"
+                    : vi
+                      ? "Chỉ chuyển"
+                      : "Switch Only"}
+                </span>
               </button>
               <button
                 type="button"
@@ -3665,10 +3819,17 @@ export function AccountsPage({
                       { config: autoSwitchCfg },
                     );
                     setAutoSwitchCfg(saved);
+                    await refreshBridgeStatus();
                     setAutoSwitchModalOpen(false);
                     flashMsg(
                       "ok",
-                      vi ? "Đã lưu cấu hình Tự động chuyển đổi" : "Saved Auto Switch settings",
+                      saved.enabled
+                        ? vi
+                          ? "Đã bật Tia sét đơn (Tia sét gấp đôi đã tự tắt)"
+                          : "Saved Auto Switch (Double Zap turned off)"
+                        : vi
+                          ? "Đã lưu cấu hình Tự động chuyển đổi"
+                          : "Saved Auto Switch settings",
                     );
                   } catch (e) {
                     flashMsg("err", e instanceof Error ? e.message : String(e));
@@ -3679,6 +3840,352 @@ export function AccountsPage({
               >
                 <Save size={14} />
                 <span>{vi ? "Lưu cấu hình" : "Save Settings"}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Seamless IDE Bridge (Extension + Local WebSocket) Modal */}
+      {bridgeModalOpen ? (
+        <div
+          className="agx-modal-backdrop"
+          onClick={() => setBridgeModalOpen(false)}
+        >
+          <div
+            className="agx-modal agx-modal--wide"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="agx-modal-head">
+              <h3>
+                <DoubleZapIcon size={16} />{" "}
+                {vi
+                  ? "Seamless IDE Bridge (Extension + WebSocket)"
+                  : "Seamless IDE Bridge (Extension + WebSocket)"}
+              </h3>
+              <button
+                type="button"
+                className="agx-icon-btn"
+                onClick={() => setBridgeModalOpen(false)}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="agx-modal-body">
+              <div className="ag-bridge-status-grid">
+                <div className="ag-bridge-stat-card">
+                  <span className="ag-bridge-stat-label">
+                    {vi ? "Antigravity IDE" : "Antigravity IDE"}
+                  </span>
+                  <strong
+                    className={
+                      bridgeStatus?.ideFound ? "ag-bridge-ok" : "ag-bridge-warn"
+                    }
+                  >
+                    {bridgeStatus?.ideFound
+                      ? vi
+                        ? "Đã tìm thấy"
+                        : "Detected"
+                      : vi
+                        ? "Chưa tìm thấy"
+                        : "Not Found"}
+                  </strong>
+                  <small className="ag-bridge-path" title={bridgeStatus?.ideRootPath ?? ""}>
+                    {bridgeStatus?.ideRootPath ?? "—"}
+                  </small>
+                </div>
+
+                <div className="ag-bridge-stat-card">
+                  <span className="ag-bridge-stat-label">
+                    {vi ? "Extension (onlydevs-auth-bridge)" : "Extension (onlydevs-auth-bridge)"}
+                  </span>
+                  <strong
+                    className={
+                      bridgeStatus?.extensionInjected && !bridgeStatus?.needsUpdate
+                        ? "ag-bridge-ok"
+                        : "ag-bridge-warn"
+                    }
+                  >
+                    {bridgeStatus?.extensionInjected
+                      ? bridgeStatus.needsUpdate
+                        ? vi
+                          ? `Cần cập nhật (v${bridgeStatus.extensionVersion ?? "?"})`
+                          : `Update available (v${bridgeStatus.extensionVersion ?? "?"})`
+                        : vi
+                          ? `Đã bơm · v${bridgeStatus.extensionVersion ?? "1.0.0"}`
+                          : `Injected · v${bridgeStatus.extensionVersion ?? "1.0.0"}`
+                      : vi
+                        ? "Chưa bơm"
+                        : "Not Injected"}
+                  </strong>
+                  <small className="ag-bridge-path" title={bridgeStatus?.extensionDir ?? ""}>
+                    {bridgeStatus?.extensionDir ?? "resources/app/extensions/onlydevs-auth-bridge"}
+                  </small>
+                </div>
+
+                <div className="ag-bridge-stat-card">
+                  <span className="ag-bridge-stat-label">
+                    {vi ? "Local WebSocket Bridge" : "Local WebSocket Bridge"}
+                  </span>
+                  <strong
+                    className={
+                      bridgeStatus?.connectedCount ? "ag-bridge-ok" : "ag-bridge-muted"
+                    }
+                  >
+                    {bridgeStatus?.connectedCount
+                      ? vi
+                        ? `Đang nối · ${bridgeStatus.connectedCount} cửa sổ IDE`
+                        : `Connected · ${bridgeStatus.connectedCount} IDE window(s)`
+                      : bridgeStatus?.serverRunning
+                        ? vi
+                          ? `Chờ IDE (ws://127.0.0.1:${bridgeStatus.wsPort ?? "?"})`
+                          : `Listening (ws://127.0.0.1:${bridgeStatus.wsPort ?? "?"})`
+                        : vi
+                          ? "Chưa khởi động"
+                          : "Offline"}
+                  </strong>
+                  <small className="ag-bridge-path">
+                    {bridgeStatus?.connectedClients?.length
+                      ? bridgeStatus.connectedClients
+                          .map((c) => `${c.ideName} (VS Code ${c.vscodeVersion || "?"})`)
+                          .join(" · ")
+                      : vi
+                        ? "Tự đổi OAuth token trong RAM IDE khi chuyển / Auto Switch"
+                        : "Hot-swaps OAuth token in IDE RAM without restarting"}
+                  </small>
+                </div>
+              </div>
+
+              {bridgeStatus?.extensionInjected && bridgeStatus.connectedCount === 0 ? (
+                <div className="od-banner is-ok" style={{ marginTop: 12 }}>
+                  <span>
+                    {vi
+                      ? "Extension đã được bơm sẵn vào Antigravity IDE. Hãy mở lại / Reload IDE 1 lần đầu để Extension kết nối; từ đó trở đi mọi lần chuyển sẽ tự nạp thẳng vào RAM."
+                      : "Extension is injected. Reload or restart Antigravity IDE once to activate it; all subsequent switches will apply live in RAM."}
+                  </span>
+                  <button
+                    type="button"
+                    className="agx-btn agx-btn--secondary agx-btn--sm"
+                    disabled={Boolean(bridgeBusy)}
+                    onClick={async () => {
+                      if (
+                        !window.confirm(
+                          vi
+                            ? "Đóng và mở lại Antigravity IDE ngay để nạp Extension? (Chỉ cần làm 1 lần sau khi bơm)"
+                            : "Restart Antigravity IDE now to load the extension? (1-time setup)",
+                        )
+                      ) {
+                        return;
+                      }
+                      setBridgeBusy("relaunch");
+                      try {
+                        const msg = await agxInvoke<string>("relaunch_antigravity_ide");
+                        flashMsg("ok", msg || (vi ? "Đã mở lại Antigravity IDE" : "Relaunched Antigravity IDE"));
+                        window.setTimeout(() => void refreshBridgeStatus(), 2500);
+                      } catch (e) {
+                        flashMsg("err", e instanceof Error ? e.message : String(e));
+                      } finally {
+                        setBridgeBusy(null);
+                      }
+                    }}
+                  >
+                    <RefreshCw
+                      size={13}
+                      className={bridgeBusy === "relaunch" ? "spin" : undefined}
+                    />
+                    <span>{vi ? "Mở lại IDE (1 lần đầu)" : "Restart IDE Once"}</span>
+                  </button>
+                </div>
+              ) : null}
+
+              <div className="ag-autoswitch-list" style={{ marginTop: 12 }}>
+                <label className="ag-autoswitch-row">
+                  <span>
+                    {vi
+                      ? "Bật Auto Switch Seamless (Tia sét gấp đôi · tự tắt Tia sét đơn)"
+                      : "Enable Seamless Auto Switch (Double Zap · turns off Single Zap)"}
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={bridgeStatus?.settings.seamlessAutoSwitch ?? false}
+                    onChange={(e) =>
+                      void saveBridgeSettingsPatch({
+                        seamlessAutoSwitch: e.target.checked,
+                      })
+                    }
+                  />
+                </label>
+
+                <div className="ag-autoswitch-row">
+                  <span>{vi ? "Ngưỡng tự động chuyển (%)" : "Auto-Switch Threshold (%)"}</span>
+                  <select
+                    className="agx-select"
+                    value={autoSwitchCfg.threshold}
+                    onChange={async (e) => {
+                      const nextCfg: AutoSwitchConfig = {
+                        ...autoSwitchCfg,
+                        threshold: Number(e.target.value),
+                      };
+                      try {
+                        const saved = await agxInvoke<AutoSwitchConfig>(
+                          "save_auto_switch_config",
+                          { config: nextCfg },
+                        );
+                        setAutoSwitchCfg(saved);
+                      } catch (err) {
+                        flashMsg("err", err instanceof Error ? err.message : String(err));
+                      }
+                    }}
+                  >
+                    {[0, 5, 10, 15, 20, 30, 40].map((v) => (
+                      <option key={v} value={v}>
+                        {v}%
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <label className="ag-autoswitch-row">
+                  <span>
+                    {vi
+                      ? "Ưu tiên chuyển nóng qua Extension Bridge (Không restart IDE)"
+                      : "Prefer Seamless WebSocket Bridge (No IDE Restart)"}
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={bridgeStatus?.settings.seamlessPriority ?? true}
+                    onChange={(e) =>
+                      void saveBridgeSettingsPatch({
+                        seamlessPriority: e.target.checked,
+                      })
+                    }
+                  />
+                </label>
+
+                <label className="ag-autoswitch-row">
+                  <span>
+                    {vi
+                      ? "Tự động bơm lại Extension nếu Antigravity IDE tự cập nhật"
+                      : "Auto re-inject Extension after IDE updates"}
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={bridgeStatus?.settings.autoHealInject ?? false}
+                    onChange={(e) =>
+                      void saveBridgeSettingsPatch({
+                        autoHealInject: e.target.checked,
+                      })
+                    }
+                  />
+                </label>
+
+                <label className="ag-autoswitch-row">
+                  <span>
+                    {vi
+                      ? "Fallback tự khởi động lại IDE nếu Extension chưa kết nối khi Auto Switch"
+                      : "Fallback auto-relaunch IDE during Auto Switch when Extension is offline"}
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={bridgeStatus?.settings.fallbackRelaunch ?? false}
+                    onChange={(e) =>
+                      void saveBridgeSettingsPatch({
+                        fallbackRelaunch: e.target.checked,
+                      })
+                    }
+                  />
+                </label>
+
+                <div className="ag-autoswitch-note">
+                  {vi
+                    ? "Cơ chế: Extension onlydevs-auth-bridge chạy ngay trong Extension Host của Antigravity IDE, nhận OAuth token mới qua Local WebSocket và gọi antigravityUnifiedStateSync.OAuthPreferences.setOAuthTokenInfo() để IDE nạp phiên mới ngay tại chỗ mà không tắt cửa sổ. Khi bật Tia sét gấp đôi, Tia sét đơn sẽ tự tắt để tránh xung đột."
+                    : "How it works: onlydevs-auth-bridge runs inside Antigravity IDE's Extension Host, receives fresh OAuth tokens over Local WebSocket, and invokes antigravityUnifiedStateSync.OAuthPreferences.setOAuthTokenInfo() to hot-swap credentials in RAM without restarting. Enabling Double Zap automatically disables Single Zap."}
+                </div>
+              </div>
+            </div>
+            <div className="agx-modal-foot">
+              {bridgeStatus?.extensionInjected ? (
+                <button
+                  type="button"
+                  className="agx-btn agx-btn--danger"
+                  disabled={Boolean(bridgeBusy)}
+                  onClick={async () => {
+                    setBridgeBusy("remove");
+                    try {
+                      const st = await agxInvoke<IdeBridgeStatus>("remove_ide_bridge_extension");
+                      setBridgeStatus(st);
+                      flashMsg(
+                        "ok",
+                        vi ? "Đã gỡ Extension khỏi Antigravity IDE" : "Removed bridge extension from IDE",
+                      );
+                    } catch (e) {
+                      flashMsg("err", e instanceof Error ? e.message : String(e));
+                    } finally {
+                      setBridgeBusy(null);
+                    }
+                  }}
+                >
+                  <Trash2 size={14} />
+                  <span>{vi ? "Gỡ Extension" : "Remove Extension"}</span>
+                </button>
+              ) : null}
+              <button
+                type="button"
+                className="agx-btn agx-btn--secondary"
+                disabled={Boolean(bridgeBusy)}
+                onClick={() => void refreshBridgeStatus()}
+              >
+                <RefreshCw
+                  size={14}
+                  className={bridgeBusy === "refresh" ? "spin" : undefined}
+                />
+                <span>{vi ? "Kiểm tra kết nối" : "Refresh Status"}</span>
+              </button>
+              <button
+                type="button"
+                className="agx-btn agx-btn--primary"
+                disabled={Boolean(bridgeBusy) || !bridgeStatus?.ideFound}
+                onClick={async () => {
+                  setBridgeBusy("inject");
+                  try {
+                    const st = await agxInvoke<IdeBridgeStatus>("inject_ide_bridge_extension");
+                    setBridgeStatus(st);
+                    setAutoSwitchCfg((prev) => ({ ...prev, enabled: false }));
+                    flashMsg(
+                      "ok",
+                      st.connectedCount > 0
+                        ? vi
+                          ? "Đã cập nhật Extension, bật Tia sét gấp đôi & kết nối thành công"
+                          : "Updated extension, enabled Double Zap & connected"
+                        : vi
+                          ? "Đã bơm Extension & bật Tia sét gấp đôi! Hãy Reload/Mở lại Antigravity IDE 1 lần để kích hoạt."
+                          : "Injected extension & enabled Double Zap! Reload/Restart Antigravity IDE once to activate.",
+                    );
+                  } catch (e) {
+                    flashMsg("err", e instanceof Error ? e.message : String(e));
+                  } finally {
+                    setBridgeBusy(null);
+                  }
+                }}
+              >
+                {bridgeBusy === "inject" ? (
+                  <Loader2 size={14} className="spin" />
+                ) : (
+                  <DoubleZapIcon size={14} />
+                )}
+                <span>
+                  {bridgeStatus?.extensionInjected
+                    ? bridgeStatus.needsUpdate
+                      ? vi
+                        ? "Cập nhật Extension"
+                        : "Update Extension"
+                      : vi
+                        ? "Bơm lại Extension"
+                        : "Re-inject Extension"
+                    : vi
+                      ? "Bơm Extension vào Antigravity IDE"
+                      : "Inject Extension into IDE"}
+                </span>
               </button>
             </div>
           </div>

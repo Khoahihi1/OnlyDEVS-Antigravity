@@ -3,6 +3,7 @@ mod antigravity_token_usage;
 mod api_service;
 mod auto_switch;
 mod config;
+mod ide_bridge;
 mod mcp_skills;
 mod paths;
 mod plugins;
@@ -354,7 +355,9 @@ async fn save_auto_switch_config(
     config: auto_switch::AutoSwitchConfig,
 ) -> Result<auto_switch::AutoSwitchConfig, String> {
     let saved = auto_switch::save_config(config)?;
-    if saved.enabled || saved.quota_alert_enabled {
+    let _ = app.emit("auto-switch-config-changed", &saved);
+    let _ = app.emit("ide-bridge-status-changed", ide_bridge::get_status().await);
+    if saved.enabled || saved.quota_alert_enabled || ide_bridge::is_seamless_auto_switch_enabled() {
         let _ = auto_switch::evaluate_and_run_if_enabled(Some(&app), false).await;
     }
     Ok(saved)
@@ -382,6 +385,45 @@ async fn switch_account(
 ) -> Result<accounts::AntigravityAccount, String> {
     accounts::switch_antigravity_account(account_id, switch_target, launch, custom_path, working_dir)
         .await
+}
+
+#[tauri::command]
+async fn get_ide_bridge_status() -> ide_bridge::IdeBridgeStatus {
+    ide_bridge::get_status().await
+}
+
+#[tauri::command]
+async fn save_ide_bridge_settings(
+    app: tauri::AppHandle,
+    settings: ide_bridge::IdeBridgeSettings,
+) -> Result<ide_bridge::IdeBridgeSettings, String> {
+    let saved = ide_bridge::save_settings(settings)?;
+    let _ = app.emit("auto-switch-config-changed", auto_switch::load_config());
+    let _ = app.emit("ide-bridge-status-changed", ide_bridge::get_status().await);
+    if saved.seamless_auto_switch {
+        let _ = auto_switch::evaluate_and_run_if_enabled(Some(&app), false).await;
+    }
+    Ok(saved)
+}
+
+#[tauri::command]
+async fn inject_ide_bridge_extension(
+    app: tauri::AppHandle,
+) -> Result<ide_bridge::IdeBridgeStatus, String> {
+    let st = ide_bridge::inject_extension().await?;
+    let _ = app.emit("auto-switch-config-changed", auto_switch::load_config());
+    let _ = app.emit("ide-bridge-status-changed", &st);
+    Ok(st)
+}
+
+#[tauri::command]
+async fn remove_ide_bridge_extension() -> Result<ide_bridge::IdeBridgeStatus, String> {
+    ide_bridge::remove_extension().await
+}
+
+#[tauri::command]
+async fn relaunch_antigravity_ide() -> Result<String, String> {
+    accounts::relaunch_antigravity_ide().await
 }
 
 #[tauri::command]
@@ -768,6 +810,7 @@ pub fn run() {
             api_service::spawn_auto_start_if_enabled();
             api_service::spawn_background_quota_worker(app.handle().clone());
             auto_switch::spawn_auto_switch_watcher(app.handle().clone());
+            ide_bridge::spawn_bridge_server(app.handle().clone());
 
             // Native System Tray so API Router keeps running when closing the window
             if let Ok(item_show) = MenuItem::with_id(
@@ -825,6 +868,7 @@ pub fn run() {
                                 "tray_quit" => {
                                     ALLOW_APP_EXIT.store(true, Ordering::SeqCst);
                                     api_service::stop_server_sync();
+                                    ide_bridge::cleanup_discovery_file_sync();
                                     app_handle.exit(0);
                                 }
                                 _ => {}
@@ -922,6 +966,11 @@ pub fn run() {
             run_auto_switch_check,
             detect_launch_targets,
             switch_account,
+            get_ide_bridge_status,
+            save_ide_bridge_settings,
+            inject_ide_bridge_extension,
+            remove_ide_bridge_extension,
+            relaunch_antigravity_ide,
             update_account_metadata,
             delete_accounts,
             prepare_oauth_session,
@@ -978,6 +1027,7 @@ pub fn run() {
                 tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
             ) {
                 api_service::stop_server_sync();
+                ide_bridge::cleanup_discovery_file_sync();
             }
         });
 }

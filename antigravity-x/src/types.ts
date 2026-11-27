@@ -821,3 +821,32 @@ export type AutoSwitchEvalResult = {
   alertTriggered: boolean;
   alertMessage?: string | null;
 };
+
+export type IdeBridgeSettings = {
+  seamlessAutoSwitch: boolean;
+  seamlessPriority: boolean;
+  autoHealInject: boolean;
+  fallbackRelaunch: boolean;
+};
+
+export type ConnectedIdeClientInfo = {
+  clientId: number;
+  extensionVersion: string;
+  vscodeVersion: string;
+  ideName: string;
+  connectedAt: number;
+};
+
+export type IdeBridgeStatus = {
+  serverRunning: boolean;
+  wsPort?: number | null;
+  ideFound: boolean;
+  ideRootPath?: string | null;
+  extensionDir?: string | null;
+  extensionInjected: boolean;
+  extensionVersion?: string | null;
+  needsUpdate: boolean;
+  connectedCount: number;
+  connectedClients: ConnectedIdeClientInfo[];
+  settings: IdeBridgeSettings;
+};

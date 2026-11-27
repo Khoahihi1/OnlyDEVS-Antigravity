@@ -37,6 +37,7 @@ export function UpdateNotification({
   const vi = lang === "vi";
   const [installing, setInstalling] = useState(false);
   const [progress, setProgress] = useState<UpdateProgressPayload | null>(null);
+  const [infoMessage, setInfoMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -84,6 +85,7 @@ export function UpdateNotification({
     }
     setInstalling(true);
     setError(null);
+    setInfoMessage(null);
     setProgress({
       downloaded: 0,
       total: update.assetSize,
@@ -91,11 +93,16 @@ export function UpdateNotification({
       status: "downloading",
     });
     try {
-      await agxInvoke<string>("download_and_install_update", {
+      const msg = await agxInvoke<string>("download_and_install_update", {
         downloadUrl: update.downloadUrl,
         assetName: update.assetName ?? null,
         silent: false,
       });
+      if (msg) {
+        setInfoMessage(msg);
+      }
+      setInstalling(false);
+      setProgress(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setInstalling(false);
@@ -177,8 +184,8 @@ export function UpdateNotification({
                 <span>
                   {progress.status === "installing"
                     ? vi
-                      ? "Đang khởi chạy trình cài đặt Setup..."
-                      : "Launching setup installer..."
+                      ? "Đang cài đặt bản cập nhật..."
+                      : "Installing update..."
                     : vi
                       ? "Đang tải bản cập nhật..."
                       : "Downloading update..."}
@@ -195,6 +202,12 @@ export function UpdateNotification({
                   style={{ width: `${Math.max(4, Math.min(100, progress.percent))}%` }}
                 />
               </div>
+            </div>
+          ) : null}
+
+          {infoMessage ? (
+            <div className="od-banner is-ok" style={{ marginTop: 12 }}>
+              <span>{infoMessage}</span>
             </div>
           ) : null}
 

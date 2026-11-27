@@ -33,7 +33,7 @@ import type {
   VersionJumpInfo,
 } from "./types";
 
-const APP_VERSION = "1.2.16";
+const APP_VERSION = "1.2.17";
 
 const VALID_LANGS: AppLanguage[] = ["vi", "en", "zh-CN", "zh-TW", "ja", "ko", "ru", "de"];
 const VALID_THEME_COLORS: AppThemeColor[] = [
@@ -388,10 +388,23 @@ export default function App() {
                 customPath: customPath ?? null,
                 workingDir: workingDir ?? null,
               });
+              let seamlessOk = false;
+              if (!launch && switchTarget !== "cli") {
+                try {
+                  const st = await agxInvoke<{ connectedCount?: number; settings?: { seamlessPriority?: boolean } }>(
+                    "get_ide_bridge_status",
+                  );
+                  seamlessOk = Boolean(st?.connectedCount && st?.settings?.seamlessPriority !== false);
+                } catch {
+                  // ignore
+                }
+              }
               showToast(
                 launch
                   ? `Đã chuyển & mở: ${acc.email}`
-                  : `Đã chuyển tài khoản: ${acc.email}`,
+                  : seamlessOk
+                    ? `Đã chuyển nóng vào Antigravity IDE (không restart): ${acc.email}`
+                    : `Đã chuyển tài khoản: ${acc.email}`,
               );
               await refreshAll();
             }}

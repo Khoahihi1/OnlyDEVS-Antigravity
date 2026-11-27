@@ -1889,6 +1889,15 @@ fn spawn_antigravity_target(
     }
 }
 
+pub async fn relaunch_antigravity_ide() -> Result<String, String> {
+    tokio::task::spawn_blocking(|| {
+        close_antigravity_process_by_target("antigravity_ide");
+        spawn_antigravity_target("antigravity_ide", None, None)
+    })
+    .await
+    .map_err(|e| format!("Relaunch task join: {e}"))?
+}
+
 pub async fn switch_antigravity_account(
     account_id: String,
     switch_target: Option<String>,
@@ -1897,7 +1906,21 @@ pub async fn switch_antigravity_account(
     working_dir: Option<String>,
 ) -> Result<AntigravityAccount, String> {
     let started = std::time::Instant::now();
-    let target = switch_target.unwrap_or_else(|| "antigravity_ide".into());
+    let raw_target = switch_target.unwrap_or_else(|| "antigravity_ide".into());
+    let target = match raw_target.trim().to_ascii_lowercase().as_str() {
+        "ide" | "antigravity_ide" => "antigravity_ide".to_string(),
+        "antigravity" => "antigravity".to_string(),
+        "cli" => "cli".to_string(),
+        "both" => "both".to_string(),
+        _ => "antigravity_ide".to_string(),
+    };
+    let affects_ide = target != "cli";
+    let affects_cli = target == "cli" || target == "both";
+    let ide_launch_target = if target == "both" {
+        "antigravity_ide".to_string()
+    } else {
+        target.clone()
+    };
     let should_launch = launch.unwrap_or(false);
 
     let (mut acc, previous_email) = {
@@ -1953,8 +1976,8 @@ pub async fn switch_antigravity_account(
     }
 
     // 0. Close running target process before writing credentials/state.vscdb when launching
-    if should_launch && (target == "antigravity_ide" || target == "antigravity") {
-        let t_close = target.clone();
+    if should_launch && affects_ide {
+        let t_close = ide_launch_target.clone();
         let _ = tokio::task::spawn_blocking(move || close_antigravity_process_by_target(&t_close)).await;
     }
 
@@ -1968,23 +1991,27 @@ pub async fn switch_antigravity_account(
     fs::write(&fallback_path, &payload_json)
         .map_err(|e| format!("Ghi {DESKTOP_FALLBACK_FILE}: {e}"))?;
     let cli_dir = gemini.join("antigravity-cli");
-    if target == "cli" || cli_dir.is_dir() {
+    if affects_cli || cli_dir.is_dir() {
         fs::create_dir_all(&cli_dir).map_err(|e| format!("Tạo antigravity-cli: {e}"))?;
         fs::write(cli_dir.join(CLI_OAUTH_TOKEN_FILE), &payload_json)
             .map_err(|e| format!("Ghi {CLI_OAUTH_TOKEN_FILE}: {e}"))?;
     }
 
     // 3. Inject into %APPDATA%/Antigravity*/User/globalStorage/state.vscdb if present
-    if target != "cli" {
+    if affects_ide {
         for db_path in antigravity_state_db_candidates() {
             let _ = inject_account_into_state_db(&db_path, &acc);
         }
     }
 
-    // 4. Launch selected target application if requested
+    // 4. Launch selected target application if requested, or push live via Seamless IDE Bridge
     let mut switch_note = "Đã chuyển tài khoản".to_string();
     if should_launch {
-        let t_launch = target.clone();
+        let t_launch = if target == "cli" {
+            "cli".to_string()
+        } else {
+            ide_launch_target.clone()
+        };
         let cp = custom_path.clone();
         let wd = working_dir.clone();
         let launch_res = tokio::task::spawn_blocking(move || {
@@ -1993,6 +2020,29 @@ pub async fn switch_antigravity_account(
         .await
         .map_err(|e| format!("Launch task join: {e}"))??;
         switch_note = launch_res;
+    } else if affects_ide
+        && crate::ide_bridge::is_seamless_priority_enabled()
+        && crate::ide_bridge::has_connected_clients().await
+    {
+        let seamless_payload = crate::ide_bridge::SeamlessSwitchPayload {
+            email: acc.email.clone(),
+            access_token: acc.token.access_token.clone(),
+            refresh_token: acc.token.refresh_token.clone(),
+            expiry_date_seconds: acc.token.expiry_timestamp,
+            is_gcp_tos: acc
+                .token
+                .is_gcp_tos
+                .or_else(|| acc.quota.as_ref().and_then(|q| q.is_gcp_tos))
+                .unwrap_or(false),
+        };
+        match crate::ide_bridge::request_seamless_switch(seamless_payload, 8_000).await {
+            Ok(_) => {
+                switch_note = "Đã chuyển nóng qua IDE Bridge (không restart)".to_string();
+            }
+            Err(err) => {
+                switch_note = format!("Đã ghi đĩa (IDE Bridge lỗi: {err})");
+            }
+        }
     }
 
     acc.last_used = now;

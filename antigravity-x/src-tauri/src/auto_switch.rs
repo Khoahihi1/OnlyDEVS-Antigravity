@@ -135,13 +135,29 @@ pub fn load_config() -> AutoSwitchConfig {
         .unwrap_or_default()
 }
 
-pub fn save_config(cfg: AutoSwitchConfig) -> Result<AutoSwitchConfig, String> {
+fn write_config_only(cfg: AutoSwitchConfig) -> Result<AutoSwitchConfig, String> {
     let normalized = normalize_config(cfg);
     let path = config_path()?;
     let json = serde_json::to_string_pretty(&normalized)
         .map_err(|e| format!("Serialize auto_switch_config: {e}"))?;
     fs::write(&path, json).map_err(|e| format!("Ghi auto_switch_config: {e}"))?;
     Ok(normalized)
+}
+
+pub fn save_config(cfg: AutoSwitchConfig) -> Result<AutoSwitchConfig, String> {
+    let normalized = write_config_only(cfg)?;
+    if normalized.enabled {
+        crate::ide_bridge::disable_seamless_mode();
+    }
+    Ok(normalized)
+}
+
+pub fn disable_classic_mode() {
+    let mut cfg = load_config();
+    if cfg.enabled {
+        cfg.enabled = false;
+        let _ = write_config_only(cfg);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -403,7 +419,9 @@ pub async fn evaluate_and_run_if_enabled(
 ) -> Result<AutoSwitchEvalResult, String> {
     let _guard = eval_lock().lock().await;
     let cfg = load_config();
-    if !force_check && !cfg.enabled && !cfg.quota_alert_enabled {
+    let seamless_on = crate::ide_bridge::is_seamless_auto_switch_enabled();
+    let effective_enabled = cfg.enabled || seamless_on;
+    if !force_check && !effective_enabled && !cfg.quota_alert_enabled {
         return Ok(AutoSwitchEvalResult {
             switched: false,
             from_email: None,
@@ -420,7 +438,11 @@ pub async fn evaluate_and_run_if_enabled(
         .find(|a| a.is_current)
         .map(|a| a.email.clone());
 
-    let (switch_plan, alert_msg) = evaluate_accounts_in_memory(&cfg, &accounts);
+    let mut eval_cfg = cfg.clone();
+    if effective_enabled {
+        eval_cfg.enabled = true;
+    }
+    let (switch_plan, alert_msg) = evaluate_accounts_in_memory(&eval_cfg, &accounts);
 
     let mut alert_triggered = false;
     if let Some(ref msg) = alert_msg {
@@ -446,15 +468,29 @@ pub async fn evaluate_and_run_if_enabled(
         }
     }
 
-    if let Some((target_id, reason)) = switch_plan {
+    if let Some((target_id, mut reason)) = switch_plan {
+        crate::ide_bridge::auto_heal_if_enabled();
+        let bridge_ready = cfg.switch_target != "cli"
+            && crate::ide_bridge::is_seamless_priority_enabled()
+            && crate::ide_bridge::has_connected_clients().await;
+        let should_relaunch = cfg.switch_target != "cli"
+            && !bridge_ready
+            && crate::ide_bridge::is_fallback_relaunch_enabled();
+
         let switched_acc = accounts::switch_antigravity_account(
             target_id,
             Some(cfg.switch_target.clone()),
-            Some(false),
+            Some(should_relaunch),
             None,
             None,
         )
         .await?;
+
+        if bridge_ready {
+            reason = format!("{reason} · Seamless IDE Bridge");
+        } else if should_relaunch {
+            reason = format!("{reason} · Relaunched IDE");
+        }
 
         let result = AutoSwitchEvalResult {
             switched: true,
@@ -474,7 +510,7 @@ pub async fn evaluate_and_run_if_enabled(
         switched: false,
         from_email: current_email,
         to_email: None,
-        reason: if cfg.enabled {
+        reason: if effective_enabled {
             "Tài khoản hiện tại vẫn đủ hạn mức hoặc chưa có tài khoản dự phòng đạt ngưỡng".into()
         } else {
             "Tự động chuyển đổi đang tắt".into()
@@ -493,7 +529,8 @@ pub fn spawn_auto_switch_watcher(app: AppHandle) {
         loop {
             let cfg = load_config();
             let interval_secs = cfg.poll_interval_minutes.clamp(1, 60) * 60;
-            if cfg.enabled || cfg.quota_alert_enabled {
+            let seamless_on = crate::ide_bridge::is_seamless_auto_switch_enabled();
+            if cfg.enabled || seamless_on || cfg.quota_alert_enabled {
                 if let Ok(accs) = accounts::list_accounts_sync() {
                     if let Some(current) = accs.iter().find(|a| a.is_current) {
                         let _ = accounts::refresh_single_account_quota(current.id.clone()).await;

@@ -11,6 +11,8 @@ import type {
   ApiTestChatResult,
   AutoSwitchConfig,
   AutoSwitchEvalResult,
+  IdeBridgeSettings,
+  IdeBridgeStatus,
   InstructionMode,
   McpSkillsState,
   OAuthPrepareResult,
@@ -542,6 +544,72 @@ export async function agxInvoke<T>(command: string, args?: Record<string, unknow
       mockAccounts = mockAccounts.map((a) => ({ ...a, isCurrent: a.id === id }));
       return (mockAccounts.find((a) => a.id === id) ?? mockAccounts[0]) as T;
     }
+    case "get_ide_bridge_status":
+      return {
+        serverRunning: true,
+        wsPort: 57128,
+        ideFound: true,
+        ideRootPath: "C:\\Users\\KhoaHihi\\AppData\\Local\\Programs\\Antigravity IDE\\resources\\app",
+        extensionDir: "C:\\Users\\KhoaHihi\\AppData\\Local\\Programs\\Antigravity IDE\\resources\\app\\extensions\\onlydevs-auth-bridge",
+        extensionInjected: false,
+        extensionVersion: null,
+        needsUpdate: false,
+        connectedCount: 0,
+        connectedClients: [],
+        settings: {
+          seamlessAutoSwitch: false,
+          seamlessPriority: true,
+          autoHealInject: false,
+          fallbackRelaunch: false,
+        },
+      } as IdeBridgeStatus as T;
+    case "save_ide_bridge_settings":
+      return (args?.settings ?? {
+        seamlessAutoSwitch: false,
+        seamlessPriority: true,
+        autoHealInject: false,
+        fallbackRelaunch: false,
+      }) as IdeBridgeSettings as T;
+    case "inject_ide_bridge_extension":
+      return {
+        serverRunning: true,
+        wsPort: 57128,
+        ideFound: true,
+        ideRootPath: "C:\\Users\\KhoaHihi\\AppData\\Local\\Programs\\Antigravity IDE\\resources\\app",
+        extensionDir: "C:\\Users\\KhoaHihi\\AppData\\Local\\Programs\\Antigravity IDE\\resources\\app\\extensions\\onlydevs-auth-bridge",
+        extensionInjected: true,
+        extensionVersion: "1.0.0",
+        needsUpdate: false,
+        connectedCount: 0,
+        connectedClients: [],
+        settings: {
+          seamlessAutoSwitch: true,
+          seamlessPriority: true,
+          autoHealInject: true,
+          fallbackRelaunch: false,
+        },
+      } as IdeBridgeStatus as T;
+    case "remove_ide_bridge_extension":
+      return {
+        serverRunning: true,
+        wsPort: 57128,
+        ideFound: true,
+        ideRootPath: "C:\\Users\\KhoaHihi\\AppData\\Local\\Programs\\Antigravity IDE\\resources\\app",
+        extensionDir: "C:\\Users\\KhoaHihi\\AppData\\Local\\Programs\\Antigravity IDE\\resources\\app\\extensions\\onlydevs-auth-bridge",
+        extensionInjected: false,
+        extensionVersion: null,
+        needsUpdate: false,
+        connectedCount: 0,
+        connectedClients: [],
+        settings: {
+          seamlessAutoSwitch: false,
+          seamlessPriority: true,
+          autoHealInject: false,
+          fallbackRelaunch: false,
+        },
+      } as IdeBridgeStatus as T;
+    case "relaunch_antigravity_ide":
+      return "Đã khởi chạy lại Antigravity IDE (mock)" as T;
     case "prepare_oauth_session":
       return {
         authUrl: "https://accounts.google.com/o/oauth2/v2/auth?client_id=1071006060591",

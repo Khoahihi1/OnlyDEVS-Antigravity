@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -239,10 +239,54 @@ fn build_http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("Khởi tạo HTTP client updater: {e}"))
 }
 
-fn pick_windows_asset(assets: &[Value]) -> (Option<String>, Option<String>, Option<u64>, bool) {
-    let mut best_setup: Option<(String, String, Option<u64>)> = None;
-    let mut best_msi: Option<(String, String, Option<u64>)> = None;
-    let mut best_exe: Option<(String, String, Option<u64>)> = None;
+fn arch_match_score(lower_name: &str, arch: &str) -> u8 {
+    let is_arm64 = lower_name.contains("aarch64") || lower_name.contains("arm64");
+    let is_x64 =
+        lower_name.contains("x86_64") || lower_name.contains("amd64") || lower_name.contains("_x64") || lower_name.contains("-x64");
+    let is_universal = lower_name.contains("universal");
+
+    match arch {
+        "aarch64" => {
+            if is_arm64 {
+                3
+            } else if is_universal {
+                2
+            } else if !is_x64 {
+                1
+            } else {
+                0
+            }
+        }
+        "x86_64" => {
+            if is_x64 {
+                3
+            } else if is_universal {
+                2
+            } else if !is_arm64 {
+                1
+            } else {
+                0
+            }
+        }
+        _ => {
+            if is_universal {
+                2
+            } else {
+                1
+            }
+        }
+    }
+}
+
+pub fn pick_asset_for_platform(
+    assets: &[Value],
+    os: &str,
+    arch: &str,
+    linux_prefer_appimage: bool,
+    linux_prefer_deb: bool,
+    linux_prefer_rpm: bool,
+) -> (Option<String>, Option<String>, Option<u64>, bool) {
+    let mut candidates: Vec<(u8, u8, String, String, Option<u64>, bool)> = Vec::new();
 
     for a in assets {
         let Some(name) = a.get("name").and_then(Value::as_str) else {
@@ -253,25 +297,114 @@ fn pick_windows_asset(assets: &[Value]) -> (Option<String>, Option<String>, Opti
         };
         let size = a.get("size").and_then(Value::as_u64);
         let lower = name.to_ascii_lowercase();
-        if lower.ends_with("-setup.exe") || (lower.contains("setup") && lower.ends_with(".exe")) {
-            best_setup = Some((url.to_string(), name.to_string(), size));
-        } else if lower.ends_with(".msi") {
-            best_msi = Some((url.to_string(), name.to_string(), size));
-        } else if lower.ends_with(".exe") {
-            best_exe = Some((url.to_string(), name.to_string(), size));
+
+        // Skip signature / checksum / manifest files
+        if lower.ends_with(".sig")
+            || lower.ends_with(".asc")
+            || lower.ends_with(".sha256")
+            || lower.ends_with(".json")
+        {
+            continue;
+        }
+
+        let arch_score = arch_match_score(&lower, arch);
+        if arch_score == 0 {
+            continue;
+        }
+
+        match os {
+            "windows" => {
+                if lower.ends_with("-setup.exe") || (lower.contains("setup") && lower.ends_with(".exe")) {
+                    candidates.push((3, arch_score, url.to_string(), name.to_string(), size, true));
+                } else if lower.ends_with(".msi") {
+                    candidates.push((2, arch_score, url.to_string(), name.to_string(), size, true));
+                } else if lower.ends_with(".exe") {
+                    candidates.push((1, arch_score, url.to_string(), name.to_string(), size, false));
+                }
+            }
+            "macos" => {
+                if lower.ends_with(".app.tar.gz") || lower.ends_with(".app.tgz") {
+                    candidates.push((3, arch_score, url.to_string(), name.to_string(), size, true));
+                } else if lower.ends_with(".dmg") {
+                    candidates.push((2, arch_score, url.to_string(), name.to_string(), size, true));
+                }
+            }
+            "linux" => {
+                let kind_rank = if lower.ends_with(".appimage") {
+                    if linux_prefer_appimage {
+                        4
+                    } else if !linux_prefer_deb && !linux_prefer_rpm {
+                        3
+                    } else {
+                        2
+                    }
+                } else if lower.ends_with(".deb") {
+                    if linux_prefer_deb && !linux_prefer_appimage {
+                        4
+                    } else {
+                        2
+                    }
+                } else if lower.ends_with(".rpm") {
+                    if linux_prefer_rpm && !linux_prefer_appimage {
+                        4
+                    } else {
+                        1
+                    }
+                } else {
+                    0
+                };
+                if kind_rank > 0 {
+                    candidates.push((kind_rank, arch_score, url.to_string(), name.to_string(), size, true));
+                }
+            }
+            _ => {}
         }
     }
 
-    if let Some((u, n, s)) = best_setup {
-        return (Some(u), Some(n), s, true);
-    }
-    if let Some((u, n, s)) = best_msi {
-        return (Some(u), Some(n), s, true);
-    }
-    if let Some((u, n, s)) = best_exe {
-        return (Some(u), Some(n), s, false);
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+    if let Some((_, _, u, n, s, inst)) = candidates.into_iter().next() {
+        return (Some(u), Some(n), s, inst);
     }
     (None, None, None, false)
+}
+
+fn pick_current_platform_asset(assets: &[Value]) -> (Option<String>, Option<String>, Option<u64>, bool) {
+    let prefer_appimage = std::env::var_os("APPIMAGE").is_some();
+    let prefer_deb = Path::new("/usr/bin/dpkg").exists() || Path::new("/etc/debian_version").exists();
+    let prefer_rpm = Path::new("/usr/bin/rpm").exists() || Path::new("/etc/redhat-release").exists();
+    pick_asset_for_platform(
+        assets,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        prefer_appimage,
+        prefer_deb,
+        prefer_rpm,
+    )
+}
+
+fn pick_manifest_platform_url_for(manifest: &Value, os: &str, arch: &str) -> Option<String> {
+    let keys: &[&str] = match (os, arch) {
+        ("windows", "aarch64") => &["windows-aarch64", "windows-x86_64"],
+        ("windows", _) => &["windows-x86_64", "windows-x86_64-nsis"],
+        ("macos", "aarch64") => &["darwin-aarch64", "darwin-universal"],
+        ("macos", _) => &["darwin-x86_64", "darwin-universal"],
+        ("linux", "aarch64") => &["linux-aarch64", "linux-aarch64-appimage"],
+        ("linux", _) => &["linux-x86_64", "linux-x86_64-appimage"],
+        _ => &[],
+    };
+    for k in keys {
+        let ptr = format!("/platforms/{k}/url");
+        if let Some(u) = manifest.pointer(&ptr).and_then(Value::as_str) {
+            if !u.trim().is_empty() {
+                return Some(u.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn pick_manifest_platform_url(manifest: &Value) -> Option<String> {
+    pick_manifest_platform_url_for(manifest, std::env::consts::OS, std::env::consts::ARCH)
 }
 
 pub async fn check_for_updates(force: bool) -> Result<UpdateCheckResult, String> {
@@ -327,7 +460,7 @@ pub async fn check_for_updates(force: bool) -> Result<UpdateCheckResult, String>
                     .cloned()
                     .unwrap_or_default();
                 let (download_url, asset_name, asset_size, is_installer) =
-                    pick_windows_asset(&assets);
+                    pick_current_platform_asset(&assets);
                 let has_update = is_newer_version(&latest_version, CURRENT_VERSION);
                 let skipped = !force
                     && !settings.skipped_version.is_empty()
@@ -386,18 +519,23 @@ pub async fn check_for_updates(force: bool) -> Result<UpdateCheckResult, String>
         .get("pub_date")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let download_url = manifest
-        .pointer("/platforms/windows-x86_64/url")
-        .or_else(|| manifest.pointer("/platforms/windows-x86_64-nsis/url"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let download_url = pick_manifest_platform_url(&manifest);
     let asset_name = download_url
         .as_deref()
         .and_then(|u| u.rsplit('/').next())
         .map(str::to_string);
     let is_installer = asset_name
         .as_deref()
-        .map(|n| n.to_ascii_lowercase().contains("setup") || n.to_ascii_lowercase().ends_with(".msi"))
+        .map(|n| {
+            let l = n.to_ascii_lowercase();
+            l.contains("setup")
+                || l.ends_with(".msi")
+                || l.ends_with(".app.tar.gz")
+                || l.ends_with(".dmg")
+                || l.ends_with(".appimage")
+                || l.ends_with(".deb")
+                || l.ends_with(".rpm")
+        })
         .unwrap_or(true);
     let has_update = is_newer_version(&latest_version, CURRENT_VERSION);
     let skipped = !force
@@ -431,10 +569,16 @@ pub async fn download_and_install_update(
         return Err("Thiếu đường dẫn tải bản cập nhật.".into());
     }
 
+    let default_name = match std::env::consts::OS {
+        "macos" => "OnlyDEVS-Antigravity.app.tar.gz",
+        "linux" => "OnlyDEVS-Antigravity.AppImage",
+        _ => "OnlyDEVS-Antigravity-setup.exe",
+    };
+
     let file_name = asset_name
         .filter(|s| !s.trim().is_empty())
         .or_else(|| url.rsplit('/').next().map(str::to_string))
-        .unwrap_or_else(|| "OnlyDEVS-Antigravity-setup.exe".to_string());
+        .unwrap_or_else(|| default_name.to_string());
 
     let safe_name: String = file_name
         .chars()
@@ -563,7 +707,341 @@ pub async fn download_and_install_update(
         }
         // Gracefully exit app so NSIS / updater can overwrite the executable cleanly
         app.exit(0);
+        return Ok("Đang khởi chạy trình cài đặt cập nhật...".into());
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        return install_update_macos(&app, &dest_path, &temp_dir, &lower);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return install_update_linux(&app, &dest_path, &temp_dir, &lower);
+    }
+
+    #[allow(unreachable_code)]
     Ok(dest_path.to_string_lossy().to_string())
+}
+
+#[cfg(any(unix, test))]
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(unix)]
+fn is_dir_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".onlydevs_probe_{}", std::process::id()));
+    match fs::OpenOptions::new().create(true).write(true).open(&probe) {
+        Ok(_) => {
+            let _ = fs::remove_file(probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn find_extracted_app_bundle(root: &Path) -> Option<PathBuf> {
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() && p.extension().and_then(|e| e.to_str()) == Some("app") {
+                return Some(p);
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let sub = entry.path();
+            if sub.is_dir() {
+                if let Ok(sub_entries) = fs::read_dir(&sub) {
+                    for se in sub_entries.flatten() {
+                        let p = se.path();
+                        if p.is_dir() && p.extension().and_then(|e| e.to_str()) == Some("app") {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_target_app(fallback_name: &str) -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        for anc in exe.ancestors() {
+            if anc.extension().and_then(|e| e.to_str()) == Some("app") {
+                return anc.to_path_buf();
+            }
+        }
+    }
+    PathBuf::from("/Applications").join(fallback_name)
+}
+
+#[cfg(target_os = "macos")]
+fn install_update_macos(
+    app: &AppHandle,
+    dest_path: &Path,
+    temp_dir: &Path,
+    lower: &str,
+) -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _ = Command::new("xattr")
+        .args(["-d", "com.apple.quarantine"])
+        .arg(dest_path)
+        .output();
+
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        let extract_dir = temp_dir.join("extracted");
+        if extract_dir.exists() {
+            let _ = fs::remove_dir_all(&extract_dir);
+        }
+        fs::create_dir_all(&extract_dir).map_err(|e| format!("Tạo thư mục giải nén: {e}"))?;
+
+        let tar_out = Command::new("tar")
+            .args(["-xzf"])
+            .arg(dest_path)
+            .arg("-C")
+            .arg(&extract_dir)
+            .output()
+            .map_err(|e| format!("Chạy tar thất bại: {e}"))?;
+        if !tar_out.status.success() {
+            let err_txt = String::from_utf8_lossy(&tar_out.stderr);
+            return Err(format!("Giải nén bản cập nhật macOS thất bại: {err_txt}"));
+        }
+
+        let extracted_app = find_extracted_app_bundle(&extract_dir)
+            .ok_or_else(|| "Không tìm thấy gói .app trong bản cập nhật.".to_string())?;
+        let _ = Command::new("xattr")
+            .args(["-dr", "com.apple.quarantine"])
+            .arg(&extracted_app)
+            .output();
+
+        let fallback_name = extracted_app
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("OnlyDEVS-Antigravity.app");
+        let target_app = resolve_macos_target_app(fallback_name);
+        let parent_dir = target_app.parent().unwrap_or_else(|| Path::new("/Applications"));
+        let writable = is_dir_writable(parent_dir);
+
+        let src_q = shell_single_quote(&extracted_app.to_string_lossy());
+        let dst_q = shell_single_quote(&target_app.to_string_lossy());
+        let script_path = temp_dir.join("apply-update.sh");
+
+        let replace_cmd = format!(
+            "rm -rf {dst_q} && ditto {src_q} {dst_q} && (xattr -dr com.apple.quarantine {dst_q} 2>/dev/null || true)"
+        );
+        let script_body = if writable {
+            format!(
+                "#!/bin/sh\nsleep 1.5\n{replace_cmd}\nopen -n {dst_q}\nrm -f -- \"$0\"\n"
+            )
+        } else {
+            let osa_cmd = replace_cmd.replace('\\', "\\\\").replace('"', "\\\"");
+            format!(
+                "#!/bin/sh\nsleep 1.5\nosascript -e \"do shell script \\\"{osa_cmd}\\\" with administrator privileges\"\nopen -n {dst_q}\nrm -f -- \"$0\"\n"
+            )
+        };
+
+        fs::write(&script_path, script_body)
+            .map_err(|e| format!("Tạo script cập nhật macOS: {e}"))?;
+        let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755));
+
+        Command::new("sh")
+            .arg(&script_path)
+            .spawn()
+            .map_err(|e| format!("Không thể chạy script cập nhật macOS: {e}"))?;
+        app.exit(0);
+        return Ok("Đang cài đặt bản cập nhật và khởi động lại ứng dụng...".into());
+    }
+
+    if lower.ends_with(".dmg") {
+        Command::new("open")
+            .arg(dest_path)
+            .spawn()
+            .map_err(|e| format!("Không thể mở tệp DMG: {e}"))?;
+        return Ok(format!(
+            "Đã tải và mở {}. Hãy kéo ứng dụng vào thư mục Applications để hoàn tất cập nhật.",
+            dest_path.file_name().and_then(|n| n.to_str()).unwrap_or("installer.dmg")
+        ));
+    }
+
+    Command::new("open")
+        .args(["-R"])
+        .arg(dest_path)
+        .spawn()
+        .map_err(|e| format!("Không thể mở Finder tới bản tải về: {e}"))?;
+    Ok(format!("Đã tải bản cập nhật tại {}", dest_path.display()))
+}
+
+#[cfg(target_os = "linux")]
+fn install_update_linux(
+    app: &AppHandle,
+    dest_path: &Path,
+    temp_dir: &Path,
+    lower: &str,
+) -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if lower.ends_with(".appimage") {
+        fs::set_permissions(dest_path, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("Cấp quyền thực thi AppImage thất bại: {e}"))?;
+
+        if let Some(current_appimage) = std::env::var_os("APPIMAGE").map(PathBuf::from) {
+            if let Some(parent) = current_appimage.parent() {
+                if is_dir_writable(parent) {
+                    let stage_target = parent.join(format!(
+                        ".onlydevs-update-{}.AppImage",
+                        std::process::id()
+                    ));
+                    let src_q = shell_single_quote(&dest_path.to_string_lossy());
+                    let stage_q = shell_single_quote(&stage_target.to_string_lossy());
+                    let dst_q = shell_single_quote(&current_appimage.to_string_lossy());
+                    let script_path = temp_dir.join("apply-update.sh");
+                    let script_body = format!(
+                        "#!/bin/sh\nsleep 1.5\ncp -f {src_q} {stage_q} && chmod +x {stage_q} && mv -f {stage_q} {dst_q} && nohup {dst_q} >/dev/null 2>&1 &\nrm -f -- {src_q} \"$0\"\n"
+                    );
+                    fs::write(&script_path, script_body)
+                        .map_err(|e| format!("Tạo script cập nhật AppImage: {e}"))?;
+                    let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755));
+                    Command::new("sh")
+                        .arg(&script_path)
+                        .spawn()
+                        .map_err(|e| format!("Không thể chạy script cập nhật AppImage: {e}"))?;
+                    app.exit(0);
+                    return Ok("Đang cập nhật AppImage và khởi động lại...".into());
+                }
+            }
+        }
+
+        Command::new(dest_path)
+            .spawn()
+            .map_err(|e| format!("Không thể khởi chạy AppImage mới: {e}"))?;
+        app.exit(0);
+        return Ok("Đã tải và khởi chạy AppImage phiên bản mới.".into());
+    }
+
+    if lower.ends_with(".deb") || lower.ends_with(".rpm") {
+        let has_gui = std::env::var_os("DISPLAY").is_some()
+            || std::env::var_os("WAYLAND_DISPLAY").is_some();
+        if has_gui && which::which("pkexec").is_ok() {
+            let pkg_q = shell_single_quote(&dest_path.to_string_lossy());
+            let install_cmd = if lower.ends_with(".deb") {
+                format!("apt-get install -y {pkg_q} || (dpkg -i {pkg_q} && apt-get install -f -y)")
+            } else {
+                format!("dnf install -y {pkg_q} || rpm -Uvh --replacepkgs {pkg_q}")
+            };
+            let status = Command::new("pkexec")
+                .args(["sh", "-c", &install_cmd])
+                .status()
+                .map_err(|e| format!("Không thể chạy pkexec: {e}"))?;
+            if status.success() {
+                for bin_name in ["onlydevs-antigravity", "OnlyDEVS-Antigravity"] {
+                    if let Ok(bin_path) = which::which(bin_name) {
+                        let _ = Command::new(bin_path).spawn();
+                        break;
+                    }
+                }
+                app.exit(0);
+                return Ok("Đã cài đặt gói cập nhật và khởi động lại ứng dụng.".into());
+            }
+        }
+
+        if which::which("xdg-open").is_ok() {
+            Command::new("xdg-open")
+                .arg(dest_path)
+                .spawn()
+                .map_err(|e| format!("Không thể mở trình cài đặt gói: {e}"))?;
+            return Ok(format!(
+                "Đã tải về {}. Hãy xác nhận cài đặt trong trình quản lý gói.",
+                dest_path.file_name().and_then(|n| n.to_str()).unwrap_or("package")
+            ));
+        }
+
+        return Err(format!(
+            "Đã tải gói cài đặt tại {}, nhưng không tìm thấy pkexec/xdg-open. Vui lòng cài thủ công.",
+            dest_path.display()
+        ));
+    }
+
+    if which::which("xdg-open").is_ok() {
+        let _ = Command::new("xdg-open").arg(dest_path).spawn();
+    }
+    Ok(format!("Đã tải bản cập nhật tại {}", dest_path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_assets() -> Vec<Value> {
+        vec![
+            json!({"name": "OnlyDEVS-Antigravity_1.2.16_x64-setup.exe", "browser_download_url": "https://example/win-setup.exe", "size": 100}),
+            json!({"name": "OnlyDEVS-Antigravity_1.2.16_x64_en-US.msi", "browser_download_url": "https://example/win.msi", "size": 101}),
+            json!({"name": "OnlyDEVS-Antigravity_aarch64.app.tar.gz", "browser_download_url": "https://example/mac-arm.app.tar.gz", "size": 200}),
+            json!({"name": "OnlyDEVS-Antigravity_aarch64.app.tar.gz.sig", "browser_download_url": "https://example/mac-arm.app.tar.gz.sig", "size": 10}),
+            json!({"name": "OnlyDEVS-Antigravity_1.2.16_aarch64.dmg", "browser_download_url": "https://example/mac-arm.dmg", "size": 201}),
+            json!({"name": "OnlyDEVS-Antigravity_x64.app.tar.gz", "browser_download_url": "https://example/mac-x64.app.tar.gz", "size": 202}),
+            json!({"name": "OnlyDEVS-Antigravity_1.2.16_x64.dmg", "browser_download_url": "https://example/mac-x64.dmg", "size": 203}),
+            json!({"name": "OnlyDEVS-Antigravity_1.2.16_amd64.AppImage", "browser_download_url": "https://example/linux-amd64.AppImage", "size": 300}),
+            json!({"name": "OnlyDEVS-Antigravity_1.2.16_amd64.deb", "browser_download_url": "https://example/linux-amd64.deb", "size": 301}),
+            json!({"name": "OnlyDEVS-Antigravity-1.2.16-1.x86_64.rpm", "browser_download_url": "https://example/linux-x86_64.rpm", "size": 302}),
+        ]
+    }
+
+    #[test]
+    fn picks_correct_asset_for_windows_macos_and_linux() {
+        let assets = sample_assets();
+
+        let (u, n, _, inst) = pick_asset_for_platform(&assets, "windows", "x86_64", false, false, false);
+        assert_eq!(u.as_deref(), Some("https://example/win-setup.exe"));
+        assert_eq!(n.as_deref(), Some("OnlyDEVS-Antigravity_1.2.16_x64-setup.exe"));
+        assert!(inst);
+
+        let (u, _, _, inst) = pick_asset_for_platform(&assets, "macos", "aarch64", false, false, false);
+        assert_eq!(u.as_deref(), Some("https://example/mac-arm.app.tar.gz"));
+        assert!(inst);
+
+        let (u, _, _, inst) = pick_asset_for_platform(&assets, "macos", "x86_64", false, false, false);
+        assert_eq!(u.as_deref(), Some("https://example/mac-x64.app.tar.gz"));
+        assert!(inst);
+
+        let (u, _, _, inst) = pick_asset_for_platform(&assets, "linux", "x86_64", true, true, false);
+        assert_eq!(u.as_deref(), Some("https://example/linux-amd64.AppImage"));
+        assert!(inst);
+
+        let (u, _, _, _) = pick_asset_for_platform(&assets, "linux", "x86_64", false, true, false);
+        assert_eq!(u.as_deref(), Some("https://example/linux-amd64.deb"));
+
+        let (u, _, _, _) = pick_asset_for_platform(&assets, "linux", "x86_64", false, false, true);
+        assert_eq!(u.as_deref(), Some("https://example/linux-x86_64.rpm"));
+    }
+
+    #[test]
+    fn manifest_fallback_and_shell_quoting() {
+        let manifest = json!({
+            "platforms": {
+                "windows-x86_64": {"url": "https://example/win.exe"},
+                "darwin-aarch64": {"url": "https://example/mac-arm.app.tar.gz"},
+                "linux-x86_64": {"url": "https://example/linux.AppImage"}
+            }
+        });
+        assert_eq!(
+            pick_manifest_platform_url_for(&manifest, "macos", "aarch64").as_deref(),
+            Some("https://example/mac-arm.app.tar.gz")
+        );
+        assert_eq!(
+            pick_manifest_platform_url_for(&manifest, "linux", "x86_64").as_deref(),
+            Some("https://example/linux.AppImage")
+        );
+        assert_eq!(
+            shell_single_quote("/Applications/My 'App'.app"),
+            "'/Applications/My '\"'\"'App'\"'\"'.app'"
+        );
+    }
 }
