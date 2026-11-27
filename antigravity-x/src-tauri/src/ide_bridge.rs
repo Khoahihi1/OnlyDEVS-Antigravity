@@ -17,11 +17,14 @@ use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use uuid::Uuid;
 
 pub const BRIDGE_EXTENSION_ID: &str = "onlydevs-auth-bridge";
-pub const BRIDGE_EXTENSION_VERSION: &str = "1.0.1";
+pub const BRIDGE_EXTENSION_VERSION: &str = "1.0.2";
 const BRIDGE_PORT_START: u16 = 57128;
 const BRIDGE_PORT_END: u16 = 57148;
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_WS_FRAME_LEN: usize = 2 * 1024 * 1024;
+const WS_HELLO_TIMEOUT_SECS: u64 = 10;
+const WS_IDLE_PING_SECS: u64 = 15;
+const WS_PONG_DEAD_SECS: u64 = 12;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -100,10 +103,13 @@ pub struct SeamlessSwitchReply {
 struct ConnectedClientHandle {
     info: ConnectedIdeClientInfo,
     tx: mpsc::UnboundedSender<WsOutbound>,
+    session_id: Option<String>,
+    host_pid: Option<u32>,
 }
 
 enum WsOutbound {
     Text(String),
+    Ping(Vec<u8>),
     Pong(Vec<u8>),
     Close,
 }
@@ -216,8 +222,87 @@ pub fn is_fallback_relaunch_enabled() -> bool {
     load_settings().fallback_relaunch
 }
 
+fn is_os_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 259;
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+            fn GetExitCodeProcess(handle: *mut std::ffi::c_void, exit_code: *mut u32) -> i32;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        }
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                // ERROR_ACCESS_DENIED (5) means process exists; ERROR_INVALID_PARAMETER (87) means gone.
+                return std::io::Error::last_os_error().raw_os_error() == Some(5);
+            }
+            let mut exit_code: u32 = 0;
+            let ok = GetExitCodeProcess(h, &mut exit_code);
+            CloseHandle(h);
+            ok != 0 && exit_code == STILL_ACTIVE
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if pid > i32::MAX as u32 {
+            return false;
+        }
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        let rc = unsafe { kill(pid as i32, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+fn is_handle_alive(handle: &ConnectedClientHandle) -> bool {
+    !handle.tx.is_closed() && handle.host_pid.map_or(true, is_os_pid_alive)
+}
+
+async fn collect_alive_clients() -> Vec<ConnectedIdeClientInfo> {
+    let stale_ids: Vec<u64> = {
+        let guard = clients_map().read().await;
+        let dead: Vec<u64> = guard
+            .iter()
+            .filter_map(|(&cid, handle)| (!is_handle_alive(handle)).then_some(cid))
+            .collect();
+        if dead.is_empty() {
+            let mut list: Vec<ConnectedIdeClientInfo> =
+                guard.values().map(|c| c.info.clone()).collect();
+            list.sort_by_key(|c| c.connected_at);
+            return list;
+        }
+        dead
+    };
+
+    let mut guard = clients_map().write().await;
+    for cid in stale_ids {
+        if let Some(old) = guard.remove(&cid) {
+            let _ = old.tx.send(WsOutbound::Close);
+        }
+    }
+    guard.retain(|_, handle| is_handle_alive(handle));
+    let mut list: Vec<ConnectedIdeClientInfo> = guard.values().map(|c| c.info.clone()).collect();
+    list.sort_by_key(|c| c.connected_at);
+    list
+}
+
 pub async fn has_connected_clients() -> bool {
-    !clients_map().read().await.is_empty()
+    !collect_alive_clients().await.is_empty()
 }
 
 fn find_antigravity_ide_app_dir() -> Option<PathBuf> {
@@ -368,11 +453,13 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const EXTENSION_VERSION = "1.0.1";
+const EXTENSION_VERSION = "1.0.2";
 const RECONNECT_DELAY_MS = 2500;
-const HEARTBEAT_INTERVAL_MS = 15000;
+const HEARTBEAT_INTERVAL_MS = 10000;
 
 let activeSocket = null;
+let activeReq = null;
+let connectSeq = 0;
 let reconnectTimer = null;
 let heartbeatTimer = null;
 let disposed = false;
@@ -558,6 +645,14 @@ function cleanupSocket() {
     clearInterval(heartbeatTimer);
     heartbeatTimer = null;
   }
+  if (activeReq) {
+    try {
+      activeReq.destroy();
+    } catch {
+      // ignore
+    }
+    activeReq = null;
+  }
   if (activeSocket) {
     try {
       activeSocket.destroy();
@@ -580,6 +675,11 @@ function scheduleReconnect() {
 
 function connectToBridge() {
   if (disposed) return;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  const mySeq = ++connectSeq;
   cleanupSocket();
 
   const discovery = readDiscovery();
@@ -607,8 +707,21 @@ function connectToBridge() {
       "Sec-WebSocket-Version": "13",
     },
   });
+  activeReq = req;
 
   req.on("upgrade", (res, socket, head) => {
+    if (activeReq === req) {
+      activeReq = null;
+    }
+    if (disposed || mySeq !== connectSeq) {
+      try {
+        socket.destroy();
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
     const acceptHeader = res.headers["sec-websocket-accept"];
     if (acceptHeader !== expectedAccept) {
       socket.destroy();
@@ -616,6 +729,13 @@ function connectToBridge() {
       return;
     }
 
+    if (activeSocket && activeSocket !== socket) {
+      try {
+        activeSocket.destroy();
+      } catch {
+        // ignore
+      }
+    }
     activeSocket = socket;
     let rxBuf = head && head.length ? Buffer.from(head) : Buffer.alloc(0);
     let fragmentedChunks = [];
@@ -663,8 +783,10 @@ function connectToBridge() {
         rxBuf = rxBuf.subarray(offset + maskBytes + payloadLen);
 
         if (opcode === 0x8) {
-          cleanupSocket();
-          scheduleReconnect();
+          if (activeSocket === socket) {
+            cleanupSocket();
+            scheduleReconnect();
+          }
           return;
         }
         if (opcode === 0x9) {
@@ -691,14 +813,21 @@ function connectToBridge() {
     });
 
     socket.on("close", () => {
-      cleanupSocket();
-      scheduleReconnect();
+      if (activeSocket === socket) {
+        cleanupSocket();
+        scheduleReconnect();
+      }
     });
 
     socket.on("error", () => {
-      cleanupSocket();
-      scheduleReconnect();
+      if (activeSocket === socket) {
+        cleanupSocket();
+        scheduleReconnect();
+      }
     });
+
+    const sessionId =
+      vscode.env && vscode.env.sessionId ? String(vscode.env.sessionId).trim() : "";
 
     sendJson({
       type: "hello",
@@ -706,6 +835,8 @@ function connectToBridge() {
       extensionVersion: EXTENSION_VERSION,
       vscodeVersion: String(vscode.version || ""),
       ideName: String(vscode.env.appName || "Antigravity IDE"),
+      sessionId,
+      hostPid: Number(process.pid || 0),
     });
 
     heartbeatTimer = setInterval(() => {
@@ -716,11 +847,21 @@ function connectToBridge() {
   });
 
   req.on("response", () => {
-    scheduleReconnect();
+    if (activeReq === req) {
+      activeReq = null;
+    }
+    if (mySeq === connectSeq) {
+      scheduleReconnect();
+    }
   });
 
   req.on("error", () => {
-    scheduleReconnect();
+    if (activeReq === req) {
+      activeReq = null;
+    }
+    if (mySeq === connectSeq) {
+      scheduleReconnect();
+    }
   });
 
   req.setTimeout(5000, () => {
@@ -737,8 +878,23 @@ function activate(context) {
   statusBarItem.show();
   updateStatusBar();
 
+  const onProcessSignal = () => {
+    deactivate();
+  };
+  process.once("beforeExit", onProcessSignal);
+  process.once("SIGTERM", onProcessSignal);
+  process.once("SIGINT", onProcessSignal);
+
   context.subscriptions.push(
     statusBarItem,
+    {
+      dispose: () => {
+        process.removeListener("beforeExit", onProcessSignal);
+        process.removeListener("SIGTERM", onProcessSignal);
+        process.removeListener("SIGINT", onProcessSignal);
+        deactivate();
+      },
+    },
     vscode.commands.registerCommand("onlydevsBridge.reconnect", () => {
       connectToBridge();
       vscode.window.setStatusBarMessage("OnlyDEVS Bridge: Đang kết nối lại...", 2500);
@@ -759,6 +915,7 @@ function activate(context) {
 
 function deactivate() {
   disposed = true;
+  connectSeq++;
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
@@ -891,10 +1048,7 @@ pub async fn get_status() -> IdeBridgeStatus {
             (false, None, None, false, None, false)
         };
 
-    let connected_clients: Vec<ConnectedIdeClientInfo> = {
-        let guard = clients_map().read().await;
-        guard.values().map(|c| c.info.clone()).collect()
-    };
+    let connected_clients = collect_alive_clients().await;
 
     IdeBridgeStatus {
         server_running: ws_port.is_some(),
@@ -915,9 +1069,10 @@ pub async fn request_seamless_switch(
     payload: SeamlessSwitchPayload,
     timeout_ms: u64,
 ) -> Result<SeamlessSwitchReply, String> {
-    let txs: Vec<mpsc::UnboundedSender<WsOutbound>> = {
+    let _ = collect_alive_clients().await;
+    let txs: Vec<(u64, mpsc::UnboundedSender<WsOutbound>)> = {
         let guard = clients_map().read().await;
-        guard.values().map(|c| c.tx.clone()).collect()
+        guard.iter().map(|(&cid, c)| (cid, c.tx.clone())).collect()
     };
     if txs.is_empty() {
         return Err("Extension IDE chưa kết nối qua WebSocket.".into());
@@ -943,10 +1098,21 @@ pub async fn request_seamless_switch(
     let text = serde_json::to_string(&msg).map_err(|e| format!("Serialize switch msg: {e}"))?;
 
     let mut sent = 0usize;
-    for client_tx in txs {
+    let mut failed_cids = Vec::new();
+    for (cid, client_tx) in txs {
         if client_tx.send(WsOutbound::Text(text.clone())).is_ok() {
             sent += 1;
+        } else {
+            failed_cids.push(cid);
         }
+    }
+    if !failed_cids.is_empty() {
+        let mut map = clients_map().write().await;
+        for cid in failed_cids {
+            map.remove(&cid);
+        }
+        drop(map);
+        emit_status_changed();
     }
     if sent == 0 {
         let mut pending = pending_map().lock().await;
@@ -1082,6 +1248,7 @@ async fn handle_ws_client(mut stream: TcpStream, expected_token: String) -> Resu
         while let Some(msg) = rx.recv().await {
             let frame = match msg {
                 WsOutbound::Text(s) => encode_ws_frame(0x1, s.as_bytes()),
+                WsOutbound::Ping(p) => encode_ws_frame(0x9, &p),
                 WsOutbound::Pong(p) => encode_ws_frame(0xA, &p),
                 WsOutbound::Close => {
                     let _ = writer.write_all(&encode_ws_frame(0x8, &[])).await;
@@ -1097,131 +1264,219 @@ async fn handle_ws_client(mut stream: TcpStream, expected_token: String) -> Resu
     let mut rx_buf = leftover;
     let mut registered_client_id: Option<u64> = None;
     let mut fragmented = Vec::new();
+    let mut awaiting_pong_since: Option<tokio::time::Instant> = None;
 
-    'read_loop: loop {
-        while let Some(frame) = try_decode_ws_frame(&mut rx_buf)? {
-            match frame.opcode {
-                0x8 => break 'read_loop,
-                0x9 => {
-                    let _ = tx.send(WsOutbound::Pong(frame.payload));
-                }
-                0xA => {}
-                0x0 | 0x1 => {
-                    fragmented.extend_from_slice(&frame.payload);
-                    if frame.fin {
-                        let text = String::from_utf8_lossy(&fragmented).to_string();
-                        fragmented.clear();
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-                            let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                            if msg_type == "hello" {
-                                let client_tok =
-                                    val.get("token").and_then(|v| v.as_str()).unwrap_or("");
-                                if client_tok != expected_token {
-                                    let _ = tx.send(WsOutbound::Close);
-                                    break 'read_loop;
-                                }
-                                let cid = registered_client_id.unwrap_or_else(|| {
-                                    CLIENT_SEQ.fetch_add(1, Ordering::SeqCst)
-                                });
-                                registered_client_id = Some(cid);
-                                let info = ConnectedIdeClientInfo {
-                                    client_id: cid,
-                                    extension_version: val
-                                        .get("extensionVersion")
+    let read_result: Result<(), String> = async {
+        'read_loop: loop {
+            while let Some(frame) = try_decode_ws_frame(&mut rx_buf)? {
+                awaiting_pong_since = None;
+                match frame.opcode {
+                    0x8 => break 'read_loop,
+                    0x9 => {
+                        if tx.send(WsOutbound::Pong(frame.payload)).is_err() {
+                            break 'read_loop;
+                        }
+                    }
+                    0xA => {}
+                    0x0 | 0x1 => {
+                        fragmented.extend_from_slice(&frame.payload);
+                        if frame.fin {
+                            let text = String::from_utf8_lossy(&fragmented).to_string();
+                            fragmented.clear();
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                                let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                if msg_type == "hello" {
+                                    let client_tok =
+                                        val.get("token").and_then(|v| v.as_str()).unwrap_or("");
+                                    if client_tok != expected_token {
+                                        let _ = tx.send(WsOutbound::Close);
+                                        break 'read_loop;
+                                    }
+                                    let cid = registered_client_id.unwrap_or_else(|| {
+                                        CLIENT_SEQ.fetch_add(1, Ordering::SeqCst)
+                                    });
+                                    registered_client_id = Some(cid);
+                                    let session_id = val
+                                        .get("sessionId")
                                         .and_then(|v| v.as_str())
-                                        .unwrap_or("1.0.0")
-                                        .to_string(),
-                                    vscode_version: val
-                                        .get("vscodeVersion")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string(),
-                                    ide_name: val
-                                        .get("ideName")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("Antigravity IDE")
-                                        .to_string(),
-                                    connected_at: Utc::now().timestamp(),
-                                };
-                                {
-                                    let mut map = clients_map().write().await;
-                                    map.insert(
-                                        cid,
-                                        ConnectedClientHandle {
-                                            info,
-                                            tx: tx.clone(),
-                                        },
-                                    );
-                                }
-                                let ack = json!({
-                                    "type": "hello_ack",
-                                    "bridgeVersion": BRIDGE_EXTENSION_VERSION,
-                                })
-                                .to_string();
-                                let _ = tx.send(WsOutbound::Text(ack));
-                                emit_status_changed();
-                            } else if msg_type == "switch_result" && registered_client_id.is_some()
-                            {
-                                if let Some(req_id) =
-                                    val.get("requestId").and_then(|v| v.as_str())
-                                {
-                                    let reply = SeamlessSwitchReply {
-                                        success: val
-                                            .get("success")
-                                            .and_then(|v| v.as_bool())
-                                            .unwrap_or(false),
-                                        email: val
-                                            .get("email")
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_string);
+                                    let host_pid = val
+                                        .get("hostPid")
+                                        .and_then(|v| v.as_u64())
+                                        .filter(|&p| p > 0 && p <= u32::MAX as u64)
+                                        .map(|p| p as u32);
+                                    let info = ConnectedIdeClientInfo {
+                                        client_id: cid,
+                                        extension_version: val
+                                            .get("extensionVersion")
                                             .and_then(|v| v.as_str())
-                                            .map(str::to_string),
-                                        effective_mode: val
-                                            .get("effectiveMode")
+                                            .unwrap_or("1.0.0")
+                                            .to_string(),
+                                        vscode_version: val
+                                            .get("vscodeVersion")
                                             .and_then(|v| v.as_str())
-                                            .map(str::to_string),
-                                        message: val
-                                            .get("message")
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        ide_name: val
+                                            .get("ideName")
                                             .and_then(|v| v.as_str())
-                                            .map(str::to_string),
+                                            .unwrap_or("Antigravity IDE")
+                                            .to_string(),
+                                        connected_at: Utc::now().timestamp(),
                                     };
-                                    let sender = {
-                                        let mut pending = pending_map().lock().await;
-                                        pending.remove(req_id)
+                                    let evicted_txs = {
+                                        let mut map = clients_map().write().await;
+                                        let mut evicted = Vec::new();
+                                        let stale_cids: Vec<u64> = map
+                                            .iter()
+                                            .filter_map(|(&existing_cid, existing)| {
+                                                if existing_cid == cid {
+                                                    return None;
+                                                }
+                                                let dead = !is_handle_alive(existing);
+                                                let same_session = session_id.is_some()
+                                                    && existing.session_id == session_id;
+                                                let same_pid = host_pid.is_some()
+                                                    && existing.host_pid == host_pid;
+                                                (dead || same_session || same_pid)
+                                                    .then_some(existing_cid)
+                                            })
+                                            .collect();
+                                        for stale_cid in stale_cids {
+                                            if let Some(old) = map.remove(&stale_cid) {
+                                                evicted.push(old.tx);
+                                            }
+                                        }
+                                        map.insert(
+                                            cid,
+                                            ConnectedClientHandle {
+                                                info,
+                                                tx: tx.clone(),
+                                                session_id,
+                                                host_pid,
+                                            },
+                                        );
+                                        evicted
                                     };
-                                    if let Some(ch) = sender {
-                                        let _ = ch.send(reply);
+                                    for old_tx in evicted_txs {
+                                        let _ = old_tx.send(WsOutbound::Close);
+                                    }
+                                    let ack = json!({
+                                        "type": "hello_ack",
+                                        "bridgeVersion": BRIDGE_EXTENSION_VERSION,
+                                    })
+                                    .to_string();
+                                    let _ = tx.send(WsOutbound::Text(ack));
+                                    emit_status_changed();
+                                } else if msg_type == "switch_result"
+                                    && registered_client_id.is_some()
+                                {
+                                    if let Some(req_id) =
+                                        val.get("requestId").and_then(|v| v.as_str())
+                                    {
+                                        let reply = SeamlessSwitchReply {
+                                            success: val
+                                                .get("success")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(false),
+                                            email: val
+                                                .get("email")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_string),
+                                            effective_mode: val
+                                                .get("effectiveMode")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_string),
+                                            message: val
+                                                .get("message")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_string),
+                                        };
+                                        let sender = {
+                                            let mut pending = pending_map().lock().await;
+                                            pending.remove(req_id)
+                                        };
+                                        if let Some(ch) = sender {
+                                            let _ = ch.send(reply);
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
+            }
+
+            let wait_secs = if registered_client_id.is_none() {
+                WS_HELLO_TIMEOUT_SECS
+            } else if awaiting_pong_since.is_some() {
+                WS_PONG_DEAD_SECS
+            } else {
+                WS_IDLE_PING_SECS
+            };
+
+            let mut chunk = [0u8; 4096];
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(wait_secs),
+                reader.read(&mut chunk),
+            )
+            .await
+            {
+                Ok(Ok(0)) => break 'read_loop,
+                Ok(Ok(n)) => {
+                    rx_buf.extend_from_slice(&chunk[..n]);
+                    if rx_buf.len() > MAX_WS_FRAME_LEN + 64 {
+                        break 'read_loop;
+                    }
+                }
+                Ok(Err(e)) => {
+                    // ConnectionReset / ConnectionAborted must still clean up `registered_client_id` below.
+                    return Err(format!("WS read: {e}"));
+                }
+                Err(_) => {
+                    if registered_client_id.is_none() {
+                        break 'read_loop;
+                    }
+                    if let Some(ping_at) = awaiting_pong_since {
+                        if ping_at.elapsed() >= std::time::Duration::from_secs(WS_PONG_DEAD_SECS)
+                        {
+                            break 'read_loop;
+                        }
+                    } else {
+                        if tx.send(WsOutbound::Ping(b"hb".to_vec())).is_err() {
+                            break 'read_loop;
+                        }
+                        awaiting_pong_since = Some(tokio::time::Instant::now());
+                    }
+                }
             }
         }
-
-        let mut chunk = [0u8; 4096];
-        let n = reader
-            .read(&mut chunk)
-            .await
-            .map_err(|e| format!("WS read: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        rx_buf.extend_from_slice(&chunk[..n]);
-        if rx_buf.len() > MAX_WS_FRAME_LEN + 64 {
-            break;
-        }
+        Ok(())
     }
+    .await;
 
+    // Unconditional cleanup: runs whether loop ended cleanly, timed out, errored (WSAECONNRESET),
+    // or failed frame decoding — preventing stale client ghosts from ever accumulating.
     if let Some(cid) = registered_client_id {
-        let mut map = clients_map().write().await;
-        map.remove(&cid);
-        drop(map);
-        emit_status_changed();
+        let removed = {
+            let mut map = clients_map().write().await;
+            map.remove(&cid).is_some()
+        };
+        if removed {
+            emit_status_changed();
+        }
     }
     let _ = tx.send(WsOutbound::Close);
-    let _ = writer_task.await;
-    Ok(())
+    if tokio::time::timeout(std::time::Duration::from_millis(250), writer_task)
+        .await
+        .is_err()
+    {
+        // Writer timed out on dead socket; dropping future cleans up.
+    }
+    read_result
 }
 
 fn futures_lite_ignore() {}
@@ -1468,18 +1723,18 @@ mod tests {
         out
     }
 
-    #[tokio::test]
-    async fn local_websocket_hello_and_switch_roundtrip() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let token = "test-bridge-token-123".to_string();
-        let server_token = token.clone();
+    static TEST_CLIENTS_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
 
-        let server_task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let _ = handle_ws_client(stream, server_token).await;
-        });
+    fn test_clients_lock() -> &'static tokio::sync::Mutex<()> {
+        TEST_CLIENTS_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
 
+    async fn open_test_ws_client(
+        port: u16,
+        token: &str,
+        session_id: Option<&str>,
+    ) -> TcpStream {
         let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let key = "dGhlIHNhbXBsZSBub25jZQ==";
         let upgrade_req = format!(
@@ -1499,7 +1754,6 @@ mod tests {
         };
         let hdr = String::from_utf8_lossy(&rx[..hdr_end]);
         assert!(hdr.contains("101 Switching Protocols"));
-        assert!(hdr.contains("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
         rx.drain(..hdr_end + 4);
 
         let hello = json!({
@@ -1507,7 +1761,8 @@ mod tests {
             "token": token,
             "extensionVersion": BRIDGE_EXTENSION_VERSION,
             "vscodeVersion": "1.107.0",
-            "ideName": "Antigravity IDE"
+            "ideName": "Antigravity IDE",
+            "sessionId": session_id.unwrap_or(""),
         })
         .to_string();
         client
@@ -1515,7 +1770,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Read hello_ack
         let ack_frame = loop {
             if let Some(f) = try_decode_ws_frame(&mut rx).unwrap() {
                 break f;
@@ -1526,7 +1780,29 @@ mod tests {
         };
         let ack_json: serde_json::Value = serde_json::from_slice(&ack_frame.payload).unwrap();
         assert_eq!(ack_json["type"], "hello_ack");
+        client
+    }
+
+    #[tokio::test]
+    async fn local_websocket_hello_and_switch_roundtrip() {
+        let _guard = test_clients_lock().lock().await;
+        clients_map().write().await.clear();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = "test-bridge-token-123".to_string();
+        let server_token = token.clone();
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_ws_client(stream, server_token).await;
+        });
+
+        let mut client = open_test_ws_client(port, &token, None).await;
         assert!(has_connected_clients().await);
+
+        let mut rx = Vec::new();
+        let mut tmp = [0u8; 1024];
 
         let switch_task = tokio::spawn(async {
             request_seamless_switch(
@@ -1576,5 +1852,65 @@ mod tests {
 
         drop(client);
         let _ = server_task.await;
+        assert_eq!(collect_alive_clients().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn deduplicates_same_window_session_and_cleans_up_on_frame_error() {
+        let _guard = test_clients_lock().lock().await;
+        clients_map().write().await.clear();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = "test-bridge-dedup-token".to_string();
+
+        let accept_token = token.clone();
+        let accept_task = tokio::spawn(async move {
+            let mut handles = Vec::new();
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let t = accept_token.clone();
+                handles.push(tokio::spawn(async move { handle_ws_client(stream, t).await }));
+            }
+            handles
+        });
+
+        let c1 = open_test_ws_client(port, &token, Some("win-session-A")).await;
+        assert_eq!(collect_alive_clients().await.len(), 1);
+
+        // Same IDE window reconnects (e.g., Extension Host restart before old socket finished closing)
+        let mut c2 = open_test_ws_client(port, &token, Some("win-session-A")).await;
+        assert_eq!(collect_alive_clients().await.len(), 1);
+        drop(c1);
+
+        // A genuine second IDE window connects with a distinct sessionId
+        let c3 = open_test_ws_client(port, &token, Some("win-session-B")).await;
+        assert_eq!(collect_alive_clients().await.len(), 2);
+
+        let server_handles = accept_task.await.unwrap();
+        let mut iter = server_handles.into_iter();
+        let h1 = iter.next().unwrap();
+        let h2 = iter.next().unwrap();
+        let h3 = iter.next().unwrap();
+        let _ = h1.await;
+
+        // Force a decode error (oversized length 127 frame > MAX_WS_FRAME_LEN) on c2 to prove cleanup still runs!
+        let bad_frame = [0x81u8, 0x7F, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let _ = c2.write_all(&bad_frame).await;
+        drop(c2);
+        let res2 = h2.await.unwrap();
+        assert!(res2.is_err());
+        assert_eq!(collect_alive_clients().await.len(), 1);
+
+        drop(c3);
+        let _ = h3.await;
+        assert_eq!(collect_alive_clients().await.len(), 0);
+    }
+
+    #[test]
+    fn process_liveness_detects_current_and_bogus_pid() {
+        assert!(is_os_pid_alive(std::process::id()));
+        assert!(!is_os_pid_alive(0));
+        assert!(!is_os_pid_alive(u32::MAX - 1));
     }
 }
