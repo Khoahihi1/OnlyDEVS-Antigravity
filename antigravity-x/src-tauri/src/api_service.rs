@@ -1320,8 +1320,31 @@ fn is_fully_cooled_down(account_id: &str) -> bool {
         .is_some_and(|e| e.until_ts > now)
 }
 
-fn parse_retry_seconds_from_body(body: &str, default_secs: u64) -> u64 {
-    // 1. Structured Google ErrorInfo/RetryInfo: details[].metadata.quotaResetTimeStamp or details[].retryDelay
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Antigravity429Decision {
+    InstantRetrySameAuth { wait_ms: u64, reason: String },
+    SoftRateLimit { cooldown_secs: u64, reason: String },
+    ShortCooldownSwitchAuth { cooldown_secs: u64, reason: String },
+    FullQuotaExhausted { cooldown_secs: u64, reason: String },
+}
+
+fn parse_retry_after_header_ms(headers: Option<&reqwest::header::HeaderMap>) -> Option<u64> {
+    let hdr = headers?.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(secs) = hdr.parse::<f64>() {
+        if secs >= 0.0 {
+            return Some(((secs * 1000.0).ceil() as u64).min(3_600_000));
+        }
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(hdr) {
+        let diff = dt.timestamp() - Utc::now().timestamp();
+        if diff >= 0 {
+            return Some(((diff as u64) * 1000).min(3_600_000));
+        }
+    }
+    None
+}
+
+fn parse_retry_millis_from_body(body: &str) -> Option<u64> {
     if let Ok(val) = serde_json::from_str::<Value>(body) {
         if let Some(details) = val.pointer("/error/details").and_then(Value::as_array) {
             for d in details {
@@ -1332,7 +1355,7 @@ fn parse_retry_seconds_from_body(body: &str, default_secs: u64) -> u64 {
                     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts_str) {
                         let diff = dt.timestamp() - Utc::now().timestamp();
                         if diff > 0 {
-                            return (diff as u64).min(3600);
+                            return Some(((diff as u64) * 1000).min(3_600_000));
                         }
                     }
                 }
@@ -1340,18 +1363,13 @@ fn parse_retry_seconds_from_body(body: &str, default_secs: u64) -> u64 {
                     let trimmed = delay_str.trim().trim_end_matches('s');
                     if let Ok(secs) = trimmed.parse::<f64>() {
                         if secs > 0.0 {
-                            return (secs.ceil() as u64).clamp(5, 3600);
+                            return Some(((secs * 1000.0).ceil() as u64).min(3_600_000));
                         }
                     }
                 }
             }
-            // Detail-free 429 (often transient/burst) -> shorter cooldown so accounts recover quickly
-            if details.is_empty() {
-                return default_secs.min(20).max(10);
-            }
         }
     }
-    // 2. Text quota reset format: "Your quota will reset after 2h7m23s"
     if let Ok(re) = Regex::new(r"(?i)reset after (?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?") {
         if let Some(caps) = re.captures(body) {
             let h: u64 = caps.get(1).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
@@ -1359,11 +1377,171 @@ fn parse_retry_seconds_from_body(body: &str, default_secs: u64) -> u64 {
             let s: u64 = caps.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
             let total = h * 3600 + m * 60 + s;
             if total > 0 {
-                return total.min(3600);
+                return Some((total * 1000).min(3_600_000));
             }
         }
     }
-    default_secs.max(15)
+    None
+}
+
+fn classify_antigravity_429(
+    headers: Option<&reqwest::header::HeaderMap>,
+    body: &str,
+    default_cooldown_secs: u64,
+) -> Antigravity429Decision {
+    let retry_ms = parse_retry_after_header_ms(headers).or_else(|| parse_retry_millis_from_body(body));
+    let retry_secs = retry_ms.map(|ms| ((ms + 999) / 1000).min(3600));
+
+    if let Ok(val) = serde_json::from_str::<Value>(body) {
+        let status_str = val
+            .pointer("/error/status")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let details = val.pointer("/error/details").and_then(Value::as_array);
+        if status_str.eq_ignore_ascii_case("RESOURCE_EXHAUSTED") {
+            if let Some(arr) = details {
+                for d in arr {
+                    let dtype = d.get("@type").and_then(Value::as_str).unwrap_or("");
+                    if dtype != "type.googleapis.com/google.rpc.ErrorInfo" {
+                        continue;
+                    }
+                    let reason = d.get("reason").and_then(Value::as_str).unwrap_or("").trim();
+                    if reason.eq_ignore_ascii_case("QUOTA_EXHAUSTED")
+                        || reason.eq_ignore_ascii_case("INSUFFICIENT_G1_CREDITS_BALANCE")
+                    {
+                        let secs = retry_secs
+                            .unwrap_or_else(|| default_cooldown_secs.max(60))
+                            .clamp(15, 3600);
+                        return Antigravity429Decision::FullQuotaExhausted {
+                            cooldown_secs: secs,
+                            reason: format!("HTTP 429 {reason}"),
+                        };
+                    }
+                    if reason.eq_ignore_ascii_case("RATE_LIMIT_EXCEEDED") {
+                        if let Some(ms) = retry_ms {
+                            if ms <= 3000 {
+                                return Antigravity429Decision::InstantRetrySameAuth {
+                                    wait_ms: ms.max(200),
+                                    reason: "HTTP 429 RATE_LIMIT_EXCEEDED (micro-burst)".into(),
+                                };
+                            }
+                            let secs = ((ms + 999) / 1000).min(3600);
+                            if secs < 120 {
+                                return Antigravity429Decision::ShortCooldownSwitchAuth {
+                                    cooldown_secs: secs.max(5),
+                                    reason: "HTTP 429 RATE_LIMIT_EXCEEDED".into(),
+                                };
+                            }
+                            return Antigravity429Decision::FullQuotaExhausted {
+                                cooldown_secs: secs,
+                                reason: "HTTP 429 RATE_LIMIT_EXCEEDED (long)".into(),
+                            };
+                        }
+                        return Antigravity429Decision::SoftRateLimit {
+                            cooldown_secs: default_cooldown_secs.clamp(5, 15),
+                            reason: "HTTP 429 RATE_LIMIT_EXCEEDED (soft)".into(),
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("quota_exhausted") || lower.contains("quota exhausted") {
+        let secs = retry_secs
+            .unwrap_or_else(|| default_cooldown_secs.max(60))
+            .clamp(15, 3600);
+        return Antigravity429Decision::FullQuotaExhausted {
+            cooldown_secs: secs,
+            reason: "HTTP 429 quota_exhausted".into(),
+        };
+    }
+
+    if let Some(ms) = retry_ms {
+        if ms <= 3000 {
+            return Antigravity429Decision::InstantRetrySameAuth {
+                wait_ms: ms.max(200),
+                reason: "HTTP 429 Retry-After".into(),
+            };
+        }
+    }
+
+    let soft_secs = retry_secs
+        .unwrap_or_else(|| default_cooldown_secs.min(15))
+        .clamp(5, 3600);
+    if retry_secs.is_none_or(|s| s <= 20) {
+        Antigravity429Decision::SoftRateLimit {
+            cooldown_secs: soft_secs.min(15).max(5),
+            reason: "HTTP 429 soft rate limit".into(),
+        }
+    } else {
+        Antigravity429Decision::FullQuotaExhausted {
+            cooldown_secs: soft_secs,
+            reason: "HTTP 429 cooldown".into(),
+        }
+    }
+}
+
+fn classify_antigravity_403(body: &str) -> (u64, String, bool) {
+    if let Ok(val) = serde_json::from_str::<Value>(body) {
+        if let Some(details) = val.pointer("/error/details").and_then(Value::as_array) {
+            for d in details {
+                let dtype = d.get("@type").and_then(Value::as_str).unwrap_or("");
+                if dtype != "type.googleapis.com/google.rpc.ErrorInfo" {
+                    continue;
+                }
+                let reason = d.get("reason").and_then(Value::as_str).unwrap_or("").trim();
+                if reason.eq_ignore_ascii_case("TOS_VIOLATION") {
+                    return (3600, "HTTP 403 TOS_VIOLATION".into(), false);
+                }
+                if reason.eq_ignore_ascii_case("VALIDATION_REQUIRED") {
+                    return (1800, "HTTP 403 VALIDATION_REQUIRED".into(), true);
+                }
+            }
+        }
+    }
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("tos_violation") {
+        return (3600, "HTTP 403 TOS_VIOLATION".into(), false);
+    }
+    if lower.contains("validation_required") {
+        return (1800, "HTTP 403 VALIDATION_REQUIRED".into(), true);
+    }
+    (300, "HTTP 403".into(), false)
+}
+
+fn extract_in_band_error_status(val: &Value) -> Option<u16> {
+    let err = val.get("error").filter(|v| !v.is_null())?;
+    if let Some(code) = err.get("code").and_then(Value::as_u64) {
+        if (400..=599).contains(&code) {
+            return Some(code as u16);
+        }
+        return Some(match code {
+            3 => 400,
+            5 => 404,
+            7 => 403,
+            8 => 429,
+            14 => 503,
+            16 => 401,
+            _ => 502,
+        });
+    }
+    let status = err
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase();
+    Some(match status.as_str() {
+        "RESOURCE_EXHAUSTED" => 429,
+        "PERMISSION_DENIED" => 403,
+        "UNAUTHENTICATED" => 401,
+        "NOT_FOUND" => 404,
+        "INVALID_ARGUMENT" => 400,
+        "UNAVAILABLE" => 503,
+        _ => 502,
+    })
 }
 
 fn account_quota_score(acc: &AntigravityAccount, model: &str) -> i32 {
@@ -2033,7 +2211,28 @@ fn sanitize_antigravity_system_prompt(raw: &str) -> String {
 
 fn clean_json_schema_for_antigravity(val: Value) -> Value {
     match val {
-        Value::Object(map) => {
+        Value::Object(mut map) => {
+            // Flatten nullable/single-variant anyOf or oneOf before stripping union keywords
+            if !map.contains_key("type") {
+                let union_arr = map
+                    .get("anyOf")
+                    .or_else(|| map.get("oneOf"))
+                    .and_then(Value::as_array)
+                    .cloned();
+                if let Some(variants) = union_arr {
+                    if let Some(chosen) = variants
+                        .iter()
+                        .find(|item| item.get("type").and_then(Value::as_str) != Some("null"))
+                        .and_then(Value::as_object)
+                    {
+                        for (vk, vv) in chosen {
+                            if !map.contains_key(vk) {
+                                map.insert(vk.clone(), vv.clone());
+                            }
+                        }
+                    }
+                }
+            }
             let mut out = Map::new();
             for (k, v) in map {
                 if matches!(
@@ -2709,6 +2908,362 @@ fn openai_body_to_antigravity_envelope(
     (Value::Object(envelope_map), preview, tool_name_map)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GeminiV1BetaRoute {
+    ListModels,
+    GetModel(String),
+    GenerateContent { model: String, stream: bool },
+}
+
+fn parse_gemini_v1beta_route(method: &str, norm_path: &str) -> Option<GeminiV1BetaRoute> {
+    if method == "GET" && norm_path == "/v1beta/models" {
+        return Some(GeminiV1BetaRoute::ListModels);
+    }
+    let rest = norm_path.strip_prefix("/v1beta/models/")?;
+    if method == "GET" && !rest.is_empty() && !rest.contains(':') {
+        return Some(GeminiV1BetaRoute::GetModel(
+            rest.trim_start_matches("models/").to_string(),
+        ));
+    }
+    if method == "POST" {
+        if let Some(model) = rest.strip_suffix(":generateContent") {
+            let clean = model.trim_start_matches("models/").trim();
+            if !clean.is_empty() {
+                return Some(GeminiV1BetaRoute::GenerateContent {
+                    model: clean.to_string(),
+                    stream: false,
+                });
+            }
+        }
+        if let Some(model) = rest.strip_suffix(":streamGenerateContent") {
+            let clean = model.trim_start_matches("models/").trim();
+            if !clean.is_empty() {
+                return Some(GeminiV1BetaRoute::GenerateContent {
+                    model: clean.to_string(),
+                    stream: true,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn gemini_body_to_antigravity_envelope(
+    body: &Value,
+    resolved_model: &str,
+    project_id: &str,
+    session_seed: &str,
+    cfg: &ApiServiceConfig,
+) -> (Value, String, HashMap<String, String>) {
+    let mut tool_name_map: HashMap<String, String> = HashMap::new();
+    let has_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| arr.iter().any(|t| t.get("functionDeclarations").is_some()));
+
+    let mut system_texts: Vec<String> = Vec::new();
+    let mut sys_inst = body.get("systemInstruction").cloned();
+    if let Some(Value::Object(ref mut sys_obj)) = sys_inst {
+        if let Some(Value::Array(parts)) = sys_obj.get_mut("parts") {
+            for part in parts.iter_mut() {
+                if let Some(txt) = part.get("text").and_then(Value::as_str) {
+                    let cleaned = sanitize_antigravity_system_prompt(txt);
+                    if !cleaned.trim().is_empty() {
+                        system_texts.push(cleaned.clone());
+                    }
+                    if let Some(po) = part.as_object_mut() {
+                        po.insert("text".into(), Value::String(cleaned));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut raw_contents = body
+        .get("contents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let total_fn_resps: usize = raw_contents
+        .iter()
+        .filter_map(|c| c.get("parts").and_then(Value::as_array))
+        .flatten()
+        .filter(|p| p.get("functionResponse").is_some())
+        .count();
+    let mut seen_fn_resps = 0usize;
+    let mut first_user_preview = String::new();
+
+    for content in &mut raw_contents {
+        let Some(c_obj) = content.as_object_mut() else {
+            continue;
+        };
+        let role = c_obj
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user")
+            .to_string();
+        if role == "assistant" {
+            c_obj.insert("role".into(), json!("model"));
+        } else if role != "model" {
+            c_obj.insert("role".into(), json!("user"));
+        }
+        let Some(Value::Array(parts)) = c_obj.get_mut("parts") else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            if first_user_preview.is_empty() && role != "model" {
+                if let Some(txt) = part.get("text").and_then(Value::as_str) {
+                    if !txt.trim().is_empty() {
+                        first_user_preview = txt.to_string();
+                    }
+                }
+            }
+            let missing_sig = part.get("thoughtSignature").is_none();
+            let mut restored_sig: Option<String> = None;
+            if let Some(Value::Object(fc)) = part.get_mut("functionCall") {
+                if let Some(name) = fc.get("name").and_then(Value::as_str).map(str::to_string) {
+                    let sanitized = sanitize_function_name(&name);
+                    let wire_name = if has_tools && !cfg.clean_tool_schema {
+                        let cloaked = cloak_tool_name(&sanitized);
+                        tool_name_map.entry(cloaked.clone()).or_insert_with(|| name.clone());
+                        cloaked
+                    } else {
+                        tool_name_map.entry(sanitized.clone()).or_insert_with(|| name.clone());
+                        sanitized
+                    };
+                    fc.insert("name".into(), Value::String(wire_name));
+                }
+                if missing_sig {
+                    if let Some(tc_id) = fc.get("id").and_then(Value::as_str) {
+                        if let Some(cached) = lookup_tool_thought_context(tc_id) {
+                            restored_sig = cached.thought_signature;
+                        }
+                    }
+                }
+            }
+            if let Some(sig) = restored_sig {
+                if let Some(p_obj) = part.as_object_mut() {
+                    p_obj.insert("thoughtSignature".into(), Value::String(sig));
+                }
+            }
+            if let Some(Value::Object(fr)) = part.get_mut("functionResponse") {
+                let is_recent_tool = seen_fn_resps + 4 >= total_fn_resps;
+                seen_fn_resps += 1;
+                let orig_name = fr
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
+                let sanitized = sanitize_function_name(&orig_name);
+                let wire_name = if has_tools && !cfg.clean_tool_schema {
+                    let cloaked = cloak_tool_name(&sanitized);
+                    tool_name_map
+                        .entry(cloaked.clone())
+                        .or_insert_with(|| orig_name.clone());
+                    cloaked
+                } else {
+                    tool_name_map
+                        .entry(sanitized.clone())
+                        .or_insert_with(|| orig_name.clone());
+                    sanitized
+                };
+                fr.insert("name".into(), Value::String(wire_name));
+                if cfg.compact_tool_history && !is_recent_tool {
+                    if let Some(resp_val) = fr.get("response") {
+                        let raw_json = serde_json::to_string(resp_val).unwrap_or_default();
+                        if raw_json.len() > 2_000 {
+                            let line_count = raw_json.lines().count();
+                            let char_count = raw_json.chars().count();
+                            let preview: String = raw_json.chars().take(360).collect();
+                            fr.insert(
+                                "response".into(),
+                                json!({
+                                    "result": {
+                                        "compacted": true,
+                                        "summary": format!(
+                                            "[Earlier tool output ({orig_name}, {line_count} lines / {char_count} chars) compacted — re-read if needed]\n{preview}..."
+                                        )
+                                    }
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let merged_contents = merge_adjacent_contents(raw_contents);
+    let mut gen_cfg = body
+        .get("generationConfig")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let max_out = gen_cfg
+        .get("maxOutputTokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(32_768)
+        .min(MAX_ANTIGRAVITY_OUTPUT_TOKENS);
+    gen_cfg.insert("maxOutputTokens".into(), json!(max_out));
+    if !gen_cfg.contains_key("thinkingConfig") {
+        if let Some(thinking_cfg) = build_thinking_config(body, resolved_model, cfg.fast_mode) {
+            gen_cfg.insert("thinkingConfig".into(), thinking_cfg);
+        }
+    }
+
+    let mut req_obj = Map::new();
+    req_obj.insert("contents".into(), Value::Array(merged_contents.clone()));
+    req_obj.insert("generationConfig".into(), Value::Object(gen_cfg));
+    if cfg.priority_tier && !resolved_model.to_ascii_lowercase().contains("image") {
+        req_obj.insert("serviceTier".into(), json!("SERVICE_TIER_PRIORITY"));
+    }
+    if let Some(sys) = sys_inst {
+        req_obj.insert("systemInstruction".into(), sys);
+    }
+    if let Some(safety) = body.get("safetySettings") {
+        req_obj.insert("safetySettings".into(), safety.clone());
+    }
+
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        let mut out_tools = Vec::new();
+        for tool in tools {
+            let Some(t_obj) = tool.as_object() else {
+                continue;
+            };
+            if let Some(decls) = t_obj.get("functionDeclarations").and_then(Value::as_array) {
+                let mut clean_decls = Vec::new();
+                let mut seen_names = HashSet::new();
+                for decl in decls {
+                    let Some(d_obj) = decl.as_object() else {
+                        continue;
+                    };
+                    let name = d_obj.get("name").and_then(Value::as_str).unwrap_or("");
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let sanitized = sanitize_function_name(name);
+                    let wire_name = if cfg.clean_tool_schema {
+                        sanitized
+                    } else {
+                        cloak_tool_name(&sanitized)
+                    };
+                    if !seen_names.insert(wire_name.clone()) {
+                        continue;
+                    }
+                    tool_name_map.insert(wire_name.clone(), name.to_string());
+                    let params = d_obj
+                        .get("parameters")
+                        .cloned()
+                        .map(clean_json_schema_for_antigravity)
+                        .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+                    clean_decls.push(json!({
+                        "name": wire_name,
+                        "description": d_obj.get("description").and_then(Value::as_str).unwrap_or(""),
+                        "parameters": params
+                    }));
+                }
+                if !clean_decls.is_empty() && !cfg.clean_tool_schema {
+                    for decoy_name in AG_NATIVE_TOOL_NAMES {
+                        if seen_names.insert((*decoy_name).to_string()) {
+                            clean_decls.push(json!({
+                                "name": decoy_name,
+                                "description": "This tool is currently unavailable.",
+                                "parameters": { "type": "OBJECT", "properties": {}, "required": [] }
+                            }));
+                        }
+                    }
+                }
+                if !clean_decls.is_empty() {
+                    out_tools.push(json!({ "functionDeclarations": clean_decls }));
+                }
+            } else {
+                out_tools.push(tool.clone());
+            }
+        }
+        if !out_tools.is_empty() {
+            req_obj.insert("tools".into(), Value::Array(out_tools));
+        }
+    }
+
+    if let Some(mut tc) = body.get("toolConfig").cloned() {
+        if let Some(allowed) = tc
+            .pointer_mut("/functionCallingConfig/allowedFunctionNames")
+            .and_then(Value::as_array_mut)
+        {
+            for item in allowed.iter_mut() {
+                if let Some(s) = item.as_str() {
+                    let sanitized = sanitize_function_name(s);
+                    let wire = if cfg.clean_tool_schema {
+                        sanitized
+                    } else {
+                        cloak_tool_name(&sanitized)
+                    };
+                    *item = Value::String(wire);
+                }
+            }
+        }
+        req_obj.insert("toolConfig".into(), tc);
+    }
+
+    for k in BLACKLISTED_FIELDS {
+        req_obj.remove(*k);
+    }
+    let (session_id, conv_id) = if cfg.prompt_cache_affinity {
+        compute_conversation_affinity(session_seed, &system_texts, &first_user_preview)
+    } else {
+        (
+            Utc::now().timestamp_millis().to_string(),
+            Uuid::new_v4().to_string(),
+        )
+    };
+    req_obj.insert("sessionId".into(), Value::String(session_id));
+
+    let traj_id = Uuid::new_v4();
+    let step = (merged_contents.len() * 2).saturating_sub(1).max(1);
+    let request_id = format!(
+        "agent/{}/{}/{}/{}",
+        conv_id,
+        Utc::now().timestamp_millis(),
+        traj_id,
+        step
+    );
+
+    let mut envelope_map = Map::new();
+    envelope_map.insert("project".into(), json!(project_id));
+    envelope_map.insert("model".into(), json!(resolved_model));
+    envelope_map.insert("userAgent".into(), json!("antigravity"));
+    if resolved_model.to_ascii_lowercase().contains("image") {
+        envelope_map.insert("requestType".into(), json!("image_gen"));
+    }
+    envelope_map.insert("requestId".into(), json!(request_id));
+    envelope_map.insert("request".into(), Value::Object(req_obj));
+
+    let preview: String = first_user_preview.chars().take(240).collect();
+    (Value::Object(envelope_map), preview, tool_name_map)
+}
+
+fn uncloak_gemini_response_value(val: &Value, tool_name_map: &HashMap<String, String>) -> Value {
+    let mut inner = val.get("response").cloned().unwrap_or_else(|| val.clone());
+    if !tool_name_map.is_empty() {
+        if let Some(Value::Array(cands)) = inner.get_mut("candidates") {
+            for cand in cands.iter_mut() {
+                if let Some(Value::Array(parts)) = cand.pointer_mut("/content/parts") {
+                    for part in parts.iter_mut() {
+                        if let Some(Value::Object(fc)) = part.get_mut("functionCall") {
+                            if let Some(name) = fc.get("name").and_then(Value::as_str) {
+                                let restored = uncloak_tool_name(name, tool_name_map);
+                                fc.insert("name".into(), Value::String(restored));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    inner
+}
+
 fn responses_body_to_openai_body(body: &Value) -> Value {
     let mut messages: Vec<Value> = Vec::new();
     if let Some(instr) = body.get("instructions").and_then(Value::as_str) {
@@ -3075,16 +3630,22 @@ fn generate_fallback_project_id() -> String {
     format!("bright-spark-{}", &id[..5])
 }
 
+enum UpstreamPayload {
+    Stream(reqwest::Response),
+    BufferedJson(String),
+}
+
 async fn send_upstream_with_failover(
     cfg: &ApiServiceConfig,
     key: &ApiKeyRecord,
     session_seed: &str,
     resolved_model: &str,
-    openai_body: &Value,
+    request_body: &Value,
     stream: bool,
+    is_gemini_native: bool,
 ) -> Result<
     (
-        reqwest::Response,
+        UpstreamPayload,
         AntigravityAccount,
         String,
         HashMap<String, String>,
@@ -3144,7 +3705,7 @@ async fn send_upstream_with_failover(
     );
 
     let conv_cache_key = if cfg.prompt_cache_affinity {
-        extract_conversation_cache_key(openai_body, session_seed, resolved_model)
+        extract_conversation_cache_key(request_body, session_seed, resolved_model)
     } else {
         String::new()
     };
@@ -3197,8 +3758,23 @@ async fn send_upstream_with_failover(
             .filter(|p| !p.trim().is_empty() && p != "aicode-consumers")
             .unwrap_or_else(generate_fallback_project_id);
 
-        let (mut envelope, preview, tool_name_map) =
-            openai_body_to_antigravity_envelope(openai_body, resolved_model, &project_id, session_seed, cfg);
+        let (mut envelope, preview, tool_name_map) = if is_gemini_native {
+            gemini_body_to_antigravity_envelope(
+                request_body,
+                resolved_model,
+                &project_id,
+                session_seed,
+                cfg,
+            )
+        } else {
+            openai_body_to_antigravity_envelope(
+                request_body,
+                resolved_model,
+                &project_id,
+                session_seed,
+                cfg,
+            )
+        };
 
         let force_non_stream = resolved_model.to_ascii_lowercase().contains("image");
         let action = if stream && !force_non_stream {
@@ -3207,172 +3783,326 @@ async fn send_upstream_with_failover(
             "generateContent"
         };
 
-        let mut succeeded = None;
+        let mut succeeded: Option<(UpstreamPayload, AntigravityAccount, String, HashMap<String, String>)> = None;
         let mut saw_model_not_found = false;
         let mut saw_non_404_error = false;
+        let mut same_auth_micro_retried = false;
         for base_url in ANTIGRAVITY_BASE_URLS {
             let url = format!("{base_url}/v1internal:{action}");
-            let send_res = client
-                .post(&url)
-                .bearer_auth(&acc.token.access_token)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .header(reqwest::header::USER_AGENT, ANTIGRAVITY_IDE_USER_AGENT)
-                .json(&envelope)
-                .send()
-                .await;
+            let mut active_acc = acc.clone();
+            'same_url: loop {
+                let send_res = client
+                    .post(&url)
+                    .bearer_auth(&active_acc.token.access_token)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .header(reqwest::header::USER_AGENT, ANTIGRAVITY_IDE_USER_AGENT)
+                    .json(&envelope)
+                    .send()
+                    .await;
 
-            match send_res {
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
-                    if resp.status().is_success() {
-                        if cfg.routing_strategy == "sticky_session" {
-                            if let Ok(mut map) = sticky_lock().lock() {
-                                map.insert(format!("{}:{resolved_model}", key.id), acc.id.clone());
-                            }
-                        }
-                        if cfg.prompt_cache_affinity && !conv_cache_key.is_empty() {
-                            record_conv_sticky_account(&conv_cache_key, &acc.id);
-                        }
-                        succeeded = Some((resp, acc.clone(), preview.clone(), tool_name_map.clone()));
-                        break;
-                    }
-                    let err_body = resp.text().await.unwrap_or_default();
-                    // Safe fallback: if a specific model rejects optional serviceTier or thinkingConfig with HTTP 400,
-                    // strip those optional speed fields and retry once immediately on the same account.
-                    if status == 400 {
-                        let lower_err = err_body.to_ascii_lowercase();
-                        let mut stripped = false;
-                        if (lower_err.contains("service_tier") || lower_err.contains("servicetier"))
-                            && envelope
-                                .pointer_mut("/request")
-                                .and_then(Value::as_object_mut)
-                                .and_then(|r| r.remove("serviceTier"))
-                                .is_some()
-                        {
-                            stripped = true;
-                        }
-                        if (lower_err.contains("thinking") || lower_err.contains("thinking_level"))
-                            && envelope
-                                .pointer_mut("/request/generationConfig")
-                                .and_then(Value::as_object_mut)
-                                .and_then(|g| g.remove("thinkingConfig"))
-                                .is_some()
-                        {
-                            stripped = true;
-                        }
-                        if stripped {
-                            if let Ok(retry_resp) = client
-                                .post(&url)
-                                .bearer_auth(&acc.token.access_token)
-                                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                                .header(reqwest::header::USER_AGENT, ANTIGRAVITY_IDE_USER_AGENT)
-                                .json(&envelope)
-                                .send()
-                                .await
-                            {
-                                if retry_resp.status().is_success() {
-                                    if cfg.prompt_cache_affinity && !conv_cache_key.is_empty() {
-                                        record_conv_sticky_account(&conv_cache_key, &acc.id);
+                match send_res {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let resp_headers = resp.headers().clone();
+                        if resp.status().is_success() {
+                            if stream {
+                                if cfg.routing_strategy == "sticky_session" {
+                                    if let Ok(mut map) = sticky_lock().lock() {
+                                        map.insert(format!("{}:{resolved_model}", key.id), active_acc.id.clone());
                                     }
-                                    succeeded = Some((
-                                        retry_resp,
-                                        acc.clone(),
+                                }
+                                if cfg.prompt_cache_affinity && !conv_cache_key.is_empty() {
+                                    record_conv_sticky_account(&conv_cache_key, &active_acc.id);
+                                }
+                                succeeded = Some((
+                                    UpstreamPayload::Stream(resp),
+                                    active_acc.clone(),
+                                    preview.clone(),
+                                    tool_name_map.clone(),
+                                ));
+                                break 'same_url;
+                            }
+
+                            let raw_text = resp.text().await.unwrap_or_default();
+                            if let Ok(val) = serde_json::from_str::<Value>(&raw_text) {
+                                if let Some(in_band_status) = extract_in_band_error_status(&val) {
+                                    saw_non_404_error = true;
+                                    if in_band_status == 429 {
+                                        match classify_antigravity_429(
+                                            Some(&resp_headers),
+                                            &raw_text,
+                                            cfg.cooldown_seconds,
+                                        ) {
+                                            Antigravity429Decision::InstantRetrySameAuth { wait_ms, .. }
+                                                if !same_auth_micro_retried =>
+                                            {
+                                                same_auth_micro_retried = true;
+                                                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                                                continue 'same_url;
+                                            }
+                                            Antigravity429Decision::InstantRetrySameAuth { .. }
+                                            | Antigravity429Decision::SoftRateLimit { .. } => {
+                                                mark_account_cooldown(
+                                                    &active_acc.id,
+                                                    &active_acc.email,
+                                                    scope,
+                                                    cfg.cooldown_seconds.clamp(5, 15),
+                                                    "In-band 429 soft rate limit".into(),
+                                                );
+                                            }
+                                            Antigravity429Decision::ShortCooldownSwitchAuth {
+                                                cooldown_secs,
+                                                reason,
+                                            }
+                                            | Antigravity429Decision::FullQuotaExhausted {
+                                                cooldown_secs,
+                                                reason,
+                                            } => {
+                                                mark_account_cooldown(
+                                                    &active_acc.id,
+                                                    &active_acc.email,
+                                                    scope,
+                                                    cooldown_secs,
+                                                    format!("In-band {reason}"),
+                                                );
+                                                spawn_post_429_quota_sync(&active_acc.id);
+                                            }
+                                        }
+                                    } else if in_band_status == 403 {
+                                        let (cool, reason_lbl, sync_acc) =
+                                            classify_antigravity_403(&raw_text);
+                                        mark_account_cooldown(
+                                            &active_acc.id,
+                                            &active_acc.email,
+                                            "all",
+                                            cool,
+                                            format!("In-band {reason_lbl}"),
+                                        );
+                                        if sync_acc {
+                                            spawn_post_429_quota_sync(&active_acc.id);
+                                        }
+                                    } else if in_band_status >= 500 {
+                                        mark_account_cooldown(
+                                            &active_acc.id,
+                                            &active_acc.email,
+                                            scope,
+                                            cfg.cooldown_seconds.min(20).max(5),
+                                            format!("In-band HTTP {in_band_status}"),
+                                        );
+                                    }
+                                    last_err = (
+                                        in_band_status,
+                                        raw_text,
+                                        active_acc.id.clone(),
+                                        active_acc.email.clone(),
                                         preview.clone(),
-                                        tool_name_map.clone(),
-                                    ));
-                                    break;
+                                    );
+                                    break 'same_url;
+                                }
+
+                                let parsed_chk = parse_antigravity_response_payload(&val);
+                                if parsed_chk.text.is_empty()
+                                    && parsed_chk.thinking.is_empty()
+                                    && parsed_chk.tool_calls.is_empty()
+                                {
+                                    saw_non_404_error = true;
+                                    last_err = (
+                                        502,
+                                        "Upstream Antigravity returned empty response (zero output)".into(),
+                                        active_acc.id.clone(),
+                                        active_acc.email.clone(),
+                                        preview.clone(),
+                                    );
+                                    break 'same_url;
                                 }
                             }
+
+                            if cfg.routing_strategy == "sticky_session" {
+                                if let Ok(mut map) = sticky_lock().lock() {
+                                    map.insert(format!("{}:{resolved_model}", key.id), active_acc.id.clone());
+                                }
+                            }
+                            if cfg.prompt_cache_affinity && !conv_cache_key.is_empty() {
+                                record_conv_sticky_account(&conv_cache_key, &active_acc.id);
+                            }
+                            succeeded = Some((
+                                UpstreamPayload::BufferedJson(raw_text),
+                                active_acc.clone(),
+                                preview.clone(),
+                                tool_name_map.clone(),
+                            ));
+                            break 'same_url;
                         }
-                    }
-                    if status == 401 {
-                        if let Ok(re_acc) =
-                            accounts::ensure_fresh_access_token(&acc.id, true).await
-                        {
-                            if let Ok(retry_resp) = client
-                                .post(&url)
-                                .bearer_auth(&re_acc.token.access_token)
-                                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                                .header(reqwest::header::USER_AGENT, ANTIGRAVITY_IDE_USER_AGENT)
-                                .json(&envelope)
-                                .send()
-                                .await
+                        let err_body = resp.text().await.unwrap_or_default();
+                        if status == 400 {
+                            let lower_err = err_body.to_ascii_lowercase();
+                            let mut stripped = false;
+                            if (lower_err.contains("service_tier") || lower_err.contains("servicetier"))
+                                && envelope
+                                    .pointer_mut("/request")
+                                    .and_then(Value::as_object_mut)
+                                    .and_then(|r| r.remove("serviceTier"))
+                                    .is_some()
                             {
-                                if retry_resp.status().is_success() {
-                                    succeeded = Some((
-                                        retry_resp,
-                                        re_acc,
-                                        preview.clone(),
-                                        tool_name_map.clone(),
-                                    ));
-                                    break;
+                                stripped = true;
+                            }
+                            if (lower_err.contains("thinking") || lower_err.contains("thinking_level"))
+                                && envelope
+                                    .pointer_mut("/request/generationConfig")
+                                    .and_then(Value::as_object_mut)
+                                    .and_then(|g| g.remove("thinkingConfig"))
+                                    .is_some()
+                            {
+                                stripped = true;
+                            }
+                            if stripped {
+                                continue 'same_url;
+                            }
+                        }
+                        if status == 401 {
+                            if let Ok(re_acc) =
+                                accounts::ensure_fresh_access_token(&active_acc.id, true).await
+                            {
+                                if re_acc.token.access_token != active_acc.token.access_token {
+                                    active_acc = re_acc;
+                                    continue 'same_url;
                                 }
                             }
                         }
-                    }
-                    if status == 429 || status == 503 || status == 500 || status == 502 {
-                        saw_non_404_error = true;
-                        let cool = parse_retry_seconds_from_body(&err_body, cfg.cooldown_seconds);
-                        mark_account_cooldown(
-                            &acc.id,
-                            &acc.email,
-                            scope,
-                            cool,
-                            format!("HTTP {status}"),
-                        );
                         if status == 429 {
-                            spawn_post_429_quota_sync(&acc.id);
-                        }
-                        last_err = (
-                            status,
-                            err_body,
-                            acc.id.clone(),
-                            acc.email.clone(),
-                            preview.clone(),
-                        );
-                        continue;
-                    }
-                    if status == 404 {
-                        saw_model_not_found = true;
-                        if !(matches!(last_err.0, 429 | 403 | 500 | 502 | 503) && saw_non_404_error)
-                        {
+                            saw_non_404_error = true;
+                            match classify_antigravity_429(
+                                Some(&resp_headers),
+                                &err_body,
+                                cfg.cooldown_seconds,
+                            ) {
+                                Antigravity429Decision::InstantRetrySameAuth { wait_ms, .. }
+                                    if !same_auth_micro_retried =>
+                                {
+                                    same_auth_micro_retried = true;
+                                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                                    continue 'same_url;
+                                }
+                                Antigravity429Decision::InstantRetrySameAuth { reason, .. }
+                                | Antigravity429Decision::SoftRateLimit {
+                                    cooldown_secs: _,
+                                    reason,
+                                } => {
+                                    mark_account_cooldown(
+                                        &active_acc.id,
+                                        &active_acc.email,
+                                        scope,
+                                        cfg.cooldown_seconds.clamp(5, 15),
+                                        reason,
+                                    );
+                                }
+                                Antigravity429Decision::ShortCooldownSwitchAuth {
+                                    cooldown_secs,
+                                    reason,
+                                }
+                                | Antigravity429Decision::FullQuotaExhausted {
+                                    cooldown_secs,
+                                    reason,
+                                } => {
+                                    mark_account_cooldown(
+                                        &active_acc.id,
+                                        &active_acc.email,
+                                        scope,
+                                        cooldown_secs,
+                                        reason,
+                                    );
+                                    spawn_post_429_quota_sync(&active_acc.id);
+                                }
+                            }
                             last_err = (
                                 status,
                                 err_body,
-                                acc.id.clone(),
-                                acc.email.clone(),
+                                active_acc.id.clone(),
+                                active_acc.email.clone(),
                                 preview.clone(),
                             );
+                            break 'same_url;
                         }
-                        continue;
+                        if status == 503 || status == 500 || status == 502 {
+                            saw_non_404_error = true;
+                            let cool = parse_retry_after_header_ms(Some(&resp_headers))
+                                .or_else(|| parse_retry_millis_from_body(&err_body))
+                                .map(|ms| ((ms + 999) / 1000).clamp(5, 3600))
+                                .unwrap_or_else(|| cfg.cooldown_seconds.clamp(5, 30));
+                            mark_account_cooldown(
+                                &active_acc.id,
+                                &active_acc.email,
+                                scope,
+                                cool,
+                                format!("HTTP {status}"),
+                            );
+                            last_err = (
+                                status,
+                                err_body,
+                                active_acc.id.clone(),
+                                active_acc.email.clone(),
+                                preview.clone(),
+                            );
+                            break 'same_url;
+                        }
+                        if status == 404 {
+                            saw_model_not_found = true;
+                            if !(matches!(last_err.0, 429 | 403 | 500 | 502 | 503) && saw_non_404_error)
+                            {
+                                last_err = (
+                                    status,
+                                    err_body,
+                                    active_acc.id.clone(),
+                                    active_acc.email.clone(),
+                                    preview.clone(),
+                                );
+                            }
+                            break 'same_url;
+                        }
+                        saw_non_404_error = true;
+                        last_err = (
+                            status,
+                            err_body.clone(),
+                            active_acc.id.clone(),
+                            active_acc.email.clone(),
+                            preview.clone(),
+                        );
+                        if status == 403 {
+                            let (cool_secs, reason_label, trigger_sync) =
+                                classify_antigravity_403(&err_body);
+                            mark_account_cooldown(
+                                &active_acc.id,
+                                &active_acc.email,
+                                "all",
+                                cool_secs,
+                                reason_label,
+                            );
+                            if trigger_sync {
+                                spawn_post_429_quota_sync(&active_acc.id);
+                            }
+                            break 'same_url;
+                        }
+                        if status == 400 {
+                            // Bad request payload won't succeed on another account either; return exact 400 immediately
+                            return Err(last_err);
+                        }
+                        break 'same_url;
                     }
-                    saw_non_404_error = true;
-                    last_err = (
-                        status,
-                        err_body,
-                        acc.id.clone(),
-                        acc.email.clone(),
-                        preview.clone(),
-                    );
-                    if status == 403 {
-                        mark_account_cooldown(&acc.id, &acc.email, "all", 300, "HTTP 403".into());
-                        break;
-                    }
-                    if status == 400 {
-                        // Bad request payload won't succeed on another account either; return exact 400 immediately
-                        return Err(last_err);
+                    Err(e) => {
+                        saw_non_404_error = true;
+                        last_err = (
+                            502,
+                            e.to_string(),
+                            active_acc.id.clone(),
+                            active_acc.email.clone(),
+                            preview.clone(),
+                        );
+                        break 'same_url;
                     }
                 }
-                Err(e) => {
-                    saw_non_404_error = true;
-                    last_err = (
-                        502,
-                        e.to_string(),
-                        acc.id.clone(),
-                        acc.email.clone(),
-                        preview.clone(),
-                    );
-                }
+            }
+            if succeeded.is_some() {
+                break;
             }
         }
 
@@ -3781,7 +4511,16 @@ async fn handle_single_request(
                 "status": "ok",
                 "service": "OnlyDEVS Antigravity API Router",
                 "activeRequests": active,
-                "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/responses", "/v1/messages", "/health"],
+                "endpoints": [
+                    "/v1/models",
+                    "/v1/chat/completions",
+                    "/v1/responses",
+                    "/v1/messages",
+                    "/v1beta/models",
+                    "/v1beta/models/{model}:generateContent",
+                    "/v1beta/models/{model}:streamGenerateContent",
+                    "/health"
+                ],
             }),
             keep_alive,
         )
@@ -3965,6 +4704,84 @@ async fn handle_single_request(
             && keep_alive;
     }
 
+    let gemini_route = parse_gemini_v1beta_route(&req.method, norm_path);
+    match gemini_route {
+        Some(GeminiV1BetaRoute::ListModels) => {
+            let models = list_available_models().unwrap_or_default();
+            let profile_members = if api_key.allowed_profile != "all" {
+                let cfg_snap = load_config().unwrap_or_default();
+                Some(select_pool_members(
+                    accounts::list_accounts_sync().unwrap_or_default(),
+                    &cfg_snap,
+                    Some(&api_key),
+                ))
+            } else {
+                None
+            };
+            let items: Vec<Value> = models
+                .into_iter()
+                .filter(|m| {
+                    api_key.allowed_models.is_empty()
+                        || api_key.allowed_models.iter().any(|a| glob_match(a, &m.id))
+                })
+                .filter(|m| match &profile_members {
+                    Some(members) => members
+                        .iter()
+                        .any(|acc| account_model_support(acc, &m.id) != ModelSupport::Unsupported),
+                    None => true,
+                })
+                .map(|m| {
+                    json!({
+                        "name": format!("models/{}", m.id),
+                        "baseModelId": m.id,
+                        "displayName": m.display_name,
+                        "inputTokenLimit": m.context_window,
+                        "outputTokenLimit": m.max_output_tokens,
+                        "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
+                    })
+                })
+                .collect();
+            return write_json_response_ka(stream, 200, &json!({ "models": items }), keep_alive)
+                .await
+                && keep_alive;
+        }
+        Some(GeminiV1BetaRoute::GetModel(ref model_id)) => {
+            let models = list_available_models().unwrap_or_default();
+            if let Some(m) = models.into_iter().find(|m| m.id.eq_ignore_ascii_case(model_id)) {
+                return write_json_response_ka(
+                    stream,
+                    200,
+                    &json!({
+                        "name": format!("models/{}", m.id),
+                        "baseModelId": m.id,
+                        "displayName": m.display_name,
+                        "inputTokenLimit": m.context_window,
+                        "outputTokenLimit": m.max_output_tokens,
+                        "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
+                    }),
+                    keep_alive,
+                )
+                .await
+                    && keep_alive;
+            }
+            return write_json_response_ka(
+                stream,
+                404,
+                &json!({ "error": { "code": 404, "message": format!("Model '{model_id}' not found"), "status": "NOT_FOUND" } }),
+                keep_alive,
+            )
+            .await
+                && keep_alive;
+        }
+        _ => {}
+    }
+
+    let (is_gemini, gemini_req_model, gemini_req_stream) = match gemini_route {
+        Some(GeminiV1BetaRoute::GenerateContent { model, stream }) => (true, Some(model), stream),
+        _ => (false, None, false),
+    };
+    let gemini_alt_sse = req.query.split('&').any(|p| p == "alt=sse");
+
     let is_openai = req.method == "POST"
         && (norm_path == "/v1/chat/completions" || norm_path == "/chat/completions");
     let is_responses =
@@ -3972,9 +4789,9 @@ async fn handle_single_request(
     let is_anthropic =
         req.method == "POST" && (norm_path == "/v1/messages" || norm_path == "/messages");
 
-    if !is_openai && !is_responses && !is_anthropic {
+    if !is_openai && !is_responses && !is_anthropic && !is_gemini {
         let err_msg = format!(
-            "Unsupported endpoint: {} {}. Use /v1/models, /v1/chat/completions, /v1/responses, or /v1/messages.",
+            "Unsupported endpoint: {} {}. Use /v1/models, /v1/chat/completions, /v1/responses, /v1/messages, or /v1beta/models/{{model}}:generateContent.",
             req.method, norm_path
         );
         record_api_log_async(ApiRequestLogItem {
@@ -4026,7 +4843,16 @@ async fn handle_single_request(
                 api_key_label: api_key.label.clone(),
                 account_id: String::new(),
                 account_email: String::new(),
-                protocol: if is_anthropic { "anthropic" } else if is_responses { "responses" } else { "openai" }.into(),
+                protocol: if is_anthropic {
+                    "anthropic"
+                } else if is_responses {
+                    "responses"
+                } else if is_gemini {
+                    "gemini"
+                } else {
+                    "openai"
+                }
+                .into(),
                 request_model: format!("{} {}", req.method, norm_path),
                 resolved_model: "-".into(),
                 stream: false,
@@ -4058,10 +4884,12 @@ async fn handle_single_request(
         "anthropic"
     } else if is_responses {
         "responses"
+    } else if is_gemini {
+        "gemini"
     } else {
         "openai"
     };
-    let openai_body = if is_anthropic {
+    let forward_body = if is_anthropic {
         anthropic_body_to_openai_body(&raw_body)
     } else if is_responses {
         responses_body_to_openai_body(&raw_body)
@@ -4069,16 +4897,23 @@ async fn handle_single_request(
         raw_body.clone()
     };
 
-    let request_model = openai_body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("gemini-4-neon-medium")
-        .to_string();
+    let request_model = gemini_req_model
+        .unwrap_or_else(|| {
+            forward_body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("gemini-4-neon-medium")
+                .to_string()
+        });
     let resolved_model = resolve_model_alias(&cfg, &request_model);
-    let is_stream = openai_body
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let is_stream = if is_gemini {
+        gemini_req_stream
+    } else {
+        forward_body
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
 
     if !api_key.allowed_models.is_empty()
         && !api_key
@@ -4149,8 +4984,9 @@ async fn handle_single_request(
         &api_key,
         &session_seed,
         &resolved_model,
-        &openai_body,
+        &forward_body,
         is_stream,
+        is_gemini,
     )
     .await;
 
@@ -4194,7 +5030,7 @@ async fn handle_single_request(
             .await
                 && keep_alive
         }
-        Ok((mut resp, acc, req_preview, tool_name_map)) => {
+        Ok((upstream_payload, acc, req_preview, tool_name_map)) => {
             let mut total_in = 0u64;
             let mut total_out = 0u64;
             let mut total_think = 0u64;
@@ -4208,92 +5044,130 @@ async fn handle_single_request(
             let created_ts = Utc::now().timestamp();
 
             let mut keep_open = false;
-            if is_stream {
-                if write_sse_headers(stream).await.is_ok() {
-                    let mut sse_buf = String::new();
-                    let mut openai_tool_idx = 0usize;
-                    let mut responses_out_idx = 1usize;
-                    let mut anthropic_started = false;
-                    let mut anthropic_block_idx = 0usize;
-                    let mut anthropic_in_thinking = false;
-                    let mut anthropic_in_text = false;
-                    let mut client_alive = true;
+            match upstream_payload {
+                UpstreamPayload::Stream(mut resp) => {
+                    let use_chunked_json_array = is_gemini && !gemini_alt_sse;
+                    let headers_ok = if use_chunked_json_array {
+                        let hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                        stream.write_all(hdr.as_bytes()).await.is_ok()
+                            && write_sse_chunk(stream, "[\n").await.is_ok()
+                    } else {
+                        write_sse_headers(stream).await.is_ok()
+                    };
+                    if headers_ok {
+                        let mut sse_buf = String::new();
+                        let mut openai_tool_idx = 0usize;
+                        let mut responses_out_idx = 1usize;
+                        let mut anthropic_started = false;
+                        let mut anthropic_block_idx = 0usize;
+                        let mut anthropic_in_thinking = false;
+                        let mut anthropic_in_text = false;
+                        let mut gemini_array_first = true;
+                        let mut client_alive = true;
 
-                    while client_alive {
-                        if *shutdown_rx.borrow() || SERVER_ACTIVE_GEN.load(Ordering::SeqCst) != conn_gen {
-                            client_alive = false;
-                            break;
-                        }
-                        let chunk = tokio::select! {
-                            _ = shutdown_rx.changed() => {
+                        while client_alive {
+                            if *shutdown_rx.borrow()
+                                || SERVER_ACTIVE_GEN.load(Ordering::SeqCst) != conn_gen
+                            {
                                 client_alive = false;
                                 break;
                             }
-                            res = tokio::time::timeout(Duration::from_secs(10), resp.chunk()) => {
-                                match res {
-                                    Ok(Ok(Some(c))) => c,
-                                    Ok(Ok(None)) | Ok(Err(_)) => break,
-                                    Err(_) => {
-                                        // 10s upstream silence (e.g. long thinking): send SSE keepalive comment
-                                        if write_sse_chunk(stream, ": keepalive\n\n").await.is_err() {
-                                            client_alive = false;
+                            let chunk = tokio::select! {
+                                _ = shutdown_rx.changed() => {
+                                    client_alive = false;
+                                    break;
+                                }
+                                res = tokio::time::timeout(Duration::from_secs(10), resp.chunk()) => {
+                                    match res {
+                                        Ok(Ok(Some(c))) => c,
+                                        Ok(Ok(None)) | Ok(Err(_)) => break,
+                                        Err(_) => {
+                                            if !use_chunked_json_array
+                                                && write_sse_chunk(stream, ": keepalive\n\n").await.is_err()
+                                            {
+                                                client_alive = false;
+                                            }
+                                            continue;
                                         }
-                                        continue;
                                     }
                                 }
-                            }
-                        };
-                        sse_buf.push_str(&String::from_utf8_lossy(&chunk));
-                        while let Some(nl) = sse_buf.find('\n') {
-                            let line = sse_buf[..nl].trim().to_string();
-                            sse_buf.drain(..=nl);
-                            let Some(data_str) = line.strip_prefix("data:") else {
-                                continue;
                             };
-                            let data_trim = data_str.trim();
-                            if data_trim.is_empty() || data_trim == "[DONE]" {
-                                continue;
-                            }
-                            let Ok(val) = serde_json::from_str::<Value>(data_trim) else {
-                                continue;
-                            };
-                            let mut parsed = parse_antigravity_response_payload(&val);
-                            if !parsed.tool_thought_signatures.is_empty() {
-                                let combined_think = if !parsed.thinking.is_empty() {
-                                    format!("{collected_think}{}", parsed.thinking)
-                                } else {
-                                    collected_think.clone()
+                            sse_buf.push_str(&String::from_utf8_lossy(&chunk));
+                            while let Some(nl) = sse_buf.find('\n') {
+                                let line = sse_buf[..nl].trim().to_string();
+                                sse_buf.drain(..=nl);
+                                let Some(data_str) = line.strip_prefix("data:") else {
+                                    continue;
                                 };
-                                for (tc_id, sig) in &parsed.tool_thought_signatures {
-                                    record_tool_thought_context(
-                                        tc_id,
-                                        Some(combined_think.as_str()),
-                                        sig.as_deref(),
-                                    );
+                                let data_trim = data_str.trim();
+                                if data_trim.is_empty() || data_trim == "[DONE]" {
+                                    continue;
                                 }
-                            }
-                            if !tool_name_map.is_empty() && !parsed.tool_calls.is_empty() {
-                                for (_, name, _) in &mut parsed.tool_calls {
-                                    *name = uncloak_tool_name(name, &tool_name_map);
+                                let Ok(val) = serde_json::from_str::<Value>(data_trim) else {
+                                    continue;
+                                };
+                                let mut parsed = parse_antigravity_response_payload(&val);
+                                if !parsed.tool_thought_signatures.is_empty() {
+                                    let combined_think = if !parsed.thinking.is_empty() {
+                                        format!("{collected_think}{}", parsed.thinking)
+                                    } else {
+                                        collected_think.clone()
+                                    };
+                                    for (tc_id, sig) in &parsed.tool_thought_signatures {
+                                        record_tool_thought_context(
+                                            tc_id,
+                                            Some(combined_think.as_str()),
+                                            sig.as_deref(),
+                                        );
+                                    }
                                 }
-                            }
-                            if parsed.input_tokens > 0 {
-                                total_in = parsed.input_tokens;
-                            }
-                            if parsed.output_tokens > 0 {
-                                total_out = parsed.output_tokens;
-                            }
-                            if parsed.thinking_tokens > 0 {
-                                total_think = parsed.thinking_tokens;
-                            }
-                            if parsed.cache_read_tokens > 0 {
-                                total_cache = parsed.cache_read_tokens;
-                            }
-                            if let Some(fr) = parsed.finish_reason {
-                                finish_reason = fr;
-                            }
+                                if !tool_name_map.is_empty() && !parsed.tool_calls.is_empty() {
+                                    for (_, name, _) in &mut parsed.tool_calls {
+                                        *name = uncloak_tool_name(name, &tool_name_map);
+                                    }
+                                }
+                                if parsed.input_tokens > 0 {
+                                    total_in = parsed.input_tokens;
+                                }
+                                if parsed.output_tokens > 0 {
+                                    total_out = parsed.output_tokens;
+                                }
+                                if parsed.thinking_tokens > 0 {
+                                    total_think = parsed.thinking_tokens;
+                                }
+                                if parsed.cache_read_tokens > 0 {
+                                    total_cache = parsed.cache_read_tokens;
+                                }
+                                if let Some(fr) = parsed.finish_reason {
+                                    finish_reason = fr;
+                                }
 
-                            if is_openai {
+                                if is_gemini {
+                                    if !parsed.thinking.is_empty() {
+                                        collected_think.push_str(&parsed.thinking);
+                                    }
+                                    if !parsed.text.is_empty() {
+                                        collected_text.push_str(&parsed.text);
+                                    }
+                                    let gemini_chunk =
+                                        uncloak_gemini_response_value(&val, &tool_name_map);
+                                    let serialized = serde_json::to_string(&gemini_chunk)
+                                        .unwrap_or_else(|_| "{}".into());
+                                    let wire = if use_chunked_json_array {
+                                        if gemini_array_first {
+                                            gemini_array_first = false;
+                                            serialized
+                                        } else {
+                                            format!(",\n{serialized}")
+                                        }
+                                    } else {
+                                        format!("data: {serialized}\n\n")
+                                    };
+                                    if write_sse_chunk(stream, &wire).await.is_err() {
+                                        client_alive = false;
+                                        break;
+                                    }
+                                } else if is_openai {
                                 let mut delta = Map::new();
                                 if !parsed.thinking.is_empty() {
                                     collected_think.push_str(&parsed.thinking);
@@ -4541,7 +5415,11 @@ async fn handle_single_request(
                     // Send stream termination frames
                     if client_alive {
                         let mut tail = String::new();
-                        if is_openai {
+                        if use_chunked_json_array {
+                            tail.push_str("\n]\n");
+                        } else if is_gemini {
+                            // Native Gemini SSE ends cleanly with HTTP chunk terminator
+                        } else if is_openai {
                             let done_frame = json!({
                                 "id": completion_id,
                                 "object": "chat.completion.chunk",
@@ -4641,43 +5519,46 @@ async fn handle_single_request(
                         write_sse_end(stream).await;
                     }
                 }
-            } else {
-                // Non-streaming JSON response
-                let raw_text = resp.text().await.unwrap_or_default();
-                let mut parsed = serde_json::from_str::<Value>(&raw_text)
-                    .map(|v| parse_antigravity_response_payload(&v))
-                    .unwrap_or_default();
-                if !tool_name_map.is_empty() && !parsed.tool_calls.is_empty() {
-                    for (_, name, _) in &mut parsed.tool_calls {
-                        *name = uncloak_tool_name(name, &tool_name_map);
+                }
+                UpstreamPayload::BufferedJson(raw_text) => {
+                    // Non-streaming JSON response (already validated for in-band errors & zero-output)
+                    let raw_val = serde_json::from_str::<Value>(&raw_text).unwrap_or(Value::Null);
+                    let mut parsed = parse_antigravity_response_payload(&raw_val);
+                    if !tool_name_map.is_empty() && !parsed.tool_calls.is_empty() {
+                        for (_, name, _) in &mut parsed.tool_calls {
+                            *name = uncloak_tool_name(name, &tool_name_map);
+                        }
                     }
-                }
-                total_in = parsed.input_tokens;
-                total_out = parsed.output_tokens;
-                total_think = parsed.thinking_tokens;
-                total_cache = parsed.cache_read_tokens;
-                collected_text = parsed.text;
-                collected_think = parsed.thinking;
-                collected_tools = parsed.tool_calls;
-                for (tc_id, sig) in &parsed.tool_thought_signatures {
-                    record_tool_thought_context(
-                        tc_id,
-                        Some(collected_think.as_str()),
-                        sig.as_deref(),
-                    );
-                }
-                if let Some(fr) = parsed.finish_reason {
-                    finish_reason = fr;
-                }
-                if !collected_tools.is_empty() {
-                    finish_reason = if is_anthropic {
-                        "tool_use".into()
-                    } else {
-                        "tool_calls".into()
-                    };
-                }
+                    total_in = parsed.input_tokens;
+                    total_out = parsed.output_tokens;
+                    total_think = parsed.thinking_tokens;
+                    total_cache = parsed.cache_read_tokens;
+                    collected_text = parsed.text;
+                    collected_think = parsed.thinking;
+                    collected_tools = parsed.tool_calls;
+                    for (tc_id, sig) in &parsed.tool_thought_signatures {
+                        record_tool_thought_context(
+                            tc_id,
+                            Some(collected_think.as_str()),
+                            sig.as_deref(),
+                        );
+                    }
+                    if let Some(fr) = parsed.finish_reason {
+                        finish_reason = fr;
+                    }
+                    if !collected_tools.is_empty() {
+                        finish_reason = if is_anthropic {
+                            "tool_use".into()
+                        } else {
+                            "tool_calls".into()
+                        };
+                    }
 
-                if is_openai {
+                    if is_gemini {
+                        let out_json = uncloak_gemini_response_value(&raw_val, &tool_name_map);
+                        keep_open = write_json_response_ka(stream, 200, &out_json, keep_alive).await
+                            && keep_alive;
+                    } else if is_openai {
                     let mut message = Map::new();
                     message.insert("role".into(), json!("assistant"));
                     message.insert("content".into(), json!(collected_text));
@@ -4801,6 +5682,7 @@ async fn handle_single_request(
                     });
                     keep_open = write_json_response_ka(stream, 200, &out_json, keep_alive).await
                         && keep_alive;
+                }
                 }
             }
 
@@ -5474,9 +6356,12 @@ pub async fn test_chat_completion(
     });
 
     let started = Instant::now();
-    match send_upstream_with_failover(&cfg, &key, &key.id, &resolved_model, &body, false).await {
-        Ok((resp, acc, req_preview, _tool_name_map)) => {
-            let raw_text = resp.text().await.unwrap_or_default();
+    match send_upstream_with_failover(&cfg, &key, &key.id, &resolved_model, &body, false, false).await {
+        Ok((payload, acc, req_preview, _tool_name_map)) => {
+            let raw_text = match payload {
+                UpstreamPayload::BufferedJson(s) => s,
+                UpstreamPayload::Stream(resp) => resp.text().await.unwrap_or_default(),
+            };
             let parsed = serde_json::from_str::<Value>(&raw_text)
                 .map(|v| parse_antigravity_response_payload(&v))
                 .unwrap_or_default();
@@ -6216,6 +7101,144 @@ mod tests {
         assert_eq!(
             parts[5].pointer("/functionResponse/response/result/result").and_then(Value::as_str),
             Some(big.as_str())
+        );
+    }
+
+    #[test]
+    fn classifies_429_403_inband_errors_and_retry_after_headers() {
+        let mut hdrs = reqwest::header::HeaderMap::new();
+        hdrs.insert(reqwest::header::RETRY_AFTER, "2".parse().unwrap());
+        let burst_body = serde_json::to_string(&json!({
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "reason": "RATE_LIMIT_EXCEEDED"
+                }]
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            classify_antigravity_429(Some(&hdrs), &burst_body, 60),
+            Antigravity429Decision::InstantRetrySameAuth {
+                wait_ms: 2000,
+                reason: "HTTP 429 RATE_LIMIT_EXCEEDED (micro-burst)".into()
+            }
+        );
+
+        let exhausted_body = serde_json::to_string(&json!({
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "reason": "QUOTA_EXHAUSTED"
+                }]
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            classify_antigravity_429(None, &exhausted_body, 60),
+            Antigravity429Decision::FullQuotaExhausted { cooldown_secs: 60, .. }
+        ));
+
+        let detail_free = json!({ "error": { "code": 429, "status": "RESOURCE_EXHAUSTED", "details": [] } }).to_string();
+        assert!(matches!(
+            classify_antigravity_429(None, &detail_free, 60),
+            Antigravity429Decision::SoftRateLimit { cooldown_secs: 5..=15, .. }
+        ));
+
+        let tos_body = json!({
+            "error": {
+                "code": 403,
+                "status": "PERMISSION_DENIED",
+                "details": [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "TOS_VIOLATION" }]
+            }
+        }).to_string();
+        assert_eq!(classify_antigravity_403(&tos_body), (3600, "HTTP 403 TOS_VIOLATION".into(), false));
+
+        let val_body = json!({
+            "error": {
+                "code": 403,
+                "status": "PERMISSION_DENIED",
+                "details": [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "VALIDATION_REQUIRED" }]
+            }
+        }).to_string();
+        assert_eq!(classify_antigravity_403(&val_body), (1800, "HTTP 403 VALIDATION_REQUIRED".into(), true));
+
+        assert_eq!(
+            extract_in_band_error_status(&json!({ "error": { "code": 8, "status": "RESOURCE_EXHAUSTED" } })),
+            Some(429)
+        );
+        assert_eq!(extract_in_band_error_status(&json!({ "response": {} })), None);
+    }
+
+    #[test]
+    fn flattens_nullable_anyof_and_supports_gemini_v1beta_routes_and_uncloaking() {
+        let cleaned = clean_json_schema_for_antigravity(json!({
+            "anyOf": [{ "type": "string", "minLength": 2 }, { "type": "null" }],
+            "description": "optional name"
+        }));
+        assert_eq!(cleaned.get("type").and_then(Value::as_str), Some("string"));
+        assert!(cleaned.get("anyOf").is_none());
+        assert!(cleaned.get("minLength").is_none());
+
+        assert_eq!(
+            parse_gemini_v1beta_route("GET", "/v1beta/models"),
+            Some(GeminiV1BetaRoute::ListModels)
+        );
+        assert_eq!(
+            parse_gemini_v1beta_route("POST", "/v1beta/models/gemini-4-argon-high:streamGenerateContent"),
+            Some(GeminiV1BetaRoute::GenerateContent {
+                model: "gemini-4-argon-high".into(),
+                stream: true
+            })
+        );
+
+        let cfg = ApiServiceConfig::default();
+        let req_body = json!({
+            "systemInstruction": { "parts": [{ "text": "You are Claude Code, Anthropic's official CLI for Claude." }] },
+            "contents": [{ "role": "user", "parts": [{ "text": "Hello" }] }],
+            "tools": [{
+                "functionDeclarations": [{
+                    "name": "read_file",
+                    "description": "Read file",
+                    "parameters": { "type": "object", "properties": { "path": { "type": "string" } } }
+                }]
+            }]
+        });
+        let (env, preview, map) =
+            gemini_body_to_antigravity_envelope(&req_body, "gemini-4-argon-high", "proj-1", "seed-1", &cfg);
+        assert_eq!(preview, "Hello");
+        assert!(env.pointer("/request/requestType").is_none());
+        let sys_txt = env
+            .pointer("/request/systemInstruction/parts/0/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(sys_txt.contains("Antigravity"));
+
+        let wire_fn = env
+            .pointer("/request/tools/0/functionDeclarations/0/name")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let raw_resp = json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "role": "model",
+                        "parts": [{ "functionCall": { "name": wire_fn, "args": { "path": "a.rs" } } }]
+                    }
+                }]
+            }
+        });
+        let uncloaked = uncloak_gemini_response_value(&raw_resp, &map);
+        assert_eq!(
+            uncloaked
+                .pointer("/candidates/0/content/parts/0/functionCall/name")
+                .and_then(Value::as_str),
+            Some("read_file")
         );
     }
 }

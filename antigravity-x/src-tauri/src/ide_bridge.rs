@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use uuid::Uuid;
 
 pub const BRIDGE_EXTENSION_ID: &str = "onlydevs-auth-bridge";
-pub const BRIDGE_EXTENSION_VERSION: &str = "1.0.0";
+pub const BRIDGE_EXTENSION_VERSION: &str = "1.0.1";
 const BRIDGE_PORT_START: u16 = 57128;
 const BRIDGE_PORT_END: u16 = 57148;
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -368,7 +368,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const EXTENSION_VERSION = "1.0.0";
+const EXTENSION_VERSION = "1.0.1";
 const RECONNECT_DELAY_MS = 2500;
 const HEARTBEAT_INTERVAL_MS = 15000;
 
@@ -493,9 +493,14 @@ async function handleSwitchAccount(msg) {
 
     await syncApi.OAuthPreferences.setOAuthTokenInfo(tokenPayload);
 
+    // Allow Electron's uss-oauth sync/subscriber to flush before restarting Extension Host
+    // so the spawned agy.exe agent backend reloads the newly written credentials cleanly
+    // without closing or reloading the Antigravity IDE window.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
     // Best-effort refresh status message without disturbing the active editor/chat panel
     vscode.window.setStatusBarMessage(
-      `$(zap) OnlyDEVS: Đã chuyển nóng sang ${targetEmail} (không restart IDE)`,
+      `$(zap) OnlyDEVS: Đã chuyển nóng sang ${targetEmail} — đang làm mới agent...`,
       5000,
     );
 
@@ -505,8 +510,19 @@ async function handleSwitchAccount(msg) {
       success: true,
       email: targetEmail,
       effectiveMode: "seamless",
-      message: `Đã nạp OAuth token mới vào RAM IDE cho ${targetEmail}`,
+      message: `Đã nạp OAuth token mới & làm mới Extension Host cho ${targetEmail}`,
     });
+
+    if (vscode.commands && typeof vscode.commands.executeCommand === "function") {
+      const restartTimer = setTimeout(() => {
+        void Promise.resolve(
+          vscode.commands.executeCommand("workbench.action.restartExtensionHost"),
+        ).catch(() => {});
+      }, 120);
+      if (typeof restartTimer.unref === "function") {
+        restartTimer.unref();
+      }
+    }
   } catch (err) {
     sendJson({
       type: "switch_result",
@@ -1429,6 +1445,9 @@ mod tests {
         assert!(found2);
         assert_eq!(ver2.as_deref(), Some(BRIDGE_EXTENSION_VERSION));
         assert!(!needs_upd);
+
+        let js = fs::read_to_string(ext_dir.join("extension.js")).unwrap();
+        assert!(js.contains("workbench.action.restartExtensionHost"));
     }
 
     fn encode_masked_client_text(text: &str) -> Vec<u8> {
