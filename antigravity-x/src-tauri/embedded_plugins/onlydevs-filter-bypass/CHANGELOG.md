@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.0
+
+- **Fixed `NO_TOOL_CALL` false-positive**: stopped treating normal concise replies (`< 500` chars) or background-task wait turns as provider filter interruptions when no filter/refusal signature is present.
+- **Background task awareness**: allows normal turn termination when waiting on an asynchronous background task (`Tool is running as a background task`).
+- **Expanded completion & path markers**: added `.rs`, `.ts`, `.tsx`, `.js`, `.py`, `.json`, `.toml`, `file://`, and Vietnamese completion keywords (`hoàn tất`, `thành công`, `đã sửa`, `đã cài`).
+- **Fast tail-cached transcript reader**: reads at most the last 512 KB of `transcript.jsonl` and caches parsed steps in memory per hook invocation instead of reading the entire file 7 times.
+
 ## 1.4.0
 
 - **Stop-only hooks** (`hooks.json`): removed SessionStart, PreInvocation, PostInvocation so Antigravity does not run hooks every model turn.

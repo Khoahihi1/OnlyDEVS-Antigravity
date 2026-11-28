@@ -251,7 +251,48 @@ def test_suite():
     finally:
         Path(transcript_path_9).unlink(missing_ok=True)
 
-    print("\nALL 15 TESTS PASSED SUCCESSFULLY.")
+    # Case 16: Normal concise reply or background-task wait with NO_TOOL_CALL and no filter -> allow
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8") as tf:
+        tf.write(json.dumps({"type": "USER_INPUT", "source": "USER", "content": "fix và build project"}) + "\n")
+        tf.write(json.dumps({
+            "type": "PLANNER_RESPONSE",
+            "content": "Launching build",
+            "tool_calls": [{"name": "run_command"}],
+        }) + "\n")
+        tf.write(json.dumps({
+            "type": "TOOL_RESPONSE",
+            "content": "Tool is running as a background task with task id: task-123\nsimply update the user with a short message (that you have launched the command and will wait for it to finish) and end the turn.",
+        }) + "\n")
+        tf.write(json.dumps({
+            "type": "PLANNER_RESPONSE",
+            "content": "Đang chờ cargo build --release ở task-123 hoàn tất.",
+        }) + "\n")
+        transcript_path_10 = tf.name
+
+    try:
+        res_bg_wait = run_hook({"transcriptPath": transcript_path_10, "terminationReason": "NO_TOOL_CALL"})
+        assert res_bg_wait.get("decision") == "allow", f"Expected allow on background wait: {res_bg_wait}"
+        print("  [PASS] Case 16: Background task wait / normal NO_TOOL_CALL without filter returns allow")
+    finally:
+        Path(transcript_path_10).unlink(missing_ok=True)
+
+    # Case 17: Explicit SAFETY terminationReason on open work order -> continue
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8") as tf:
+        tf.write(json.dumps({"type": "USER_INPUT", "source": "USER", "content": "patch memory.rs"}) + "\n")
+        tf.write(json.dumps({
+            "type": "PLANNER_RESPONSE",
+            "content": "Partial output cut off",
+        }) + "\n")
+        transcript_path_11 = tf.name
+
+    try:
+        res_safety = run_hook({"transcriptPath": transcript_path_11, "terminationReason": "SAFETY"})
+        assert res_safety.get("decision") == "continue", f"Expected continue on SAFETY reason: {res_safety}"
+        print("  [PASS] Case 17: Explicit SAFETY terminationReason triggers continue")
+    finally:
+        Path(transcript_path_11).unlink(missing_ok=True)
+
+    print("\nALL 17 TESTS PASSED SUCCESSFULLY.")
 
 
 if __name__ == "__main__":

@@ -145,16 +145,22 @@ fn inspect_plugin_dir(dir: &Path, id: &str) -> PluginManifestMeta {
 }
 
 pub fn list_plugins() -> Result<Vec<PluginEntry>, String> {
+    plugins::ensure_default_plugin_up_to_date();
     let config = read_config_value()?;
     let plugins_dir = paths::plugins_dir()?;
     let builtin_dir = paths::builtin_plugins_dir()?;
     let mut entries: BTreeMap<String, PluginEntry> = BTreeMap::new();
+    let mut stale_legacy_ids: Vec<String> = Vec::new();
 
     if let Some(plugins_map) = config.get("plugins").and_then(Value::as_object) {
         for (id, node) in plugins_map {
             let enabled = node.get("enabled").and_then(Value::as_bool).unwrap_or(false);
             let user_path = plugins_dir.join(id);
             let builtin_path = builtin_dir.join(id);
+            if id == "antigravity-filter-bypass" && !user_path.is_dir() && !builtin_path.is_dir() {
+                stale_legacy_ids.push(id.clone());
+                continue;
+            }
             let (installed, active_dir, source) = if user_path.is_dir() {
                 (
                     true,
@@ -267,6 +273,10 @@ pub fn list_plugins() -> Result<Vec<PluginEntry>, String> {
         }
     }
 
+    for legacy_id in stale_legacy_ids {
+        let _ = remove_plugin_entry(&legacy_id);
+    }
+
     // Ensure onlydevs-filter-bypass always appears at the top of the list even if not installed yet
     if !entries.contains_key("onlydevs-filter-bypass") {
         let bundled_src = paths::default_bundled_plugin_source();
@@ -276,7 +286,7 @@ pub fn list_plugins() -> Result<Vec<PluginEntry>, String> {
             PluginManifestMeta {
                 name: Some("onlydevs-filter-bypass".into()),
                 description: Some("Stop hook only: continue on Gemini filter/refusal cards — no Pre/Post/Session noise.".into()),
-                version: Some("1.4.0".into()),
+                version: Some(plugins::DEFAULT_PLUGIN_VERSION.into()),
                 hooks: vec!["Stop".into()],
                 has_self_test: true,
             }
@@ -330,6 +340,20 @@ pub(crate) fn write_plugin_enabled_flag(plugin_id: &str, enabled: bool) -> Resul
     write_config_value(&config)
 }
 
+pub(crate) fn remove_plugin_entry(plugin_id: &str) -> Result<(), String> {
+    let mut config = read_config_value()?;
+    if let Some(plugins_map) = config
+        .as_object_mut()
+        .and_then(|root| root.get_mut("plugins"))
+        .and_then(Value::as_object_mut)
+    {
+        if plugins_map.remove(plugin_id).is_some() {
+            write_config_value(&config)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn set_plugin_enabled(plugin_id: &str, enabled: bool) -> Result<(), String> {
     if plugin_id == plugins::DEFAULT_PLUGIN_ID && enabled {
         let installed_script = paths::plugins_dir()?
@@ -339,6 +363,7 @@ pub fn set_plugin_enabled(plugin_id: &str, enabled: bool) -> Result<(), String> 
             let _ = plugins::install_filter_bypass(None)?;
             return Ok(());
         }
+        plugins::ensure_default_plugin_up_to_date();
     }
     write_plugin_enabled_flag(plugin_id, enabled)
 }

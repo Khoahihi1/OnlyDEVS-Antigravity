@@ -9,6 +9,20 @@ use crate::config;
 use crate::paths;
 
 pub const DEFAULT_PLUGIN_ID: &str = "onlydevs-filter-bypass";
+pub const DEFAULT_PLUGIN_VERSION: &str = "1.5.0";
+
+fn apply_no_window(cmd: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = cmd;
+    }
+}
 
 const COPY_FILES: &[&str] = &[
     "filter_bypass.py",
@@ -57,26 +71,44 @@ pub(crate) fn resolve_python() -> Result<PathBuf, String> {
             return Err(format!("Python không tồn tại: {}", trimmed));
         }
     }
+    #[cfg(not(target_os = "windows"))]
+    if let Ok(path) = which::which("python3") {
+        return Ok(path);
+    }
     if let Ok(path) = which::which("python") {
+        return Ok(path);
+    }
+    if let Ok(path) = which::which("python3") {
         return Ok(path);
     }
     if let Ok(path) = which::which("py") {
         return Ok(path);
     }
-    let fallback = dirs::home_dir()
-        .map(|h| {
-            h.join("AppData")
+    if let Some(home) = dirs::home_dir() {
+        for ver in ["Python313", "Python312", "Python311", "Python310"] {
+            let candidate = home
+                .join("AppData")
                 .join("Local")
                 .join("Programs")
                 .join("Python")
-                .join("Python312")
-                .join("python.exe")
-        })
-        .unwrap_or_default();
-    if fallback.is_file() {
-        return Ok(fallback);
+                .join(ver)
+                .join("python.exe");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
     }
-    Err("Không tìm thấy Python. Cài Python 3.12+ hoặc đặt ANTIGRAVITY_X_PYTHON.".into())
+    for unix_path in [
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+        "/usr/bin/python3",
+    ] {
+        let p = PathBuf::from(unix_path);
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    Err("Không tìm thấy Python. Cài Python 3.10+ hoặc đặt ANTIGRAVITY_X_PYTHON.".into())
 }
 
 fn rewrite_hooks(dest: &Path, python: &Path) -> Result<(), String> {
@@ -152,10 +184,38 @@ pub fn install_filter_bypass(source_override: Option<String>) -> Result<String, 
     }
     config::write_plugin_enabled_flag(DEFAULT_PLUGIN_ID, true)?;
     Ok(format!(
-        "Đã cài & kích hoạt {} (hardcoded built-in v1.4.0) tại {}",
+        "Đã cài & kích hoạt {} (hardcoded built-in v{}) tại {}",
         DEFAULT_PLUGIN_ID,
+        DEFAULT_PLUGIN_VERSION,
         paths::path_display(&dest)
     ))
+}
+
+pub fn ensure_default_plugin_up_to_date() {
+    let Ok(plugins_root) = paths::plugins_dir() else {
+        return;
+    };
+    let dest = plugins_root.join(DEFAULT_PLUGIN_ID);
+    if !dest.is_dir() {
+        return;
+    }
+    let needs_sync = EMBEDDED_FILTER_BYPASS_FILES.iter().any(|(filename, expected)| {
+        if *filename == "hooks.json" {
+            return !dest.join(filename).is_file();
+        }
+        fs::read_to_string(dest.join(filename))
+            .map(|actual| actual != *expected)
+            .unwrap_or(true)
+    });
+    if !needs_sync {
+        return;
+    }
+    for (filename, content) in EMBEDDED_FILTER_BYPASS_FILES {
+        let _ = fs::write(dest.join(filename), content);
+    }
+    if let Ok(python) = resolve_python() {
+        let _ = rewrite_hooks(&dest, &python);
+    }
 }
 
 fn sanitize_plugin_id(raw: &str) -> String {
@@ -313,22 +373,52 @@ pub fn install_plugin_from_zip(
     let extract_dir = temp_root.join("extracted");
     fs::create_dir_all(&extract_dir).map_err(|e| format!("Tạo extract dir: {e}"))?;
 
-    // Extract using Windows built-in tar.exe or PowerShell Expand-Archive fallback
-    let tar_status = Command::new("tar")
+    // Extract using tar, Python zipfile module, unzip, or PowerShell Expand-Archive fallback
+    let mut tar_cmd = Command::new("tar");
+    apply_no_window(&mut tar_cmd);
+    let tar_status = tar_cmd
         .arg("-xf")
         .arg(&archive_file)
         .arg("-C")
         .arg(&extract_dir)
         .status();
 
-    let extracted_ok = tar_status.map(|s| s.success()).unwrap_or(false);
+    let mut extracted_ok = tar_status.map(|s| s.success()).unwrap_or(false);
+    if !extracted_ok {
+        if let Ok(python) = resolve_python() {
+            let mut py_cmd = Command::new(python);
+            apply_no_window(&mut py_cmd);
+            if let Ok(st) = py_cmd
+                .args(["-m", "zipfile", "-e"])
+                .arg(&archive_file)
+                .arg(&extract_dir)
+                .status()
+            {
+                extracted_ok = st.success();
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    if !extracted_ok {
+        if let Ok(st) = Command::new("unzip")
+            .arg("-oq")
+            .arg(&archive_file)
+            .arg("-d")
+            .arg(&extract_dir)
+            .status()
+        {
+            extracted_ok = st.success();
+        }
+    }
     if !extracted_ok {
         let ps_cmd = format!(
             "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
             archive_file.to_string_lossy().replace('\'', "''"),
             extract_dir.to_string_lossy().replace('\'', "''")
         );
-        let ps_out = Command::new("powershell")
+        let mut ps = Command::new("powershell");
+        apply_no_window(&mut ps);
+        let ps_out = ps
             .args(["-NoProfile", "-Command", &ps_cmd])
             .output()
             .map_err(|e| format!("Giải nén ZIP thất bại: {e}"))?;
@@ -381,7 +471,9 @@ pub fn install_plugin_from_git(
     let clone_dir = temp_root.join(derived_name);
     fs::create_dir_all(&temp_root).map_err(|e| format!("Tạo temp dir: {e}"))?;
 
-    let output = Command::new("git")
+    let mut git_cmd = Command::new("git");
+    apply_no_window(&mut git_cmd);
+    let output = git_cmd
         .args(["clone", "--depth", "1", url])
         .arg(&clone_dir)
         .output()
@@ -447,11 +539,11 @@ pub fn create_custom_plugin(
 
 pub fn uninstall_plugin(plugin_id: &str) -> Result<String, String> {
     let dest = paths::plugins_dir()?.join(plugin_id);
-    let _ = config::write_plugin_enabled_flag(plugin_id, false);
+    let _ = config::remove_plugin_entry(plugin_id);
     if dest.is_dir() {
         fs::remove_dir_all(&dest).map_err(|e| format!("Xóa thư mục plugin: {e}"))?;
     }
-    Ok(format!("Đã gỡ cài đặt plugin {plugin_id}"))
+    Ok(format!("Đã gỡ cài đặt & xóa cấu hình plugin {plugin_id}"))
 }
 
 pub fn get_plugin_hooks_raw(plugin_id: &str) -> Result<String, String> {
@@ -482,6 +574,7 @@ pub fn save_plugin_hooks_raw(plugin_id: &str, raw: &str) -> Result<(), String> {
 }
 
 pub fn run_filter_bypass_test() -> Result<String, String> {
+    ensure_default_plugin_up_to_date();
     let python = resolve_python()?;
     let installed_dir = paths::plugins_dir()?.join(DEFAULT_PLUGIN_ID);
     let work_dir = if installed_dir.join("test_filter_bypass.py").is_file() {
@@ -495,7 +588,9 @@ pub fn run_filter_bypass_test() -> Result<String, String> {
         }
     };
 
-    let output = Command::new(&python)
+    let mut py_cmd = Command::new(&python);
+    apply_no_window(&mut py_cmd);
+    let output = py_cmd
         .arg("test_filter_bypass.py")
         .current_dir(&work_dir)
         .output()

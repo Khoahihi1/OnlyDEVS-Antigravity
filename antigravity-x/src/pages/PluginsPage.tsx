@@ -22,7 +22,7 @@ import {
 import type { AppLanguage, OverviewState, PluginEntry } from "../types";
 import { agxInvoke } from "../platform/invoke";
 
-const BUILTIN_HARDCODED_LABEL = "Hardcoded Built-in · onlydevs-filter-bypass v1.4.0 (Embedded)";
+const BUILTIN_HARDCODED_LABEL = "Hardcoded Built-in · onlydevs-filter-bypass v1.5.0 (Embedded)";
 
 type AddPluginMethod = "folder" | "zip" | "git" | "custom";
 
@@ -112,7 +112,7 @@ export function PluginsPage({
       installed: false,
       source: "bundled",
       installPath: null,
-      version: "1.4.0",
+      version: "1.5.0",
       hooks: ["Stop"],
       hasSelfTest: true,
     };
@@ -238,7 +238,7 @@ export function PluginsPage({
               <div className="agx-hero-plugin-title-row">
                 <h3>onlydevs-filter-bypass</h3>
                 <span className="agx-badge agx-badge--brand">
-                  v{filterBypass.version ?? "1.4.0"}
+                  v{filterBypass.version ?? "1.5.0"}
                 </span>
                 <span
                   className={`agx-badge ${
@@ -446,11 +446,19 @@ export function PluginsPage({
                       <Code2 size={14} /> hooks.json
                     </button>
                   )}
-                  {!isDefault && p.source === "user" && p.installed && (
+                  {!isDefault && (p.source === "user" || p.source === "config") && (
                     <button
                       type="button"
                       className="agx-icon-btn agx-icon-btn--danger"
-                      title={vi ? "Gỡ cài đặt thư mục plugin" : "Uninstall plugin folder"}
+                      title={
+                        p.installed
+                          ? vi
+                            ? "Gỡ cài đặt thư mục & cấu hình plugin"
+                            : "Uninstall plugin folder & config entry"
+                          : vi
+                            ? "Xóa mục cấu hình plugin rác khỏi config.json"
+                            : "Remove orphan plugin entry from config.json"
+                      }
                       onClick={() => void onUninstallPlugin(p.id)}
                     >
                       <Trash2 size={15} />
